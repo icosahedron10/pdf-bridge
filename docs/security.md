@@ -15,20 +15,28 @@ network until your security team approves the complete path.
 - A server-calculated SHA-256 identifies exact active duplicates.
 - Every upload and historical import is scanned through ClamAV `INSTREAM`; scanner errors fail
   closed and unclean files are not promoted.
-- Canonical paths derive only from UUIDs. User filenames are metadata.
+- Every upload requires a configured collection; the stable key is validated as lowercase,
+  path-safe ASCII and is immutable after queuing.
+- Canonical bridge paths derive only from UUIDs. User filenames, collection names, and languages
+  are metadata and never shape canonical object paths.
 - Browser mutations require a signed session, same-origin request, and CSRF token. CORS is absent.
 - Trusted-host checks reject unexpected Host headers.
 - The container disables Uvicorn's forwarded-header rewriting; trusted-header mode checks the
   direct peer against `TRUSTED_PROXY_CIDRS` before accepting the identity header.
 - Jenkins and retrieval use separate bearer credentials supplied through environment/secrets.
 - Batch downloads require both a valid job credential and an active batch scope.
+- Jenkins validates every version 2 handoff path against its collection, language, and document UUID
+  before creating a file below the batch directory.
+- Grouped retrieval responses must correlate exactly to the requested collection set.
+  Cross-collection, wrong-language, inactive, unknown, or impossible-total responses fail closed
+  without partial results or metadata fallback.
 - Preview is application-controlled and limited to clean, eligible states with defensive headers.
 - Lifecycle events are append-only at the ORM layer and exclude file content and credentials.
 - The official container runs the app as a non-root user, drops Linux capabilities, uses a
   read-only root filesystem, and mounts only its data volume writable.
 
 These controls reduce common mistakes; they are not a content-disarm system, sandbox, DLP product,
-or authorization model.
+or end-user retrieval authorization model.
 
 ## Important residual risks
 
@@ -48,6 +56,16 @@ control plane. A stolen data volume contains the catalog and all canonical PDFs.
 **Filename and document sensitivity.** Logs avoid contents and local paths, but filenames, search
 queries, snippets, error messages, and audit actors may still be confidential.
 
+**Collection labels are not authorization.** `customer` and `internal` audience labels make corpus
+placement visible to the PDF Bridge operator. PDF Bridge does not authenticate chatbot end users or
+enforce their `allowed_collections`. A manager bug, client-supplied allowlist, or direct Qdrant
+access can still expose internal material even when the bridge catalog is correctly partitioned.
+
+**Misrouting and stale indexes.** A wrong collection key in deployment configuration, an ingestion
+pipeline that ignores the version 2 path, or stale chunks left in the wrong Qdrant collection can
+defeat the intended boundary. Reconcile catalog and index counts and run positive and negative
+collection searches after every rebuild or routing change.
+
 ## Mandatory enterprise gate
 
 Do not call the deployment enterprise-ready until owners from application security,
@@ -59,6 +77,9 @@ infrastructure, identity, data governance, and the retrieval pipeline approve ea
 - [ ] Restrict direct app access so only configured proxy CIDRs can reach it or assert identity.
 - [ ] Add authorization policy (library audience, uploaders, deleters, administrators) if all SSO
       users should not have identical rights.
+- [ ] In the chatbot manager, derive `allowed_collections` only from authenticated server-side
+      policy and intersect it with every requested collection list before retrieval. Never trust a
+      browser/client-supplied allowlist; test that an HR topic returns zero from the customer corpus.
 - [ ] Store session, Jenkins, and retrieval credentials in the approved secret manager; define
       owners, rotation, revocation, and incident procedures.
 - [ ] Complete threat modeling and security review for browser, bridge, Jenkins, storage,
@@ -66,7 +87,9 @@ infrastructure, identity, data governance, and the retrieval pipeline approve ea
 - [ ] Replace/augment ClamAV according to the organization's malware, content-disarm, encrypted
       document, and signature freshness policies.
 - [ ] Run parsing in a least-privilege disposable sandbox with CPU, memory, time, process, and
-      network limits. Patch parser libraries through an owned vulnerability process.
+      network limits. Use the existing parser for language detection, and patch parser/language
+      libraries through an owned vulnerability process; do not add V8 or a second PDF parser to the
+      bridge merely for classification.
 - [ ] Decide whether encrypted/password-protected PDFs are rejected before parsing and give users a
       safe failure explanation.
 - [ ] Move metadata to managed PostgreSQL before multiple replicas/HA; test migrations, backups,
@@ -75,6 +98,8 @@ infrastructure, identity, data governance, and the retrieval pipeline approve ea
       legal-hold, recovery, and verified deletion controls.
 - [ ] Establish upload/search/audit retention and privacy rules; prevent sensitive snippets or
       queries from entering broad logs or Jenkins artifacts.
+- [ ] Reconcile PDF Bridge collection/language counts with Qdrant payloads, and alert on unknown
+      collection keys, undetermined indexed documents, or cross-collection retrieval responses.
 - [ ] Add rate limits, request-body limits at the proxy, capacity alerts, malware-signature age
       alerts, dependency monitoring, and operational ownership.
 - [ ] Validate all service egress destinations and certificates. Do not permit a response-provided

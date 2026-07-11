@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -45,6 +46,7 @@ class DocumentState(str, enum.Enum):
     DELETE_FAILED = "DELETE_FAILED"
     CANCEL_CLEANUP = "CANCEL_CLEANUP"
     CANCELLED = "CANCELLED"
+    CLASSIFICATION_REVIEW = "CLASSIFICATION_REVIEW"
 
 
 class ScanState(str, enum.Enum):
@@ -66,6 +68,20 @@ class OperationState(str, enum.Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+
+
+class LanguageCode(str, enum.Enum):
+    UND = "und"
+    EN = "en"
+    FR = "fr"
+
+
+class LanguageStatus(str, enum.Enum):
+    PENDING = "pending"
+    DETECTED = "detected"
+    REVIEW_REQUIRED = "review_required"
+    OVERRIDDEN = "overridden"
 
 
 class BatchState(str, enum.Enum):
@@ -87,6 +103,7 @@ def enum_type(enum_class: type[enum.Enum], name: str) -> SAEnum:
         native_enum=False,
         create_constraint=True,
         validate_strings=True,
+        values_callable=lambda members: [member.value for member in members],
     )
 
 
@@ -95,7 +112,19 @@ class Document(Base):
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="size_bytes_nonnegative"),
         CheckConstraint("length(sha256) = 64", name="sha256_length"),
+        CheckConstraint(
+            "language_confidence IS NULL OR "
+            "(language_confidence >= 0 AND language_confidence <= 1)",
+            name="language_confidence_range",
+        ),
         Index("ix_documents_sha256_state", "sha256", "state"),
+        Index("ix_documents_collection_state", "collection_key", "state"),
+        Index(
+            "ix_documents_collection_language_state",
+            "collection_key",
+            "language",
+            "state",
+        ),
         Index(
             "ix_documents_normalized_filename_size",
             "normalized_filename",
@@ -115,6 +144,25 @@ class Document(Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     state: Mapped[DocumentState] = mapped_column(
         enum_type(DocumentState, "document_state"), nullable=False, index=True
+    )
+    collection_key: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    language: Mapped[LanguageCode] = mapped_column(
+        enum_type(LanguageCode, "language_code"),
+        nullable=False,
+        default=LanguageCode.UND,
+        server_default=LanguageCode.UND.value,
+    )
+    language_status: Mapped[LanguageStatus] = mapped_column(
+        enum_type(LanguageStatus, "language_status"),
+        nullable=False,
+        default=LanguageStatus.PENDING,
+        server_default=LanguageStatus.PENDING.value,
+    )
+    language_method: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    language_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    language_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    language_detected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     scan_state: Mapped[ScanState] = mapped_column(
@@ -157,7 +205,7 @@ class JobBatch(Base):
     state: Mapped[BatchState] = mapped_column(
         enum_type(BatchState, "batch_state"), nullable=False, default=BatchState.CLAIMED
     )
-    manifest_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    manifest_version: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
     operation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

@@ -33,7 +33,8 @@
         </button>
 
         <nav class="primary-nav" id="primary-navigation" aria-label="Primary navigation">
-          <a href="/library" {% if selected_page == 'library' or current_path == '/library' %}aria-current="page"{% endif %}>Library</a>
+          <a href="/library" {% if selected_page == 'library' or current_path == '/library' %}aria-current="page"{% endif %}>Collections</a>
+          <a href="/review" {% if selected_page == 'review' or current_path == '/review' %}aria-current="page"{% endif %}>Needs review</a>
           <a href="/queue" {% if selected_page == 'queue' or current_path == '/queue' %}aria-current="page"{% endif %}>Queue</a>
           <a href="/upload" {% if selected_page == 'upload' or current_path == '/upload' %}aria-current="page"{% endif %}>Upload PDFs</a>
         </nav>

@@ -5,6 +5,10 @@
   if (!form) return;
 
   const fileInput = form.querySelector("[data-file-input]");
+  const collectionChoices = Array.from(form.querySelectorAll("[data-collection-choice]"));
+  const destinationLock = form.querySelector("[data-destination-lock]");
+  const destinationName = form.querySelector("[data-destination-name]");
+  const dropHelp = form.querySelector("[data-drop-help]");
   const dropZone = document.getElementById("drop-zone");
   const selection = document.getElementById("upload-selection");
   const list = document.getElementById("upload-list");
@@ -23,6 +27,31 @@
   const uploadUrl = form.dataset.uploadUrl || "/api/v1/uploads";
   const items = new Map();
   let uploading = false;
+
+  function selectedCollection() {
+    const selected = collectionChoices.find(function (choice) { return choice.checked; });
+    if (!selected) return null;
+    return {
+      key: selected.value,
+      name: selected.dataset.collectionName || selected.value
+    };
+  }
+
+  function updateCollectionControls() {
+    const collection = selectedCollection();
+    const locked = items.size > 0;
+    collectionChoices.forEach(function (choice) { choice.disabled = locked || uploading; });
+    fileInput.disabled = !collection || uploading;
+    dropZone.classList.toggle("is-disabled", !collection || uploading);
+    dropZone.setAttribute("aria-disabled", String(!collection || uploading));
+    if (dropHelp) {
+      dropHelp.textContent = collection
+        ? "Only .pdf files are accepted"
+        : "Choose a destination collection to enable file selection";
+    }
+    if (destinationLock) destinationLock.hidden = !locked || !collection;
+    if (destinationName) destinationName.textContent = collection?.name || "";
+  }
 
   function announce(message) {
     if (!liveRegion) return;
@@ -116,6 +145,7 @@
     allItems.forEach(function (item) {
       item.removeButton.disabled = uploading || item.status === "uploading";
     });
+    updateCollectionControls();
   }
 
   function safeDocumentPath(candidate, documentId) {
@@ -143,6 +173,8 @@
       listItem.append(link);
       const matchStatus = match.status || match.state;
       if (matchStatus) listItem.append(document.createTextNode(" — " + String(matchStatus).replaceAll("_", " ").toLowerCase()));
+      const boundary = [match.collection_key, match.language].filter(Boolean).join(" / ");
+      if (boundary) listItem.append(document.createTextNode(" · " + boundary));
       matchList.append(listItem);
     });
   }
@@ -160,7 +192,11 @@
         method: "POST",
         credentials: "same-origin",
         headers: headers,
-        body: JSON.stringify({ filename: item.file.name, size_bytes: item.file.size })
+        body: JSON.stringify({
+          filename: item.file.name,
+          size_bytes: item.file.size,
+          collection_key: item.collectionKey
+        })
       });
       if (!response.ok) throw new Error(await problemMessage(response));
 
@@ -191,6 +227,11 @@
   }
 
   function addFile(file) {
+    const collection = selectedCollection();
+    if (!collection) {
+      showFormError("Choose a destination collection before selecting files.");
+      return;
+    }
     const id = createId();
     const fragment = rowTemplate.content.cloneNode(true);
     const row = fragment.querySelector("[data-upload-item]");
@@ -204,6 +245,8 @@
       idempotencyKey: createId(),
       identity: fileIdentity(file),
       file: file,
+      collectionKey: collection.key,
+      collectionName: collection.name,
       row: list.querySelector('[data-upload-id="' + CSS.escape(id) + '"]'),
       status: "checking",
       possibleDuplicate: false,
@@ -239,6 +282,10 @@
     showFormError("");
     const incoming = Array.from(fileList || []);
     if (!incoming.length) return;
+    if (!selectedCollection()) {
+      showFormError("Choose a destination collection before selecting files.");
+      return;
+    }
 
     const existingIdentities = new Set(Array.from(items.values(), function (item) { return item.identity; }));
     let duplicateSelections = 0;
@@ -308,7 +355,8 @@
   function queuedDocumentLink(item, payload) {
     const documentId = payload.document_id || payload.id || payload.document?.id || "";
     const documentUrl = payload.document_url || payload.document?.detail_url || payload.url || "";
-    item.statusNode.textContent = "Queued successfully. ";
+    const language = payload.document?.language || payload.language || "und";
+    item.statusNode.textContent = "Queued successfully for " + item.collectionName + ". Language " + (language === "und" ? "pending" : language.toUpperCase()) + ". ";
     const link = document.createElement("a");
     link.href = safeDocumentPath(documentUrl, documentId);
     link.textContent = "View document";
@@ -325,6 +373,7 @@
       payload.append("file", item.file, item.file.name);
       payload.append("possible_duplicate_confirmed", String(item.possibleDuplicate && item.confirmed));
       payload.append("idempotency_key", item.idempotencyKey);
+      payload.append("collection_key", item.collectionKey);
 
       const request = new XMLHttpRequest();
       let settled = false;
@@ -449,6 +498,15 @@
     showFormError("");
     updateControls();
     announce("File selection cleared");
+  });
+
+  collectionChoices.forEach(function (choice) {
+    choice.addEventListener("change", function () {
+      showFormError("");
+      updateCollectionControls();
+      const collection = selectedCollection();
+      if (collection) announce("Destination set to " + collection.name);
+    });
   });
 
   startButton.addEventListener("click", uploadReadyFiles);

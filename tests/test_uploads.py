@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
 
-from pdf_bridge.models import Document, DocumentState, ScanState, utc_now
+from pdf_bridge.db import get_db
+from pdf_bridge.models import (
+    Document,
+    DocumentState,
+    OperationState,
+    OperationType,
+    QueueOperation,
+    ScanState,
+    utc_now,
+)
 from pdf_bridge.scanner import ScannerProtocolError, ScannerUnavailableError, ScanResult
 from pdf_bridge.storage import StorageLayout, stream_upload
 from tests.conftest import PDF_A, PDF_B
@@ -57,7 +70,11 @@ def test_possible_duplicate_requires_confirmation(
     preflight = client.post(
         "/api/v1/uploads/preflight",
         headers=csrf_headers,
-        json={"filename": "revision.pdf", "size_bytes": len(PDF_B)},
+        json={
+            "filename": "revision.pdf",
+            "size_bytes": len(PDF_B),
+            "collection_key": "customer",
+        },
     )
     assert preflight.status_code == 200
     assert preflight.json()["requires_confirmation"] is True
@@ -119,7 +136,7 @@ def test_invalid_uploads_and_csrf_fail_closed(
         "/api/v1/uploads",
         headers={**csrf_headers, "Idempotency-Key": "header-key-123"},
         files={"file": ("document.pdf", PDF_A, "application/pdf")},
-        data={"idempotency_key": "form-key-456"},
+        data={"idempotency_key": "form-key-456", "collection_key": "customer"},
     )
     assert mismatched_key.status_code == 422
     assert mismatched_key.json()["code"] == "idempotency-key-mismatch"
@@ -270,7 +287,11 @@ def test_concurrent_distinct_uploads_are_all_registered(app) -> None:
                         "application/pdf",
                     )
                 },
-                data={"idempotency_key": key, "possible_duplicate_confirmed": "false"},
+                data={
+                    "idempotency_key": key,
+                    "possible_duplicate_confirmed": "false",
+                    "collection_key": "customer",
+                },
             )
             return response.status_code, response.json().get("document", {}).get("id", "")
 
@@ -278,6 +299,85 @@ def test_concurrent_distinct_uploads_are_all_registered(app) -> None:
         results = list(executor.map(upload, range(4)))
     assert [status for status, _document_id in results] == [201, 201, 201, 201]
     assert len({document_id for _status, document_id in results}) == 4
+
+
+@pytest.mark.parametrize("matching_winner", [True, False])
+def test_idempotency_commit_race_uses_the_winning_catalog_row(
+    app,
+    client: TestClient,
+    csrf_headers: dict[str, str],
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    matching_winner: bool,
+) -> None:
+    racing_session = session_factory()
+    winner_id = uuid.uuid4()
+    winner_operation_id = uuid.uuid4()
+
+    def database_override():
+        yield racing_session
+
+    def race_commit() -> None:
+        racing_session.rollback()
+        with session_factory() as winner_session:
+            filename = "race.pdf" if matching_winner else "different.pdf"
+            collection_key = "customer" if matching_winner else "internal"
+            winner = Document(
+                id=winner_id,
+                original_filename=filename,
+                normalized_filename=filename,
+                storage_key=f"objects/{winner_id}.pdf",
+                size_bytes=len(PDF_A),
+                sha256=(
+                    hashlib.sha256(PDF_A).hexdigest()
+                    if matching_winner
+                    else hashlib.sha256(PDF_B).hexdigest()
+                ),
+                idempotency_key="commit-race-key",
+                state=DocumentState.QUEUED,
+                collection_key=collection_key,
+                scan_state=ScanState.CLEAN,
+                scan_engine="test-clamd",
+                scanned_at=utc_now(),
+                uploader_identity="race-winner",
+            )
+            operation = QueueOperation(
+                id=winner_operation_id,
+                document=winner,
+                operation_type=OperationType.INGEST,
+                state=OperationState.QUEUED,
+                attempt=1,
+            )
+            winner_session.add_all([winner, operation])
+            winner_session.commit()
+        raise IntegrityError("simulated idempotency race", {}, Exception("unique"))
+
+    original_override = app.dependency_overrides[get_db]
+    app.dependency_overrides[get_db] = database_override
+    monkeypatch.setattr(racing_session, "commit", race_commit)
+    try:
+        response = client.post(
+            "/api/v1/uploads",
+            headers={**csrf_headers, "Idempotency-Key": "commit-race-key"},
+            files={"file": ("race.pdf", PDF_A, "application/pdf")},
+            data={
+                "idempotency_key": "commit-race-key",
+                "possible_duplicate_confirmed": "false",
+                "collection_key": "customer",
+            },
+        )
+    finally:
+        app.dependency_overrides[get_db] = original_override
+        racing_session.close()
+
+    if matching_winner:
+        assert response.status_code == 201, response.text
+        assert response.json()["idempotent_replay"] is True
+        assert response.json()["document"]["id"] == str(winner_id)
+        assert response.json()["operation_id"] == str(winner_operation_id)
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "idempotency-key-conflict"
 
 
 def test_interrupted_upload_removes_partial_temporary_file(tmp_path) -> None:

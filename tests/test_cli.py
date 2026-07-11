@@ -55,7 +55,7 @@ def test_job_pull_streams_verifies_and_atomically_stages(tmp_path: Path, monkeyp
         return_value=httpx.Response(
             200,
             json={
-                "version": 1,
+                "version": 2,
                 "batch_id": str(batch_id),
                 "request_id": "jenkins-cli-test",
                 "state": "CLAIMED",
@@ -69,6 +69,10 @@ def test_job_pull_streams_verifies_and_atomically_stages(tmp_path: Path, monkeyp
                         "filename": "handbook.pdf",
                         "size_bytes": len(PDF_A),
                         "sha256": sha256,
+                        "collection_key": "customer",
+                        "language": "und",
+                        "classification_required": True,
+                        "relative_path": f"pdfs/und/customer/{document_id}.pdf",
                         "download_url": (
                             f"/api/v1/jobs/batches/{batch_id}/operations/{operation_id}/content"
                         ),
@@ -113,8 +117,14 @@ def test_job_pull_streams_verifies_and_atomically_stages(tmp_path: Path, monkeyp
     )
     assert result.exit_code == 0, result.output
     batch_directory = destination / str(batch_id)
-    assert (batch_directory / "manifest.json").is_file()
-    assert (batch_directory / "files" / f"{operation_id}.pdf").read_bytes() == PDF_A
+    staged_manifest = json.loads((batch_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert staged_manifest["version"] == 2
+    assert staged_manifest["operations"][0]["relative_path"] == (
+        f"pdfs/und/customer/{document_id}.pdf"
+    )
+    assert (
+        batch_directory / "pdfs" / "und" / "customer" / f"{document_id}.pdf"
+    ).read_bytes() == PDF_A
     assert json.loads(result_path.read_text(encoding="utf-8"))["operation_count"] == 1
 
 
@@ -127,19 +137,25 @@ def test_job_report_validates_and_submits_results(tmp_path: Path, monkeypatch) -
     report_path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "batch_id": str(batch_id),
                 "pipeline_run_id": "pipeline-cli-test",
                 "results": [
                     {
                         "operation_id": str(operation_id),
-                        "success": True,
+                        "outcome": "succeeded",
                         "chunk_count": 3,
                         "components": {
                             "pdf_source": "succeeded",
                             "markdown": "succeeded",
                             "bm25": "succeeded",
                             "dense": "succeeded",
+                        },
+                        "classification": {
+                            "language": "en",
+                            "status": "detected",
+                            "method": "test-parser",
+                            "confidence": 0.99,
                         },
                     }
                 ],
@@ -171,6 +187,7 @@ def test_job_report_validates_and_submits_results(tmp_path: Path, monkeypatch) -
                 "completed_at": now.isoformat(),
                 "succeeded": 1,
                 "failed": 0,
+                "review_required": 0,
                 "idempotent_replay": False,
             },
         )
@@ -227,19 +244,25 @@ def test_job_report_rejects_batch_mismatch_before_request(tmp_path: Path, monkey
     report_path.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "batch_id": str(report_batch_id),
                 "pipeline_run_id": "pipeline-mismatch-test",
                 "results": [
                     {
                         "operation_id": str(operation_id),
-                        "success": True,
+                        "outcome": "succeeded",
                         "chunk_count": 1,
                         "components": {
                             "pdf_source": "succeeded",
                             "markdown": "succeeded",
                             "bm25": "succeeded",
                             "dense": "succeeded",
+                        },
+                        "classification": {
+                            "language": "en",
+                            "status": "detected",
+                            "method": "test-parser",
+                            "confidence": 0.99,
                         },
                     }
                 ],
@@ -287,8 +310,10 @@ def test_job_report_rejects_batch_mismatch_before_request(tmp_path: Path, monkey
 def test_job_staging_removes_partial_batch_after_checksum_failure(tmp_path: Path) -> None:
     batch_id = uuid.uuid4()
     operation_id = uuid.uuid4()
+    document_id = uuid.uuid4()
     now = datetime.now(UTC)
     remote = BatchManifestResponse(
+        version=2,
         batch_id=batch_id,
         request_id="jenkins-checksum-test",
         state=BatchState.CLAIMED,
@@ -297,11 +322,15 @@ def test_job_staging_removes_partial_batch_after_checksum_failure(tmp_path: Path
         operations=[
             BatchManifestItem(
                 operation_id=operation_id,
-                document_id=uuid.uuid4(),
+                document_id=document_id,
                 operation_type=OperationType.INGEST,
                 filename="checksum.pdf",
                 size_bytes=len(PDF_A),
                 sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
+                collection_key="customer",
+                language="und",
+                classification_required=True,
+                relative_path=f"pdfs/und/customer/{document_id}.pdf",
                 download_url=f"/operations/{operation_id}/content",
             )
         ],
@@ -329,6 +358,101 @@ def test_job_staging_removes_partial_batch_after_checksum_failure(tmp_path: Path
     assert list(destination.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "unsafe_path_template",
+    [
+        "/pdfs/und/customer/{document_id}.pdf",
+        "../pdfs/und/customer/{document_id}.pdf",
+        "pdfs/und/customer/../customer/{document_id}.pdf",
+        r"pdfs\und\customer\{document_id}.pdf",
+        "pdfs/und/internal/{document_id}.pdf",
+        "C:/pdfs/und/customer/{document_id}.pdf",
+    ],
+)
+def test_job_client_rejects_server_supplied_unsafe_relative_path(
+    unsafe_path_template: str,
+) -> None:
+    document_id = uuid.uuid4()
+    unsafe_path = unsafe_path_template.format(document_id=document_id)
+    operation = BatchManifestItem(
+        operation_id=uuid.uuid4(),
+        document_id=document_id,
+        operation_type=OperationType.INGEST,
+        filename="path-test.pdf",
+        size_bytes=len(PDF_A),
+        sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
+        collection_key="customer",
+        language="und",
+        classification_required=True,
+        relative_path=f"pdfs/und/customer/{document_id}.pdf",
+        download_url="/content",
+    )
+    object.__setattr__(operation, "relative_path", unsafe_path)
+    remote = BatchManifestResponse.model_construct(
+        version=2,
+        batch_id=uuid.uuid4(),
+        request_id="jenkins-unsafe-path",
+        state=BatchState.CLAIMED,
+        claimed_at=datetime.now(UTC),
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=30),
+        operations=[operation],
+    )
+
+    with pytest.raises(BridgeClientError, match="unsafe or inconsistent relative_path"):
+        _local_manifest(remote)
+
+
+def test_job_client_requires_manifest_version_two() -> None:
+    remote = BatchManifestResponse.model_construct(version=1)
+
+    with pytest.raises(BridgeClientError, match="unsupported server manifest version: 1"):
+        _local_manifest(remote)
+
+
+def test_job_stages_delete_metadata_without_downloading(tmp_path: Path) -> None:
+    batch_id = uuid.uuid4()
+    document_id = uuid.uuid4()
+    relative_path = f"pdfs/fr/internal/{document_id}.pdf"
+    now = datetime.now(UTC)
+    remote = BatchManifestResponse(
+        version=2,
+        batch_id=batch_id,
+        request_id="jenkins-delete-stage",
+        state=BatchState.CLAIMED,
+        claimed_at=now,
+        lease_expires_at=now + timedelta(minutes=30),
+        operations=[
+            BatchManifestItem(
+                operation_id=uuid.uuid4(),
+                document_id=document_id,
+                operation_type=OperationType.DELETE,
+                filename="retired.pdf",
+                size_bytes=len(PDF_A),
+                sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
+                collection_key="internal",
+                language="fr",
+                classification_required=False,
+                relative_path=relative_path,
+                download_url=None,
+            )
+        ],
+    )
+
+    class NoDownloadClient:
+        def stream_operation(self, _download_url: str):
+            raise AssertionError("DELETE operations must not be downloaded")
+
+    destination = tmp_path / "handoff"
+    destination.mkdir()
+    final_directory, _checksum = _stage_new_batch(
+        NoDownloadClient(), destination, remote, _local_manifest(remote)
+    )
+
+    staged = json.loads((final_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert staged["operations"][0]["relative_path"] == relative_path
+    assert not (final_directory / Path(relative_path)).exists()
+
+
 def test_admin_import_manifest_dry_run(
     tmp_path: Path,
     monkeypatch,
@@ -341,10 +465,17 @@ def test_admin_import_manifest_dry_run(
     manifest = tmp_path / "historical.json"
     manifest.write_text(
         json.dumps(
-            {
-                "version": 1,
-                "documents": [{"path": "existing.pdf", "filename": "Existing.pdf"}],
-            }
+                {
+                    "version": 2,
+                    "documents": [
+                        {
+                            "path": "existing.pdf",
+                            "filename": "Existing.pdf",
+                            "collection_key": "internal",
+                            "language": "fr",
+                        }
+                    ],
+                }
         ),
         encoding="utf-8",
     )

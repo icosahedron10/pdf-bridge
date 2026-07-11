@@ -11,6 +11,30 @@
   <span class="status status--{{ css_value }}">{{ label }}</span>
 {%- endmacro %}
 
+{% macro audience_label(audience) -%}
+  {% set normalized = audience|default('internal', true)|lower %}
+  <span class="audience-boundary audience-boundary--{{ normalized }}">
+    {% if normalized == 'customer' %}
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><circle cx="8" cy="8" r="5.75" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M2.5 8h11M8 2.25c1.5 1.58 2.25 3.5 2.25 5.75S9.5 12.17 8 13.75C6.5 12.17 5.75 10.25 5.75 8S6.5 3.83 8 2.25Z" fill="none" stroke="currentColor" stroke-width="1.05"/></svg>
+      Customer-facing
+    {% else %}
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
+      Internal only
+    {% endif %}
+  </span>
+{%- endmacro %}
+
+{% macro language_label(language, status=none) -%}
+  {% set code = language|default('und', true)|lower %}
+  {% if code == 'en' %}{% set label = 'English' %}
+  {% elif code == 'fr' %}{% set label = 'Français' %}
+  {% else %}{% set label = 'Undetermined' %}{% endif %}
+  <span class="language-label language-label--{{ code }}{% if status %} language-label--{{ status|lower|replace('_', '-') }}{% endif %}">
+    <span aria-hidden="true">{{ code|upper }}</span>
+    {{ label }}
+  </span>
+{%- endmacro %}
+
 {% macro value_or_missing(value, missing='Not reported') -%}
   {% if value is not none and value != '' %}
     {{ value }}

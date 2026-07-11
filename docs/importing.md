@@ -2,12 +2,13 @@
 
 `pdf-bridge import-manifest` is a local administrative command for registering PDFs that were
 already ingested before the bridge existed. It uses the same filename, PDF signature, size,
-checksum, exact-duplicate, and ClamAV controls as a new upload. It creates each document directly in
-the `INGESTED` state plus a synthetic successful ingestion operation for lifecycle transparency; it
-does not enqueue work for Jenkins.
+checksum, exact-duplicate, and ClamAV controls as a new upload. Version 2 requires the operator to
+attest the configured collection and an already-established English or French language. It creates
+each document directly in the `INGESTED` state plus a synthetic successful ingestion operation for
+lifecycle transparency; it does not enqueue work for Jenkins or move an existing Qdrant payload.
 
-Run it only on the bridge host/container with access to the catalog and canonical storage. This is
-not a browser feature and does not accept a remote URL.
+Run it only on the Linux bridge host/container with access to the catalog and canonical storage.
+This is not a browser feature and does not accept a remote URL.
 
 ## Prepare a source root
 
@@ -19,15 +20,17 @@ The source root is a security boundary. Each manifest entry is resolved, includi
 must remain beneath the resolved root. Relative paths are strongly preferred because they make the
 manifest reviewable and portable. A symlink pointing outside the root is rejected.
 
-## Version 1 manifest
+## Version 2 manifest
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "documents": [
     {
       "path": "policies/remote-work.pdf",
       "filename": "Remote work policy.pdf",
+      "collection_key": "internal",
+      "language": "fr",
       "ingested_at": "2026-06-18T13:05:00Z",
       "chunk_count": 47,
       "pipeline_run_id": "legacy-import-2026-06"
@@ -35,6 +38,8 @@ manifest reviewable and portable. A symlink pointing outside the root is rejecte
     {
       "path": "handbooks/safety.pdf",
       "filename": null,
+      "collection_key": "customer",
+      "language": "en",
       "ingested_at": null,
       "chunk_count": null,
       "pipeline_run_id": null
@@ -47,16 +52,23 @@ Fields:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `version` | yes | must be `1` |
+| `version` | yes | must be `2` |
 | `documents` | yes | 1–10,000 entries; duplicate source paths are rejected |
 | `path` | yes | source path resolved under `--source-root` |
 | `filename` | no | display filename; defaults to the source basename and must end in `.pdf` |
+| `collection_key` | yes | stable key from `PDF_BRIDGE_COLLECTIONS`; must match the existing downstream corpus |
+| `language` | yes | operator attestation of `en` or `fr`; `und` is not accepted for an already-ingested record |
 | `ingested_at` | no | known UTC-aware historical ingestion time; otherwise import time |
 | `chunk_count` | no | known nonnegative downstream chunk count |
 | `pipeline_run_id` | no | bounded identifier that can be correlated with pipeline records |
 
 Use JSON `null` or omit an unknown optional field. Do not invent metadata merely to avoid an
 “information unavailable” label in the document ledger.
+
+Collection and language are not optional historical hints. Before approval, verify that every
+document and all of its chunks already exist only in the named Qdrant collection, and that the
+attested language agrees with the downstream corpus. If that evidence is unavailable, do not
+import the record as ingested; place it through the maintenance review/rebuild workflow instead.
 
 ## Validate first
 
@@ -73,8 +85,9 @@ Dry-run is the default. It validates the strict manifest and resolved paths, str
 through size/signature/hash checks, scans it with ClamAV, and checks active exact duplicates. It
 does not create document/audit rows or retain canonical copies. Scanner failure fails the run.
 
-Review the JSON result: each item contains the effective filename, SHA-256, byte count, and a null
-`document_id`. Record the manifest checksum and dry-run output with the approved change ticket.
+Review the JSON result: each item contains the effective filename, SHA-256, byte count, collection,
+language, and a null `document_id`. Record the manifest checksum and dry-run output with the
+approved change ticket.
 
 ## Apply once
 
@@ -97,8 +110,8 @@ For each entry, apply mode:
 3. calculates SHA-256 and rejects an active duplicate;
 4. streams the copy to ClamAV and requires a clean result;
 5. atomically promotes the clean copy to canonical storage;
-6. creates an ingested document, a synthetic `SUCCEEDED` ingestion operation, and an audit event in
-   one controlled transaction.
+6. creates an ingested document with an audited historical language override, a synthetic
+   `SUCCEEDED` ingestion operation, and an audit event in one controlled transaction.
 
 The command fails hard on the first invalid item and rolls back its catalog transaction. Because a
 database transaction and filesystem promotion cannot form one distributed transaction, an abrupt
@@ -112,8 +125,11 @@ confirmed missing documents.
 - Every returned document UUID opens the expected ledger and clean preview.
 - SHA-256 and size agree with the source inventory.
 - Historical times/counts/run IDs appear when supplied; unknown values are labeled unavailable.
-- Retrieval search returns these bridge UUIDs. If the existing Qdrant payloads lack them, update or
-  reingest those chunks before declaring search integration complete.
+- The catalog shows the attested collection and language for every imported UUID.
+- Retrieval search returns each bridge UUID only from its attested collection and language. If the
+  existing Qdrant payloads lack `document_id`, `collection_key`, or language, update or reingest
+  those chunks before declaring search integration complete.
+- A known internal topic produces an explicit zero in the customer collection.
 - Source files remain unchanged.
 
 ## Backups versus imports

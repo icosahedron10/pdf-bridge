@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from pdf_bridge.models import (
     Document,
     DocumentState,
+    LanguageCode,
+    LanguageStatus,
     OperationState,
     OperationType,
     QueueOperation,
@@ -30,6 +32,9 @@ def _cleanup_document(*, state: DocumentState, filename: str) -> Document:
         sha256=document_id.hex * 2,
         idempotency_key=f"cleanup-test:{document_id}",
         state=state,
+        collection_key="customer",
+        language=LanguageCode.EN,
+        language_status=LanguageStatus.DETECTED,
         scan_state=ScanState.CLEAN,
         scan_engine="test-clamd",
         scanned_at=utc_now(),
@@ -104,12 +109,12 @@ def test_cleanup_states_are_visible_in_their_web_surfaces(
         session.add_all([deletion_operation, cancellation_operation])
         session.commit()
 
-    library = client.get("/library")
+    library = client.get("/library/customer")
     assert library.status_code == 200
-    assert deletion.original_filename in library.text
-    assert "Deletion cleanup" in library.text
+    # Downstream deletion has already succeeded, so cleanup-only records are no
+    # longer retrieval-eligible and remain visible through Queue/details instead.
+    assert deletion.original_filename not in library.text
     assert cancellation.original_filename not in library.text
-    assert f"/api/v1/documents/{deletion.id}/content" not in library.text
 
     deletion_queue = client.get("/queue?status=delete_cleanup")
     assert deletion_queue.status_code == 200

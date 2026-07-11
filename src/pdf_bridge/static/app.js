@@ -156,10 +156,12 @@
         setSubmitting(form, true);
 
         try {
-          const action = new URL(form.action, window.location.href);
+          // Attribute access avoids HTML named-property collisions from fields such as
+          // the classification discriminator named "action".
+          const action = new URL(form.getAttribute("action") || window.location.href, window.location.href);
           if (action.origin !== window.location.origin) throw new Error("Cross-origin form actions are not allowed.");
 
-          const method = (form.dataset.method || form.method || "POST").toUpperCase();
+          const method = (form.dataset.method || form.getAttribute("method") || "POST").toUpperCase();
           const headers = { Accept: "application/json, application/problem+json" };
           if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
 

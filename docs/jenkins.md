@@ -7,8 +7,10 @@ pipeline itself.
 
 ## Agent setup
 
-1. Use a controlled agent with Python 3.12 and network access to the internal bridge URL.
-2. Allocate a durable handoff root outside the Jenkins workspace, Git checkout, and OneDrive.
+1. Use a controlled Linux agent with Python 3.12, a POSIX shell, and network access to the internal
+   bridge URL. Windows and macOS agents are not supported.
+2. Allocate a durable handoff root outside the Jenkins workspace, Git checkout, and synchronized
+   directories; `/srv/rag/pdf-bridge-handoff` is the example location.
 3. Store the bridge job token as a Jenkins secret-text credential.
 4. Publish the exact released `pdf-bridge` wheel and its dependencies to an approved internal
    package index. Install an exact version with `--only-binary=:all:`; never install `.` from the
@@ -82,7 +84,7 @@ Its `manifest.json` is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "batch_id": "b6eab35c-d552-4894-8d43-2c0b7ef9f513",
   "request_id": "jenkins-pdf-ingest-412",
   "claimed_at": "2026-07-10T05:55:00+00:00",
@@ -95,7 +97,10 @@ Its `manifest.json` is:
       "filename": "Safety handbook.pdf",
       "size_bytes": 348121,
       "sha256": "c5ac957ff6a8adf6bde68b0f2d9858f72091c1a0383ac673be163a7b528af02f",
-      "local_path": "files/dbcc76d3-6338-4f09-9f3a-2b66d8095f82.pdf"
+      "collection_key": "customer",
+      "language": "und",
+      "classification_required": true,
+      "relative_path": "pdfs/und/customer/d8fb31ea-bda8-4355-b52e-97c30bcbe35b.pdf"
     },
     {
       "operation_id": "5e7cfbf5-962b-441d-95c3-f15546c98985",
@@ -104,16 +109,34 @@ Its `manifest.json` is:
       "filename": "Retired policy.pdf",
       "size_bytes": 92215,
       "sha256": "9d9766d70f6e3f1416bc44bab063b37c552e9a71cf08869f219019de4229af4a",
-      "local_path": null
+      "collection_key": "internal",
+      "language": "fr",
+      "classification_required": false,
+      "relative_path": "pdfs/fr/internal/0df9842d-7860-4d24-9839-78adf1e6c517.pdf"
     }
   ]
 }
 ```
 
-Treat `filename` as display metadata. Read the generated `local_path`; never derive paths from the
-filename. An `INGEST` item has a file. A `DELETE` item does not: use `document_id` to remove its PDF
-source, markdown, BM25 chunks, and dense chunks. Every Qdrant chunk must retain this bridge UUID in
-its payload as `document_id`.
+Treat `filename` as display metadata. Read the server-issued `relative_path`; never derive paths
+from the filename. The client independently verifies that it is exactly
+`pdfs/{language}/{collection_key}/{document_id}.pdf` and rejects absolute, traversal, noncanonical,
+or metadata-mismatched paths before writing anything. An `INGEST` item has a file at that path
+below the batch directory. A `DELETE` item carries the same routing metadata but has no downloaded
+file or download URL; use its collection, language, and `document_id` to remove the PDF source,
+markdown, BM25 chunks, and dense chunks. Every Qdrant chunk must retain the bridge UUID,
+`collection_key`, and language in its payload.
+
+`collection_key` is the configured cross-system identity: it must equal the target Qdrant
+collection name and the value understood by chatbot-manager `allowed_collections`. The ingestion
+pipeline treats it as authoritative routing data, not user-controlled metadata.
+
+New uploads arrive as `language: "und"` with `classification_required: true`. The downstream PDF
+parser already used for extraction must classify them as English or French before indexing, then
+place the durable RAG PDF source at the same path with `und` replaced by the detected language; it
+must never index an undetermined document. Do not add V8, Node, PDF.js, or `franc` to PDF Bridge for
+this inspection. An operator override arrives as `en` or `fr` with classification disabled.
+Collection placement is authoritative in either case; the pipeline must never infer or change it.
 
 Use the batch directory read-only and write markdown/results elsewhere. That preserves the ability
 to verify a replay. The pull algorithm is:
@@ -135,13 +158,13 @@ The pipeline must emit exactly one result for every manifest operation:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "batch_id": "b6eab35c-d552-4894-8d43-2c0b7ef9f513",
   "pipeline_run_id": "rag-nightly-2026-07-10-412",
   "results": [
     {
       "operation_id": "dbcc76d3-6338-4f09-9f3a-2b66d8095f82",
-      "success": true,
+      "outcome": "succeeded",
       "chunk_count": 84,
       "components": {
         "pdf_source": "succeeded",
@@ -149,11 +172,16 @@ The pipeline must emit exactly one result for every manifest operation:
         "bm25": "succeeded",
         "dense": "succeeded"
       },
-      "error": null
+      "classification": {
+        "language": "fr",
+        "status": "detected",
+        "method": "downstream_pdf_parser",
+        "confidence": 0.98
+      }
     },
     {
       "operation_id": "5e7cfbf5-962b-441d-95c3-f15546c98985",
-      "success": false,
+      "outcome": "failed",
       "chunk_count": null,
       "components": {
         "pdf_source": "succeeded",
@@ -167,10 +195,42 @@ The pipeline must emit exactly one result for every manifest operation:
 }
 ```
 
-Component values are `succeeded`, `failed`, or `not_applicable`. A successful operation cannot
-contain a failed component. A failed operation requires bounded error text (maximum 4,000
-characters) suitable for the coworker's lifecycle view; exclude stack dumps, secrets, paths, and
-document contents. Deletion is finalized only when all four components are `succeeded`.
+Component values are `succeeded`, `failed`, or `not_applicable`; operation outcomes are
+`succeeded`, `failed`, or `review_required`. A successful ingest must report a `detected` or
+`overridden` `en`/`fr` classification and cannot contain a failed component. A delete omits
+classification. A failed operation represents an operational/parser failure, remains retryable,
+and requires bounded error text (maximum 4,000 characters) suitable for the coworker's lifecycle
+view; exclude stack dumps, secrets, paths, and document contents. Deletion is finalized only when
+all four components are `succeeded`.
+
+When text inspection cannot safely choose English or French, report `review_required` with
+classification language `und`, status `review_required`, and one bounded reason: `no_text`,
+`ocr_required`, `encrypted`, `bilingual`, `unsupported`, or `low_confidence`. BM25 and dense must
+both be `not_applicable`, and the pipeline must not write either index. This is a content decision,
+not an operational failure; do not use it for parser crashes, timeouts, or unavailable services.
+
+A review result has this operation shape:
+
+```json
+{
+  "operation_id": "dbcc76d3-6338-4f09-9f3a-2b66d8095f82",
+  "outcome": "review_required",
+  "chunk_count": null,
+  "components": {
+    "pdf_source": "succeeded",
+    "markdown": "succeeded",
+    "bm25": "not_applicable",
+    "dense": "not_applicable"
+  },
+  "classification": {
+    "language": "und",
+    "status": "review_required",
+    "method": "downstream_pdf_parser",
+    "confidence": null,
+    "reason": "low_confidence"
+  }
+}
+```
 
 The ingestion wrapper should write a complete report even when one operation fails. It may then
 exit nonzero; the example uses Jenkins `catchError` so the report stage still runs while the build
@@ -204,6 +264,7 @@ because filenames and operational errors may be sensitive.
 | Lease expires before staging | start a new claim with a new request/build ID after requeue |
 | Staging acknowledged but ingestion never ran | rerun the same staged batch; do not make a new claim |
 | Some pipeline operations fail | report every result; retry failed items later from the UI |
+| Language cannot be determined safely | report `review_required`; do not write retrieval indexes or retry as an operational failure |
 | Result response is lost | resubmit the identical report |
 | Pull/report batch IDs differ | stop; remove stale workspace artifacts and investigate the producer |
 | Existing batch verification fails | stop; investigate disk tampering/corruption before changing files |

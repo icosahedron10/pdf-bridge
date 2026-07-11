@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -22,6 +22,7 @@ from sqlalchemy.exc import ArgumentError
 APP_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SESSION_SECRET = "development-only-change-me"
 HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+COLLECTION_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -30,6 +31,35 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+class CollectionDefinition(BaseModel):
+    """Deployment-owned metadata for one isolated retrieval collection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: str = Field(max_length=63)
+    display_name: str = Field(max_length=255)
+    description: str = Field(max_length=2_000)
+    audience: Literal["customer", "internal"]
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        if not COLLECTION_KEY.fullmatch(value):
+            raise ValueError(
+                "collection key must contain only lowercase letters, numbers, hyphens, "
+                "and underscores, and must start with a letter or number"
+            )
+        return value
+
+    @field_validator("display_name", "description")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("collection display name and description cannot be blank")
+        return stripped
 
 
 class Settings(BaseSettings):
@@ -48,6 +78,7 @@ class Settings(BaseSettings):
 
     storage_root: Path
     database_url: str = ""
+    collections: list[CollectionDefinition] = Field(min_length=1, max_length=50)
 
     session_secret: SecretStr = SecretStr(DEVELOPMENT_SESSION_SECRET)
     allowed_hosts: list[str] = Field(
@@ -73,6 +104,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_and_prepare(self) -> Settings:
+        collection_keys = [collection.key for collection in self.collections]
+        if len(collection_keys) != len(set(collection_keys)):
+            raise ValueError("collection keys must be unique")
+
         root = self.storage_root.expanduser().resolve(strict=False)
         app_root = APP_ROOT.resolve(strict=False)
 
