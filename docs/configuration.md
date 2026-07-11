@@ -14,7 +14,7 @@ Engine and Compose. Windows and macOS hosts and agents are not supported deploym
 | Variable | Purpose | POC value |
 |---|---|---|
 | `PDF_BRIDGE_STORAGE_ROOT` | Absolute canonical data directory | `/var/lib/pdf-bridge` in Compose |
-| `PDF_BRIDGE_SESSION_SECRET` | Signs pseudonymous browser sessions | unique random value, at least 32 characters |
+| `PDF_BRIDGE_SESSION_SECRET` | Derives the browser-session encryption and authentication key | unique random value, at least 32 characters |
 | `PDF_BRIDGE_JOB_TOKEN` | Authenticates Jenkins API calls | separate random value, at least 32 characters |
 | `PDF_BRIDGE_ALLOWED_HOSTS` | Accepted HTTP Host values, encoded as JSON | `["localhost","127.0.0.1"]` |
 | `PDF_BRIDGE_COLLECTIONS` | Ordered JSON collection registry; there is no default | see example below |
@@ -68,6 +68,49 @@ state.
 `enterprise` refuses to start with anonymous access, the development session secret, or no trusted
 proxy CIDRs. Do not expose trusted-header mode directly to clients: the named identity header is
 authoritative only when the immediate peer address belongs to a configured CIDR.
+
+## Branding and appearance
+
+Branding is deployment-wide. It is not stored per tenant or per user, and there is no runtime
+branding administration screen. Configure the four client colors before starting the application:
+
+| Variable | Default | Semantic role |
+|---|---:|---|
+| `PDF_BRIDGE_BRAND_PRIMARY_1` | `#173f34` | actions and primary branded surfaces |
+| `PDF_BRIDGE_BRAND_PRIMARY_2` | `#0f3028` | action hover and pressed states |
+| `PDF_BRIDGE_BRAND_SECONDARY_1` | `#d5a846` | focus and selected outlines |
+| `PDF_BRIDGE_BRAND_SECONDARY_2` | `#d9c78f` | accents and active marks |
+| `PDF_BRIDGE_THEME_DEFAULT` | `system` | `system`, `light`, or `dark` |
+
+Each color must be a `#` followed by exactly six hexadecimal digits. Shorthand colors, alpha
+channels, CSS color names and functions, surrounding whitespace, and additional CSS are rejected;
+an invalid value prevents startup. PDF Bridge chooses an AA black or white foreground for each
+branded surface instead of assuming that one foreground works for every color. Text on neutral
+surfaces remains tied to the accessible light/dark text palette. Danger, warning, and success remain
+fixed semantic roles so their meaning does not change between client deployments.
+Quote color values in `.env` files so the leading `#` is not parsed as a comment.
+
+For example, an approved client palette can be supplied through the deployment environment:
+
+```text
+PDF_BRIDGE_BRAND_PRIMARY_1="#1f4e79"
+PDF_BRIDGE_BRAND_PRIMARY_2="#173a5e"
+PDF_BRIDGE_BRAND_SECONDARY_1="#8a4b08"
+PDF_BRIDGE_BRAND_SECONDARY_2="#fde68a"
+PDF_BRIDGE_THEME_DEFAULT=system
+```
+
+The application serves the validated values through the same-origin `/theme.css` stylesheet, which
+keeps deployment branding compatible with the Content Security Policy. Components consume semantic
+tokens instead of client color values directly; changing a client palette must not change status
+semantics or page layout.
+
+When `PDF_BRIDGE_THEME_DEFAULT=system`, light or dark mode follows the operating system and updates
+when the system preference changes. A user's toggle choice is stored as `light` or `dark` under the
+namespaced local-storage key `pdf-bridge:theme` and takes precedence over the deployment default.
+With no stored choice, an explicit deployment default of `light` or `dark` remains fixed and does
+not follow later operating-system changes. Clearing the stored value returns the user to the
+deployment default.
 
 ## Files and database
 

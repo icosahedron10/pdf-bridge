@@ -17,6 +17,7 @@ from pdf_bridge.admin_cli import app as admin_app
 from pdf_bridge.job_cli import (
     BridgeClientError,
     _local_manifest,
+    _problem_message,
     _stage_new_batch,
 )
 from pdf_bridge.job_cli import (
@@ -27,6 +28,21 @@ from pdf_bridge.schemas import BatchManifestItem, BatchManifestResponse
 from tests.conftest import PDF_A, clean_scanner
 
 runner = CliRunner()
+
+
+def test_job_client_reads_native_litestar_error_detail() -> None:
+    response = httpx.Response(
+        400,
+        headers={
+            "content-type": "application/json",
+            "x-request-id": "request-native-error",
+        },
+        json={"status_code": 400, "detail": "The request body was invalid."},
+    )
+
+    assert _problem_message(response) == (
+        "400 Bad Request: The request body was invalid. (request request-native-error)"
+    )
 
 
 @respx.mock

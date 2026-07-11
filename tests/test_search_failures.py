@@ -5,7 +5,7 @@ import uuid
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 
 
 def _request(query: str, mode: str = "hybrid", page_size: int = 10) -> dict:

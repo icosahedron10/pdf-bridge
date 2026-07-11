@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import RequestFactory, TestClient
 from pydantic import SecretStr, ValidationError
 
+from pdf_bridge.app import create_app
 from pdf_bridge.config import Settings
+from pdf_bridge.db import build_engine, create_schema
 from pdf_bridge.lifecycle import LifecycleError, import_historical_manifest
 from pdf_bridge.models import Document, DocumentState
+from pdf_bridge.problems import ProblemError
+from pdf_bridge.security import get_actor
 from pdf_bridge.storage import StorageLayout, UnsafePathError, validate_source_path
 from tests.conftest import PDF_A, clean_scanner
 
@@ -131,23 +136,40 @@ def test_retrieval_configuration_requires_a_separate_credential(tmp_path: Path) 
 def test_trusted_header_identity_requires_configured_proxy(app) -> None:
     app.state.settings.auth_mode = "trusted-header"
     app.state.settings.trusted_proxy_cidrs = ["127.0.0.0/8"]
-    with TestClient(app, client=("127.0.0.1", 50000)) as trusted_client:
-        accepted = trusted_client.get(
-            "/upload", headers={"X-Forwarded-User": "data.scientist@example.test"}
-        )
-        assert accepted.status_code == 200
-        assert "data.scientist@example.test" in accepted.text
+    trusted_request = RequestFactory(
+        app=app,
+        server="127.0.0.1",
+        port=50000,
+    ).get(
+        "/upload",
+        headers={"X-Forwarded-User": "data.scientist@example.test"},
+        session={},
+    )
+    actor = get_actor(trusted_request)
+    assert actor.identifier == "data.scientist@example.test"
+    assert actor.kind == "trusted-header"
 
-        missing = trusted_client.get("/upload")
-        assert missing.status_code == 401
-        assert missing.json()["code"] == "identity-required"
+    missing_request = RequestFactory(
+        app=app,
+        server="127.0.0.1",
+        port=50000,
+    ).get("/upload", session={})
+    with pytest.raises(ProblemError) as missing:
+        get_actor(missing_request)
+    assert missing.value.code == "identity-required"
 
-    with TestClient(app, client=("192.0.2.5", 50000)) as untrusted_client:
-        rejected = untrusted_client.get(
-            "/upload", headers={"X-Forwarded-User": "forged@example.test"}
-        )
-        assert rejected.status_code == 401
-        assert rejected.json()["code"] == "untrusted-identity-source"
+    untrusted_request = RequestFactory(
+        app=app,
+        server="192.0.2.5",
+        port=50000,
+    ).get(
+        "/upload",
+        headers={"X-Forwarded-User": "forged@example.test"},
+        session={},
+    )
+    with pytest.raises(ProblemError) as rejected:
+        get_actor(untrusted_request)
+    assert rejected.value.code == "untrusted-identity-source"
 
 
 def test_html_responses_have_a_restrictive_content_security_policy(
@@ -160,11 +182,78 @@ def test_html_responses_have_a_restrictive_content_security_policy(
     assert "object-src 'none'" in policy
     assert "form-action 'self'" in policy
 
-    docs = client.get("/api/docs")
-    assert docs.status_code == 200
-    docs_policy = docs.headers["content-security-policy"]
-    assert "https://cdn.jsdelivr.net" in docs_policy
-    assert "connect-src 'self'" in docs_policy
+    for path in ("/api", "/api/", "/api/docs", "/api/oauth2-redirect.html"):
+        docs = client.get(path)
+        assert docs.status_code == 200, path
+        docs_policy = docs.headers["content-security-policy"]
+        assert "https://cdn.jsdelivr.net" in docs_policy
+        assert "connect-src 'self'" in docs_policy
+
+
+def test_browser_session_cookie_is_encrypted_and_persists(client: TestClient) -> None:
+    first = client.get("/upload")
+    assert first.status_code == 200
+    first_token = re.search(
+        r'<meta name="csrf-token" content="([^"]+)"', first.text
+    )
+    assert first_token
+
+    encoded_cookie = client.cookies.get("pdf_bridge_session")
+    assert encoded_cookie
+    assert first_token.group(1) not in encoded_cookie
+    set_cookie = first.headers["set-cookie"]
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=strict" in set_cookie
+    assert "Max-Age=28800" in set_cookie
+    assert "Path=/" in set_cookie
+
+    second = client.get("/upload")
+    second_token = re.search(
+        r'<meta name="csrf-token" content="([^"]+)"', second.text
+    )
+    assert second_token
+    assert second_token.group(1) == first_token.group(1)
+
+
+def test_enterprise_mode_disables_all_openapi_routes(tmp_path: Path) -> None:
+    storage_root = tmp_path / "enterprise-docs"
+    database_path = storage_root / "catalog.sqlite3"
+    settings = Settings(
+        app_env="enterprise",
+        auth_mode="trusted-header",
+        storage_root=storage_root,
+        database_url=f"sqlite+pysqlite:///{database_path.as_posix()}",
+        session_secret=SecretStr("enterprise-docs-session-secret-32-characters"),
+        job_token=SecretStr("enterprise-docs-job-token-32-characters-long"),
+        allowed_hosts=["testserver"],
+        trusted_proxy_cidrs=["127.0.0.0/8"],
+        collections=[
+            {
+                "key": "customer",
+                "display_name": "Customer Product",
+                "description": "Approved customer-facing product content.",
+                "audience": "customer",
+            }
+        ],
+    )
+    engine = build_engine(settings.database_url)
+    create_schema(engine)
+    engine.dispose()
+    application = create_app(settings, scanner=clean_scanner)
+
+    with TestClient(
+        application,
+        base_url="http://testserver",
+        raise_server_exceptions=True,
+    ) as test_client:
+        for path in (
+            "/api",
+            "/api/",
+            "/api/docs",
+            "/api/openapi.json",
+            "/api/oauth2-redirect.html",
+        ):
+            assert test_client.get(path).status_code == 404, path
 
 
 def test_historical_import_dry_run_rejects_duplicate_manifest_contents(

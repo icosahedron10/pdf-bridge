@@ -192,13 +192,13 @@ def _problem_message(response: httpx.Response) -> str:
     request_id = response.headers.get("x-request-id")
     suffix = f" (request {request_id})" if request_id else ""
     content_type = response.headers.get("content-type", "").partition(";")[0].casefold()
-    if content_type == "application/problem+json":
+    if content_type == "application/json" or content_type.endswith("+json"):
         try:
             body = response.json()
         except (ValueError, httpx.ResponseNotRead):
             body = None
         if isinstance(body, dict):
-            title = str(body.get("title", "Request failed"))[:200]
+            title = str(body.get("title") or response.reason_phrase or "Request failed")[:200]
             detail = str(body.get("detail", "")).strip()[:1000]
             code = str(body.get("code", "")).strip()[:100]
             message = f"{response.status_code} {title}"

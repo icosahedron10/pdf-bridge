@@ -6,7 +6,7 @@ pipeline. Markdown, chunking, BM25, sentence-transformer embeddings, and Qdrant 
 
 ```mermaid
 flowchart LR
-    U["Trusted coworker"] -->|"choose collection; upload and review"| B["PDF Bridge\nFastAPI + SQLite"]
+    U["Trusted coworker"] -->|"choose collection; upload and review"| B["PDF Bridge\nLitestar + SQLite"]
     B -->|"INSTREAM scan"| C["ClamAV clamd"]
     B -->|"opaque UUID canonical object"| V["External data volume"]
     J["Jenkins scheduled job"] -->|"claim, download, acknowledge"| B

@@ -8,7 +8,7 @@ import secrets
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from fastapi import Request
+from litestar import Request
 
 from pdf_bridge.problems import ProblemError
 
@@ -20,10 +20,16 @@ class Actor:
 
 
 def ensure_browser_session(request: Request) -> None:
-    if "session_id" not in request.session:
-        request.session["session_id"] = secrets.token_urlsafe(18)
-    if "csrf_token" not in request.session:
-        request.session["csrf_token"] = secrets.token_urlsafe(32)
+    session = dict(request.session)
+    changed = False
+    if "session_id" not in session:
+        session["session_id"] = secrets.token_urlsafe(18)
+        changed = True
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+        changed = True
+    if changed:
+        request.set_session(session)
 
 
 def csrf_token(request: Request) -> str:

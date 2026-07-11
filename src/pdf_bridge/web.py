@@ -4,19 +4,19 @@ from __future__ import annotations
 
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlencode
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import RedirectResponse
-from fastapi.templating import Jinja2Templates
+from litestar import Request, Response, Router, get
+from litestar.concurrency import sync_to_thread
+from litestar.di import NamedDependency
+from litestar.params import FromPath, FromQuery, QueryParameter
+from litestar.response import Redirect, Template
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
-from starlette.concurrency import run_in_threadpool
 
 from pdf_bridge import __version__
-from pdf_bridge.db import get_db
 from pdf_bridge.lifecycle import ACTIVE_DOCUMENT_STATES
 from pdf_bridge.models import (
     Document,
@@ -31,6 +31,7 @@ from pdf_bridge.scanner import clamd_ping
 from pdf_bridge.schemas import SearchMode, SearchRequest
 from pdf_bridge.search import search_retrieval
 from pdf_bridge.security import csrf_token, get_actor
+from pdf_bridge.theme import render_theme_css
 from pdf_bridge.view_models import (
     audit_event_view,
     components_view,
@@ -39,8 +40,6 @@ from pdf_bridge.view_models import (
 )
 
 TEMPLATE_ROOT = Path(__file__).with_name("templates")
-templates = Jinja2Templates(directory=str(TEMPLATE_ROOT))
-router = APIRouter(include_in_schema=False)
 
 LIBRARY_STATES = (
     DocumentState.INGESTED,
@@ -164,10 +163,14 @@ def _available_document_count(
 
 def _error_page(
     request: Request, *, status_code: int, title: str, message: str
-):
+) -> Template:
     context = _base_context(request, active_page="")
     context.update({"status_code": status_code, "title": title, "message": message})
-    return templates.TemplateResponse(request, "error.html", context, status_code=status_code)
+    return Template(
+        template_name="error.html",
+        context=context,
+        status_code=status_code,
+    )
 
 
 def _base_context(request: Request, *, active_page: str) -> dict[str, Any]:
@@ -184,23 +187,33 @@ def _base_context(request: Request, *, active_page: str) -> dict[str, Any]:
             if request.app.state.settings.app_env != "enterprise"
             else "Enterprise"
         ),
+        "theme_default": request.app.state.settings.theme_default,
         "app_version": __version__,
     }
 
 
-@router.get("/")
-def index() -> RedirectResponse:
-    return RedirectResponse("/library", status_code=307)
+@get("/theme.css", sync_to_thread=False)
+def theme_stylesheet(request: Request) -> Response[str]:
+    return Response(
+        content=render_theme_css(request.app.state.settings),
+        media_type="text/css",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
-@router.get("/library")
+@get("/", sync_to_thread=False)
+def index() -> Redirect:
+    return Redirect("/library", status_code=307)
+
+
+@get("/library")
 async def library_page(
     request: Request,
-    q: str = Query(default="", max_length=1000),
-    mode: SearchMode = SearchMode.HYBRID,
-    language: str = Query(default="all", max_length=3),
-    db: Session = Depends(get_db),
-):
+    db: NamedDependency[Session],
+    q: Annotated[str, QueryParameter(max_length=1000)] = "",
+    mode: FromQuery[SearchMode] = SearchMode.HYBRID,
+    language: Annotated[str, QueryParameter(max_length=3)] = "all",
+) -> Template:
     response_status = 200
     query = q.strip()
     selected_language = _normalized_language(language)
@@ -293,21 +306,23 @@ async def library_page(
         except ProblemError as exc:
             context["search_error"] = exc.detail
             response_status = exc.status
-    return templates.TemplateResponse(
-        request, "library.html", context, status_code=response_status
+    return Template(
+        template_name="library.html",
+        context=context,
+        status_code=response_status,
     )
 
 
-@router.get("/library/{collection_key}")
+@get("/library/{collection_key:str}")
 async def collection_page(
     request: Request,
-    collection_key: str,
-    q: str = Query(default="", max_length=1000),
-    mode: SearchMode = SearchMode.HYBRID,
-    language: str = Query(default="all", max_length=3),
-    page: int = Query(default=1, ge=1),
-    db: Session = Depends(get_db),
-):
+    collection_key: FromPath[str],
+    db: NamedDependency[Session],
+    q: Annotated[str, QueryParameter(max_length=1000)] = "",
+    mode: FromQuery[SearchMode] = SearchMode.HYBRID,
+    language: Annotated[str, QueryParameter(max_length=3)] = "all",
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+) -> Template:
     collection_map = {
         item["key"]: item for item in _configured_collections(request)
     }
@@ -462,22 +477,26 @@ async def collection_page(
                 "result_count": 0,
             }
         )
-    return templates.TemplateResponse(
-        request, "collection_detail.html", context, status_code=response_status
+    return Template(
+        template_name="collection_detail.html",
+        context=context,
+        status_code=response_status,
     )
 
 
-@router.get("/queue")
+@get("/queue", sync_to_thread=True)
 def queue_page(
     request: Request,
-    status: str = Query(default="all", max_length=30),
-    collection: str = Query(default="all", max_length=64),
-    language: str = Query(default="all", max_length=3),
-    sort: str = Query(default="created_at", pattern="^(created_at|status|filename)$"),
-    order: str = Query(default="asc", pattern="^(asc|desc)$"),
-    page: int = Query(default=1, ge=1),
-    db: Session = Depends(get_db),
-):
+    db: NamedDependency[Session],
+    status: Annotated[str, QueryParameter(max_length=30)] = "all",
+    collection: Annotated[str, QueryParameter(max_length=64)] = "all",
+    language: Annotated[str, QueryParameter(max_length=3)] = "all",
+    sort: Annotated[
+        str, QueryParameter(pattern="^(created_at|status|filename)$")
+    ] = "created_at",
+    order: Annotated[str, QueryParameter(pattern="^(asc|desc)$")] = "asc",
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+) -> Template:
     page_size = 25
     operations = db.scalars(
         select(QueueOperation)
@@ -557,16 +576,16 @@ def queue_page(
             "last_claim_at": last_claim_at,
         }
     )
-    return templates.TemplateResponse(request, "queue.html", context)
+    return Template(template_name="queue.html", context=context)
 
 
-@router.get("/review")
+@get("/review", sync_to_thread=True)
 def review_page(
     request: Request,
-    collection: str = Query(default="all", max_length=64),
-    page: int = Query(default=1, ge=1),
-    db: Session = Depends(get_db),
-):
+    db: NamedDependency[Session],
+    collection: Annotated[str, QueryParameter(max_length=64)] = "all",
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+) -> Template:
     page_size = 25
     configured = _configured_collections(request)
     collection_keys = {item["key"] for item in configured}
@@ -606,16 +625,16 @@ def review_page(
             "pagination_query": urlencode({"collection": selected_collection}),
         }
     )
-    return templates.TemplateResponse(request, "review.html", context)
+    return Template(template_name="review.html", context=context)
 
 
-@router.get("/upload")
+@get("/upload")
 async def upload_page(
     request: Request,
-    collection: str = Query(default="", max_length=64),
-):
+    collection: Annotated[str, QueryParameter(max_length=64)] = "",
+) -> Template:
     settings = request.app.state.settings
-    scanner_available = await run_in_threadpool(
+    scanner_available = await sync_to_thread(
         clamd_ping,
         host=settings.clamd_host,
         port=settings.clamd_port,
@@ -633,11 +652,15 @@ async def upload_page(
             "selected_collection": collection if collection in collection_keys else None,
         }
     )
-    return templates.TemplateResponse(request, "upload.html", context)
+    return Template(template_name="upload.html", context=context)
 
 
-@router.get("/documents/{document_id}")
-def document_page(request: Request, document_id: UUID, db: Session = Depends(get_db)):
+@get("/documents/{document_id:uuid}", sync_to_thread=True)
+def document_page(
+    request: Request,
+    document_id: FromPath[UUID],
+    db: NamedDependency[Session],
+) -> Template:
     document = (
         db.execute(
             select(Document)
@@ -679,4 +702,21 @@ def document_page(request: Request, document_id: UUID, db: Session = Depends(get
             "pipeline_components": components_view(active_operation),
         }
     )
-    return templates.TemplateResponse(request, "document_detail.html", context)
+    return Template(template_name="document_detail.html", context=context)
+
+
+web_router = Router(
+    path="",
+    route_handlers=[
+        theme_stylesheet,
+        index,
+        library_page,
+        collection_page,
+        queue_page,
+        review_page,
+        upload_page,
+        document_page,
+    ],
+    include_in_schema=False,
+)
+router = web_router

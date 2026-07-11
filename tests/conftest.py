@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 from pydantic import SecretStr
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -26,7 +26,7 @@ os.environ.setdefault(
 
 from pdf_bridge.app import create_app  # noqa: E402
 from pdf_bridge.config import Settings  # noqa: E402
-from pdf_bridge.db import build_engine, build_session_factory, create_schema, get_db  # noqa: E402
+from pdf_bridge.db import build_engine, build_session_factory, create_schema  # noqa: E402
 from pdf_bridge.models import ScanState, utc_now  # noqa: E402
 from pdf_bridge.scanner import ScanResult  # noqa: E402
 
@@ -83,20 +83,26 @@ def session_factory(settings: Settings) -> Iterator[sessionmaker[Session]]:
 
 @pytest.fixture
 def app(settings: Settings, session_factory: sessionmaker[Session]):
-    application = create_app(settings, scanner=clean_scanner)
-
     def database_override() -> Iterator[Session]:
         with session_factory() as session:
             yield session
 
-    application.dependency_overrides[get_db] = database_override
+    application = create_app(
+        settings,
+        scanner=clean_scanner,
+        db_provider=database_override,
+    )
     application.state.test_session_factory = session_factory
     return application
 
 
 @pytest.fixture
 def client(app) -> Iterator[TestClient]:
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        base_url="http://testserver",
+        raise_server_exceptions=True,
+    ) as test_client:
         yield test_client
 
 

@@ -6,7 +6,7 @@ import uuid
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge.models import (
@@ -230,7 +230,8 @@ def test_upload_requires_configured_collection_and_locks_idempotency_scope(
         headers=csrf_headers,
         json={"filename": "missing.pdf", "size_bytes": len(PDF_A)},
     )
-    assert missing_preflight.status_code == 422
+    assert missing_preflight.status_code == 400
+    assert missing_preflight.json()["status_code"] == 400
 
     unknown_preflight = client.post(
         "/api/v1/uploads/preflight",
@@ -250,7 +251,8 @@ def test_upload_requires_configured_collection_and_locks_idempotency_scope(
         files={"file": ("missing.pdf", PDF_A, "application/pdf")},
         data={"idempotency_key": "missing-collection-key"},
     )
-    assert missing_upload.status_code == 422
+    assert missing_upload.status_code == 400
+    assert missing_upload.json()["status_code"] == 400
 
     unknown_upload = upload_pdf(key="unknown-collection-key", collection="partners")
     assert unknown_upload.status_code == 422

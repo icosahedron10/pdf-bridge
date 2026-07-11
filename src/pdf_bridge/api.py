@@ -4,19 +4,33 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import TypeAdapter, ValidationError
+from litestar import Request, Router, delete, get, post
+from litestar.concurrency import sync_to_thread
+from litestar.datastructures import UploadFile
+from litestar.di import NamedDependency, Provide
+from litestar.enums import RequestEncodingType
+from litestar.openapi.datastructures import ResponseSpec
+from litestar.openapi.spec import Operation, RequestBody
+from litestar.params import (
+    Body,
+    FromPath,
+    FromQuery,
+    HeaderParameter,
+    JSONBody,
+    MultipartBody,
+    QueryParameter,
+)
+from litestar.response import File, Response
+from pydantic import RootModel, TypeAdapter, ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
-from starlette.concurrency import run_in_threadpool
 
-from pdf_bridge.db import get_db
 from pdf_bridge.lifecycle import (
     ACTIVE_DOCUMENT_STATES,
     DuplicateDocumentError,
@@ -78,8 +92,35 @@ from pdf_bridge.storage import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1", tags=["PDF Bridge"], responses=problem_responses())
 idempotency_adapter = TypeAdapter(IdempotencyKey)
+
+
+@dataclass(slots=True)
+class UploadForm:
+    """Multipart upload contract with the public form field names."""
+
+    file: UploadFile
+    collection_key: str
+    possible_duplicate_confirmed: bool = False
+    idempotency_key: str | None = None
+
+
+class ClassificationBody(RootModel[ClassificationRequest]):
+    """Single Pydantic body model around the discriminated request union."""
+
+
+@dataclass
+class OptionalRequestBodyOperation(Operation):
+    """Correct Litestar 2.24's always-required OpenAPI request-body flag."""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.request_body, RequestBody):
+            self.request_body.required = False
+
+
+_BROWSER_ACTOR_DEPENDENCIES = {"_actor": Provide(get_actor, sync_to_thread=False)}
+_CSRF_ACTOR_DEPENDENCIES = {"actor": Provide(require_csrf)}
+_CSRF_CHECK_DEPENDENCIES = {"_actor": Provide(require_csrf)}
 
 LIBRARY_STATES = (
     DocumentState.INGESTED,
@@ -185,11 +226,16 @@ def _get_document_detail(db: Session, document_id: UUID) -> Document:
     return document
 
 
-@router.get("/collections", response_model=CollectionListResponse)
+@get(
+    "/collections",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def list_collections(
     request: Request,
-    _actor: Actor = Depends(get_actor),
-    db: Session = Depends(get_db),
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> CollectionListResponse:
     processing_states = tuple(
         state
@@ -254,17 +300,26 @@ def list_collections(
     return CollectionListResponse(items=items, total=len(items))
 
 
-@router.get("/documents", response_model=DocumentListResponse)
+@get(
+    "/documents",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def list_documents(
     request: Request,
-    scope: Literal["library", "queue", "review", "all"] = "all",
-    state: DocumentState | None = None,
-    collection_key: str | None = None,
-    language: LanguageCode | None = None,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=100),
-    _actor: Actor = Depends(get_actor),
-    db: Session = Depends(get_db),
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    document_scope: Annotated[
+        Literal["library", "queue", "review", "all"], QueryParameter(name="scope")
+    ] = "all",
+    document_state: Annotated[
+        DocumentState | None, QueryParameter(name="state")
+    ] = None,
+    collection_key: FromQuery[str | None] = None,
+    language: FromQuery[LanguageCode | None] = None,
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
 ) -> DocumentListResponse:
     filters = []
     if collection_key is not None:
@@ -272,11 +327,11 @@ def list_documents(
         filters.append(Document.collection_key == collection_key)
     if language is not None:
         filters.append(Document.language == language)
-    if state is not None:
-        filters.append(Document.state == state)
-    elif scope == "library":
+    if document_state is not None:
+        filters.append(Document.state == document_state)
+    elif document_scope == "library":
         filters.extend(_retrieval_catalog_filters())
-    elif scope == "queue":
+    elif document_scope == "queue":
         filters.append(
             Document.state.in_(
                 tuple(
@@ -286,7 +341,7 @@ def list_documents(
                 )
             )
         )
-    elif scope == "review":
+    elif document_scope == "review":
         filters.append(Document.state == DocumentState.CLASSIFICATION_REVIEW)
     total = db.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
     documents = db.scalars(
@@ -304,11 +359,16 @@ def list_documents(
     )
 
 
-@router.get("/documents/{document_id}", response_model=DocumentDetail)
+@get(
+    "/documents/{document_id:uuid}",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def get_document(
-    document_id: UUID,
-    _actor: Actor = Depends(get_actor),
-    db: Session = Depends(get_db),
+    document_id: FromPath[UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> DocumentDetail:
     document = _get_document_detail(db, document_id)
     return DocumentDetail.model_validate(document).model_copy(
@@ -316,13 +376,19 @@ def get_document(
     )
 
 
-@router.get("/documents/{document_id}/content", response_class=FileResponse)
+@get(
+    "/documents/{document_id:uuid}/content",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    media_type="application/pdf",
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def document_content(
     request: Request,
-    document_id: UUID,
-    _actor: Actor = Depends(get_actor),
-    db: Session = Depends(get_db),
-) -> FileResponse:
+    document_id: FromPath[UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> File:
     document = db.get(Document, document_id)
     if document is None:
         raise ProblemError(
@@ -347,7 +413,7 @@ def document_content(
             title="Stored PDF is missing",
             detail="The catalog and canonical storage are inconsistent. Contact the operator.",
         )
-    return FileResponse(
+    return File(
         path,
         media_type="application/pdf",
         filename=document.original_filename,
@@ -359,16 +425,22 @@ def document_content(
     )
 
 
-@router.post("/uploads/preflight", response_model=UploadPreflightResponse)
+@post(
+    "/uploads/preflight",
+    dependencies=_CSRF_CHECK_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def upload_preflight(
     request: Request,
-    payload: UploadPreflightRequest,
-    _actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    data: JSONBody[UploadPreflightRequest],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> UploadPreflightResponse:
-    _configured_collection(request, payload.collection_key)
+    _configured_collection(request, data.collection_key)
     try:
-        normalized = normalize_filename(payload.filename)
+        normalized = normalize_filename(data.filename)
     except InvalidFilenameError as exc:
         raise ProblemError(
             status=422,
@@ -377,7 +449,7 @@ def upload_preflight(
             detail=str(exc),
         ) from exc
     matches = find_preflight_duplicates(
-        db, normalized_filename=normalized, size_bytes=payload.size_bytes
+        db, normalized_filename=normalized, size_bytes=data.size_bytes
     )
     return UploadPreflightResponse(
         normalized_filename=normalized,
@@ -386,19 +458,23 @@ def upload_preflight(
     )
 
 
-@router.post("/uploads", response_model=UploadResponse, status_code=201)
+@post(
+    "/uploads",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=201,
+    responses=problem_responses(),
+)
 async def upload_document(
     request: Request,
-    file: Annotated[UploadFile, File()],
-    collection_key: Annotated[str, Form()],
-    possible_duplicate_confirmed: Annotated[bool, Form()] = False,
-    form_idempotency_key: Annotated[str | None, Form(alias="idempotency_key")] = None,
-    header_idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-    actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    data: MultipartBody[UploadForm],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    header_idempotency_key: Annotated[
+        str | None, HeaderParameter(name="Idempotency-Key")
+    ] = None,
 ) -> UploadResponse:
-    _configured_collection(request, collection_key)
-    raw_key = header_idempotency_key or form_idempotency_key
+    _configured_collection(request, data.collection_key)
+    raw_key = header_idempotency_key or data.idempotency_key
     try:
         idempotency_key = idempotency_adapter.validate_python(raw_key)
     except ValidationError as exc:
@@ -410,8 +486,8 @@ async def upload_document(
         ) from exc
     if (
         header_idempotency_key
-        and form_idempotency_key
-        and (header_idempotency_key != form_idempotency_key)
+        and data.idempotency_key
+        and (header_idempotency_key != data.idempotency_key)
     ):
         raise ProblemError(
             status=422,
@@ -420,7 +496,7 @@ async def upload_document(
             detail="The header and form idempotency keys must be identical.",
         )
     try:
-        filename = validate_pdf_filename(file.filename or "")
+        filename = validate_pdf_filename(data.file.filename or "")
     except InvalidFilenameError as exc:
         raise ProblemError(
             status=422,
@@ -428,7 +504,7 @@ async def upload_document(
             title="Filename was rejected",
             detail=str(exc),
         ) from exc
-    if file.content_type and file.content_type.casefold() not in {
+    if data.file.content_type and data.file.content_type.casefold() not in {
         "application/pdf",
         "application/octet-stream",
     }:
@@ -445,24 +521,24 @@ async def upload_document(
     registration = None
     try:
         staged = await stream_upload(
-            file,
+            data.file,
             layout,
             max_bytes=settings.max_upload_bytes,
             chunk_bytes=settings.upload_chunk_bytes,
         )
-        scan_result = await run_in_threadpool(request.app.state.scanner, staged.path)
+        scan_result = await sync_to_thread(request.app.state.scanner, staged.path)
         with request.app.state.transition_lock:
             registration = register_staged_upload(
                 db,
                 staged=staged,
                 layout=layout,
                 filename=filename,
-                collection_key=collection_key,
+                collection_key=data.collection_key,
                 idempotency_key=idempotency_key,
                 actor_type=actor.kind,
                 actor_id=actor.identifier,
                 scan_result=scan_result,
-                allow_possible_duplicate=possible_duplicate_confirmed,
+                allow_possible_duplicate=data.possible_duplicate_confirmed,
             )
             if registration.idempotent_replay:
                 staged.path.unlink(missing_ok=True)
@@ -481,7 +557,7 @@ async def upload_document(
                     existing.sha256 != staged.sha256
                     or existing.size_bytes != staged.size_bytes
                     or existing.normalized_filename != normalize_filename(filename)
-                    or existing.collection_key != collection_key
+                    or existing.collection_key != data.collection_key
                 ):
                     raise LifecycleError(
                         "The idempotency key was already used for a different file.",
@@ -523,7 +599,7 @@ async def upload_document(
         db.rollback()
         raise _lifecycle_problem(exc) from exc
     finally:
-        await file.close()
+        await data.file.close()
         if staged is not None:
             staged.path.unlink(missing_ok=True)
 
@@ -536,15 +612,20 @@ async def upload_document(
     )
 
 
-@router.get("/queue", response_model=QueueListResponse)
+@get(
+    "/queue",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def list_queue(
     request: Request,
-    collection_key: str | None = None,
-    language: LanguageCode | None = None,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=100),
-    _actor: Actor = Depends(get_actor),
-    db: Session = Depends(get_db),
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    collection_key: FromQuery[str | None] = None,
+    language: FromQuery[LanguageCode | None] = None,
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
 ) -> QueueListResponse:
     filters = [
         Document.state.in_(
@@ -591,12 +672,18 @@ def list_queue(
     )
 
 
-@router.delete("/queue/{operation_id}", response_model=DocumentMutationResponse)
+@delete(
+    "/queue/{operation_id:uuid}",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def cancel_queue_item(
     request: Request,
-    operation_id: UUID,
-    actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    operation_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
     with request.app.state.transition_lock:
         try:
@@ -641,12 +728,18 @@ def cancel_queue_item(
     return DocumentMutationResponse(document=_document_summary(document))
 
 
-@router.post("/queue/{operation_id}/retry", response_model=DocumentMutationResponse)
+@post(
+    "/queue/{operation_id:uuid}/retry",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
 def retry_queue_item(
     request: Request,
-    operation_id: UUID,
-    actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    operation_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
     with request.app.state.transition_lock:
         try:
@@ -665,17 +758,21 @@ def retry_queue_item(
     )
 
 
-@router.post(
-    "/documents/{document_id}/classification",
-    response_model=DocumentMutationResponse,
+@post(
+    "/documents/{document_id:uuid}/classification",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
 )
 def resolve_document_classification(
     request: Request,
-    document_id: UUID,
-    payload: ClassificationRequest,
-    actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    document_id: FromPath[UUID],
+    data: JSONBody[ClassificationBody],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
+    payload = data.root
     language = payload.language if payload.action == "override" else None
     reason = payload.reason if payload.action == "override" else None
     with request.app.state.transition_lock:
@@ -708,13 +805,23 @@ def resolve_document_classification(
     )
 
 
-@router.post("/documents/{document_id}/deletion", response_model=DocumentMutationResponse)
+@post(
+    "/documents/{document_id:uuid}/deletion",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
+    operation_class=OptionalRequestBodyOperation,
+)
 def request_document_deletion(
     request: Request,
-    document_id: UUID,
-    payload: Annotated[DeleteDocumentRequest | None, Body()] = None,
-    actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    document_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    data: Annotated[
+        DeleteDocumentRequest | None,
+        Body(media_type=RequestEncodingType.JSON),
+    ] = None,
 ) -> DocumentMutationResponse:
     with request.app.state.transition_lock:
         try:
@@ -723,7 +830,7 @@ def request_document_deletion(
                 document_id=document_id,
                 actor_type=actor.kind,
                 actor_id=actor.identifier,
-                reason=payload.reason if payload else None,
+                reason=data.reason if data else None,
             )
             db.commit()
         except LifecycleError as exc:
@@ -734,18 +841,23 @@ def request_document_deletion(
     )
 
 
-@router.post("/search", response_model=SearchResponse)
+@post(
+    "/search",
+    dependencies=_CSRF_CHECK_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+)
 async def search_documents(
     request: Request,
-    payload: SearchRequest,
-    _actor: Actor = Depends(require_csrf),
-    db: Session = Depends(get_db),
+    data: JSONBody[SearchRequest],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> SearchResponse:
-    for collection_key in payload.collections:
+    for collection_key in data.collections:
         _configured_collection(request, collection_key)
     response = await search_retrieval(
         request.app.state.settings,
-        payload,
+        data,
         client=getattr(request.app.state, "search_http_client", None),
     )
     for group in response.groups:
@@ -765,8 +877,8 @@ async def search_documents(
             document_id not in documents_by_id
             or documents_by_id[document_id].collection_key != group.collection_key
             or (
-                payload.language is not None
-                and documents_by_id[document_id].language != payload.language
+                data.language is not None
+                and documents_by_id[document_id].language != data.language
             )
             for document_id in ids
         )
@@ -775,7 +887,7 @@ async def search_documents(
                 select(func.count()).select_from(Document).where(
                     *_retrieval_catalog_filters(
                         collection_key=group.collection_key,
-                        language=payload.language,
+                        language=data.language,
                     ),
                 )
             )
@@ -794,7 +906,11 @@ async def search_documents(
     return response
 
 
-@router.get("/health/live", response_model=HealthResponse)
+@get(
+    "/health/live",
+    responses=problem_responses(),
+    sync_to_thread=False,
+)
 def live() -> HealthResponse:
     return HealthResponse(status="ok", checks={"process": "ok"})
 
@@ -827,29 +943,78 @@ def _dependency_checks(request: Request, db: Session) -> dict[str, str]:
     return checks
 
 
-def _health_response(checks: dict[str, str]) -> JSONResponse:
+def _health_response(checks: dict[str, str]) -> Response[HealthResponse]:
     healthy = all(value == "ok" for value in checks.values())
     body = HealthResponse(status="ok" if healthy else "degraded", checks=checks)
-    return JSONResponse(
-        body.model_dump(mode="json"),
+    return Response(
+        content=body,
         status_code=200 if healthy else 503,
         headers={"Cache-Control": "no-store"},
     )
 
 
-@router.get(
+def _health_responses(description: str) -> dict[int, ResponseSpec]:
+    return {
+        **problem_responses(),
+        503: ResponseSpec(
+            data_container=HealthResponse,
+            description=description,
+            generate_examples=False,
+        ),
+    }
+
+
+@get(
     "/health/ready",
-    response_model=HealthResponse,
-    responses={503: {"model": HealthResponse, "description": "A dependency is not ready"}},
+    responses=_health_responses("A dependency is not ready"),
+    sync_to_thread=True,
 )
-def ready(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+def ready(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
     return _health_response(_dependency_checks(request, db))
 
 
-@router.get(
+@get(
     "/health/dependencies",
-    response_model=HealthResponse,
-    responses={503: {"model": HealthResponse, "description": "A dependency is unavailable"}},
+    responses=_health_responses("A dependency is unavailable"),
+    sync_to_thread=True,
 )
-def dependencies(request: Request, db: Session = Depends(get_db)) -> JSONResponse:
+def dependencies(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
     return _health_response(_dependency_checks(request, db))
+
+
+_API_ROUTE_HANDLERS = (
+    list_collections,
+    list_documents,
+    get_document,
+    document_content,
+    upload_preflight,
+    list_queue,
+    cancel_queue_item,
+    retry_queue_item,
+    resolve_document_classification,
+    request_document_deletion,
+    search_documents,
+    live,
+    ready,
+    dependencies,
+)
+
+
+def create_api_routers(upload_request_max_body_size: int) -> list[Router]:
+    """Build the API routers, isolating uploads behind their envelope limit."""
+
+    if upload_request_max_body_size <= 0:
+        raise ValueError("upload_request_max_body_size must be positive")
+    return [
+        Router(
+            path="/api/v1",
+            route_handlers=list(_API_ROUTE_HANDLERS),
+            tags=["PDF Bridge"],
+        ),
+        Router(
+            path="/api/v1",
+            route_handlers=[upload_document],
+            request_max_body_size=upload_request_max_body_size,
+            tags=["PDF Bridge"],
+        ),
+    ]

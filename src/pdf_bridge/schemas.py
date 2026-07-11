@@ -8,6 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Generic, Literal, TypeVar
 
+from litestar.openapi.datastructures import ResponseSpec
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -59,12 +60,6 @@ class PaginatedResponse(ApiModel, Generic[T]):
         return cls(items=items, total=total, page=page, page_size=page_size, pages=pages)
 
 
-class ProblemFieldError(ApiModel):
-    location: list[str]
-    message: str
-    type: str
-
-
 class DuplicateMatch(ApiModel):
     document_id: uuid.UUID
     filename: str
@@ -85,36 +80,31 @@ class ProblemDetail(ApiModel):
     instance: str | None = None
     code: str
     request_id: str | None = None
-    errors: list[ProblemFieldError] = Field(default_factory=list)
     duplicate: DuplicateMatch | None = None
     possible_duplicates: list[DuplicateMatch] = Field(default_factory=list, max_length=100)
 
 
-def problem_responses() -> dict[int | str, dict[str, Any]]:
+def problem_responses() -> dict[int, ResponseSpec]:
     """Common OpenAPI declarations for the API's problem-details responses."""
 
     descriptions = {
-        400: "Malformed request",
         401: "Authentication failed",
         403: "Request was not authorized",
         404: "Resource was not found",
         409: "State or duplicate conflict",
         413: "Upload is too large",
-        422: "Request validation failed",
+        422: "Request was deliberately rejected",
         500: "Catalog or storage inconsistency",
         502: "Invalid retrieval service response",
         503: "Required dependency is unavailable",
     }
     return {
-        status: {
-            "model": ProblemDetail,
-            "description": description,
-            "content": {
-                "application/problem+json": {
-                    "schema": {"$ref": "#/components/schemas/ProblemDetail"}
-                }
-            },
-        }
+        status: ResponseSpec(
+            data_container=ProblemDetail,
+            description=description,
+            media_type="application/problem+json",
+            generate_examples=False,
+        )
         for status, description in descriptions.items()
     }
 
