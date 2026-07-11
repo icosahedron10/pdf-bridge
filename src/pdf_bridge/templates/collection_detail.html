@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import status_label, audience_label, language_label, document_icon, external_icon, empty_state, pagination %}
+
+{% set selected_mode = search_mode|default('hybrid', true) %}
+{% set current_query = search_query|default('', true) %}
+{% set selected_language = language_filter|default('all', true) %}
+{% set library_items = search_results if search_results is defined and current_query else documents|default([], true) %}
+
+{% block title %}{{ collection.display_name }} · PDF Bridge{% endblock %}
+
+{% block breadcrumbs %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="/library">Collections</a>
+    <span aria-hidden="true">/</span>
+    <span aria-current="page">{{ collection.display_name }}</span>
+  </nav>
+{% endblock %}
+
+{% block page_header %}
+  <div class="page-heading page-heading--collection">
+    <div>
+      <div class="heading-boundary">{{ audience_label(collection.audience) }} <code>{{ collection.key }}</code></div>
+      <h1>{{ collection.display_name }}</h1>
+      <p>{{ collection.description }}</p>
+    </div>
+    <a class="button button--primary" href="/upload?collection={{ collection.key }}">Upload to this collection</a>
+  </div>
+{% endblock %}
+
+{% block content %}
+  <div class="corpus-boundary corpus-boundary--{{ collection.audience }}" role="note">
+    <strong>{% if collection.audience == 'customer' %}Customer-facing corpus{% else %}Internal-only corpus{% endif %}</strong>
+    <span>Every result and document on this page is constrained to <code>{{ collection.key }}</code>.</span>
+  </div>
+
+  <section aria-labelledby="collection-search-title">
+    <h2 class="visually-hidden" id="collection-search-title">Search {{ collection.display_name }}</h2>
+    <form class="search-toolbar" method="get" action="/library/{{ collection.key }}">
+      <div class="search-field">
+        <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m12.5 12.5 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <label class="visually-hidden" for="library-query">Search {{ collection.display_name }}</label>
+        <input id="library-query" name="q" type="search" value="{{ current_query }}" placeholder="Search only {{ collection.display_name }}" autocomplete="off">
+      </div>
+      <div class="field field--inline">
+        <label for="search-mode">Method</label>
+        <select id="search-mode" name="mode">
+          <option value="hybrid" {% if selected_mode == 'hybrid' %}selected{% endif %}>Hybrid</option>
+          <option value="keyword" {% if selected_mode == 'keyword' %}selected{% endif %}>Keyword</option>
+          <option value="semantic" {% if selected_mode == 'semantic' %}selected{% endif %}>Semantic</option>
+        </select>
+      </div>
+      <div class="field field--inline field--language">
+        <label for="library-language">Language</label>
+        <select id="library-language" name="language">
+          <option value="all" {% if selected_language == 'all' %}selected{% endif %}>All languages</option>
+          <option value="en" {% if selected_language == 'en' %}selected{% endif %}>English</option>
+          <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
+        </select>
+      </div>
+      <button class="button button--primary" type="submit">Search collection</button>
+      {% if current_query or selected_language != 'all' %}<a class="button button--quiet" href="/library/{{ collection.key }}">Clear</a>{% endif %}
+    </form>
+  </section>
+
+  {% if search_error|default(false) %}
+    <div class="notice notice--error" role="alert">
+      <div>
+        <strong>Search is unavailable</strong>
+        <p>{{ search_error }} No partial results or fallback search were shown.</p>
+      </div>
+    </div>
+  {% endif %}
+
+  <section class="table-section" aria-labelledby="collection-table-title">
+    <div class="section-heading">
+      <div>
+        <h2 id="collection-table-title">{% if current_query %}Search results{% else %}Documents{% endif %}</h2>
+        {% if current_query %}
+          <p>{{ result_count|default(0) }} result{% if result_count|default(0) != 1 %}s{% endif %} in {{ collection.display_name }} for “{{ current_query }}” using {{ selected_mode }} search.</p>
+        {% elif document_count is defined %}
+          <p>{{ document_count }} document{% if document_count != 1 %}s{% endif %}{% if selected_language != 'all' %} in the selected language{% endif %}.</p>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if library_items %}
+      <div class="table-frame">
+        <table class="data-table data-table--library">
+          <caption class="visually-hidden">Documents in {{ collection.display_name }}</caption>
+          <thead>
+            <tr>
+              <th scope="col">Document</th>
+              {% if current_query %}<th scope="col">Match</th>{% endif %}
+              <th scope="col">Language</th>
+              <th scope="col">Status</th>
+              <th scope="col">Ingested</th>
+              <th scope="col">Chunks</th>
+              <th scope="col" aria-label="Actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in library_items %}
+              {% set doc = item.document if item.document is defined else item %}
+              {% set document_id = doc.id|default(doc.document_id, true) %}
+              {% set filename = doc.original_filename|default(doc.filename, true)|default('Untitled PDF', true) %}
+              {% set document_status = doc.status|default('INGESTED', true)|upper %}
+              <tr>
+                <td class="document-cell">
+                  <div class="document-cell__main">
+                    {{ document_icon() }}
+                    <div>
+                      <a class="document-link" href="/documents/{{ document_id }}">{{ filename }}</a>
+                      <span class="document-cell__meta">{{ doc.size_display|default(doc.size_bytes_display, true)|default('Size not reported', true) }} · <code>{{ collection.key }}</code></span>
+                      {% if document_status == 'DELETE_CLEANUP' %}<span class="document-cell__meta document-cell__meta--warning">Downstream deletion complete; canonical PDF cleanup pending</span>{% endif %}
+                    </div>
+                  </div>
+                </td>
+                {% if current_query %}
+                  <td class="match-cell">
+                    {% if item.snippet|default(false) %}<p class="match-snippet">{{ item.snippet }}</p>{% else %}<span class="missing-value">No snippet reported</span>{% endif %}
+                    {% if item.score is defined and item.score is not none %}<span class="match-score">Score {{ '%.3f'|format(item.score) }}</span>{% endif %}
+                  </td>
+                {% endif %}
+                <td>{{ language_label(doc.language, doc.language_status) }}</td>
+                <td>{{ status_label(document_status) }}</td>
+                <td>{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</td>
+                <td>{{ doc.chunk_count|default('—', true) }}</td>
+                <td class="actions-cell">
+                  <div class="row-actions">
+                    {% if doc.can_preview|default(false) and document_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
+                      <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener">Open {{ external_icon() }}</a>
+                    {% endif %}
+                    {% if document_status == 'INGESTED' %}
+                      <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/library/{{ collection.key }}" data-confirm="Request deletion of {{ filename }}? The document will remain visible until the pipeline confirms every downstream copy was removed." data-confirm-label="Request deletion">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                        <button class="button button--danger-text button--small" type="submit">Delete</button>
+                        <p class="form-error" data-form-error hidden></p>
+                      </form>
+                    {% endif %}
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {{ pagination(page|default(1, true), total_pages|default(1, true), '/library/' ~ collection.key, pagination_query|default('', true)) }}
+    {% elif current_query and not search_error|default(false) %}
+      {{ empty_state('No matching documents in this collection', 'This is an authoritative zero for the selected collection and language.') }}
+    {% elif not search_error|default(false) %}
+      {{ empty_state('No documents in this view', 'Upload a PDF to this collection or choose another language.', '/upload?collection=' ~ collection.key, 'Upload PDF') }}
+    {% endif %}
+  </section>
+{% endblock %}

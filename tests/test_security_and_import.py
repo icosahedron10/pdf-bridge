@@ -178,10 +178,20 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
     manifest.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "documents": [
-                    {"path": "one.pdf", "filename": "one.pdf"},
-                    {"path": "two.pdf", "filename": "two.pdf"},
+                    {
+                        "path": "one.pdf",
+                        "filename": "one.pdf",
+                        "collection_key": "internal",
+                        "language": "en",
+                    },
+                    {
+                        "path": "two.pdf",
+                        "filename": "two.pdf",
+                        "collection_key": "internal",
+                        "language": "en",
+                    },
                 ],
             }
         ),
@@ -201,6 +211,7 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
             max_bytes=1024 * 1024,
             dry_run=True,
             actor_id="import-test",
+            configured_collections={"customer", "internal"},
         )
 
 
@@ -223,13 +234,15 @@ def test_historical_import_applies_scanned_canonical_record(
     manifest.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "documents": [
                     {
                         "path": "existing.pdf",
                         "filename": "Existing handbook.pdf",
                         "chunk_count": 12,
                         "pipeline_run_id": "historical-run-1",
+                        "collection_key": "internal",
+                        "language": "en",
                     }
                 ],
             }
@@ -247,6 +260,7 @@ def test_historical_import_applies_scanned_canonical_record(
             max_bytes=1024 * 1024,
             dry_run=False,
             actor_id="import-test",
+            configured_collections={"customer", "internal"},
         )
         session.commit()
         document_id = response.items[0].document_id

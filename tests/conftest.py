@@ -16,6 +16,13 @@ _IMPORT_STORAGE = tempfile.mkdtemp(prefix="pdf-bridge-import-")
 os.environ.setdefault("PDF_BRIDGE_STORAGE_ROOT", _IMPORT_STORAGE)
 os.environ.setdefault("PDF_BRIDGE_SESSION_SECRET", "test-import-session-secret-32-characters")
 os.environ.setdefault("PDF_BRIDGE_JOB_TOKEN", "test-import-job-secret-32-characters")
+os.environ.setdefault(
+    "PDF_BRIDGE_COLLECTIONS",
+    '[{"key":"customer","display_name":"Customer Product",'
+    '"description":"Approved customer-facing product content.","audience":"customer"},'
+    '{"key":"internal","display_name":"HR & Internal",'
+    '"description":"Employee-only policies and operations.","audience":"internal"}]',
+)
 
 from pdf_bridge.app import create_app  # noqa: E402
 from pdf_bridge.config import Settings  # noqa: E402
@@ -46,6 +53,20 @@ def settings(tmp_path: Path) -> Settings:
         clamd_port=3310,
         clamd_timeout=0.05,
         search_api_url="https://retrieval.test",
+        collections=[
+            {
+                "key": "customer",
+                "display_name": "Customer Product",
+                "description": "Approved customer-facing product content.",
+                "audience": "customer",
+            },
+            {
+                "key": "internal",
+                "display_name": "HR & Internal",
+                "description": "Employee-only policies and operations.",
+                "audience": "internal",
+            },
+        ],
     )
 
 
@@ -97,6 +118,7 @@ def upload_pdf(client: TestClient, csrf_headers: dict[str, str]) -> Callable[...
         key: str = "upload-key-0001",
         confirm: bool = False,
         content_type: str = "application/pdf",
+        collection: str = "customer",
     ):
         headers = {**csrf_headers, "Idempotency-Key": key}
         return client.post(
@@ -106,6 +128,7 @@ def upload_pdf(client: TestClient, csrf_headers: dict[str, str]) -> Callable[...
             data={
                 "idempotency_key": key,
                 "possible_duplicate_confirmed": str(confirm).lower(),
+                "collection_key": collection,
             },
         )
 

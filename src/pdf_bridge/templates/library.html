@@ -1,17 +1,17 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import status_label, document_icon, external_icon, empty_state, pagination %}
+{% from "macros/ui.html" import audience_label %}
 
 {% set selected_mode = search_mode|default('hybrid', true) %}
 {% set current_query = search_query|default('', true) %}
-{% set library_items = search_results if search_results is defined and current_query else documents|default([], true) %}
+{% set selected_language = language_filter|default('all', true) %}
 
-{% block title %}Library · PDF Bridge{% endblock %}
+{% block title %}Collections · PDF Bridge{% endblock %}
 
 {% block page_header %}
   <div class="page-heading">
     <div>
-      <h1>Library</h1>
-      <p>PDFs available to the retrieval pipeline, including pending deletions.</p>
+      <h1>Collections</h1>
+      <p>Corpus boundaries configured for retrieval. Every document belongs to one collection and one audience.</p>
     </div>
     <a class="button button--primary" href="/upload">
       <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 11.75v-9m-3.25 3L8 2.5l3.25 3M3 9.75v3.5h10v-3.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -21,13 +21,13 @@
 {% endblock %}
 
 {% block content %}
-  <section aria-labelledby="library-search-title">
-    <h2 class="visually-hidden" id="library-search-title">Search library</h2>
+  <section aria-labelledby="collection-search-title">
+    <h2 class="visually-hidden" id="collection-search-title">Search every collection</h2>
     <form class="search-toolbar" method="get" action="/library">
       <div class="search-field">
         <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m12.5 12.5 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        <label class="visually-hidden" for="library-query">Search document contents</label>
-        <input id="library-query" name="q" type="search" value="{{ current_query }}" placeholder="Search document contents" autocomplete="off">
+        <label class="visually-hidden" for="library-query">Count matches in every collection</label>
+        <input id="library-query" name="q" type="search" value="{{ current_query }}" placeholder="Where is this topic located?" autocomplete="off">
       </div>
       <div class="field field--inline">
         <label for="search-mode">Method</label>
@@ -37,7 +37,15 @@
           <option value="semantic" {% if selected_mode == 'semantic' %}selected{% endif %}>Semantic</option>
         </select>
       </div>
-      <button class="button button--primary" type="submit">Search</button>
+      <div class="field field--inline field--language">
+        <label for="library-language">Language</label>
+        <select id="library-language" name="language">
+          <option value="all" {% if selected_language == 'all' %}selected{% endif %}>All languages</option>
+          <option value="en" {% if selected_language == 'en' %}selected{% endif %}>English</option>
+          <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
+        </select>
+      </div>
+      <button class="button button--primary" type="submit">Count matches</button>
       {% if current_query %}<a class="button button--quiet" href="/library">Clear</a>{% endif %}
     </form>
   </section>
@@ -45,99 +53,69 @@
   {% if search_error|default(false) %}
     <div class="notice notice--error" role="alert">
       <div>
-        <strong>Search is unavailable</strong>
-        <p>{{ search_error }}</p>
+        <strong>Collection counts are unavailable</strong>
+        <p>{{ search_error }} No fallback search was used.</p>
       </div>
     </div>
   {% endif %}
 
-  <section class="table-section" aria-labelledby="library-table-title">
+  {% if unassigned_review_count|default(0) %}
+    <div class="notice notice--warning" role="status">
+      <div>
+        <strong>{{ unassigned_review_count }} unassigned document{% if unassigned_review_count != 1 %}s{% endif %} need review</strong>
+        <p>Assign a collection before these documents can enter either retrieval corpus.</p>
+      </div>
+      <a class="button button--quiet button--small" href="/review?collection=unassigned">Open review</a>
+    </div>
+  {% endif %}
+
+  <section class="collection-register" aria-labelledby="collection-register-title">
     <div class="section-heading">
       <div>
-        <h2 id="library-table-title">{% if current_query %}Search results{% else %}Documents{% endif %}</h2>
-        {% if current_query %}
-          <p>{{ result_count|default(library_items|length, true) }} result{% if result_count|default(library_items|length, true) != 1 %}s{% endif %} for “{{ current_query }}” using {{ selected_mode }} search.</p>
-        {% elif document_count is defined %}
-          <p>{{ document_count }} document{% if document_count != 1 %}s{% endif %} in the library.</p>
-        {% endif %}
+        <h2 id="collection-register-title">Configured collection register</h2>
+        <p>{{ collections|length }} collection{% if collections|length != 1 %}s{% endif %}. Counts reflect the PDF Bridge catalog.</p>
       </div>
-      {% if last_pipeline_update|default(false) %}
-        <p class="section-heading__meta">Pipeline status updated {{ last_pipeline_update }}</p>
-      {% endif %}
+      {% if current_query %}<p class="section-heading__meta">Exact accepted matches for “{{ current_query }}”</p>{% endif %}
     </div>
 
-    {% if library_items %}
-      <div class="table-frame">
-        <table class="data-table data-table--library">
-          <caption class="visually-hidden">Ingested and deletion-pending PDF documents</caption>
-          <thead>
-            <tr>
-              <th scope="col">Document</th>
-              {% if current_query %}<th scope="col">Match</th>{% endif %}
-              <th scope="col">Status</th>
-              <th scope="col">Ingested</th>
-              <th scope="col">Chunks</th>
-              <th scope="col" aria-label="Actions"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for item in library_items %}
-              {% set doc = item.document if item.document is defined else item %}
-              {% set document_id = doc.id|default(doc.document_id, true) %}
-              {% set filename = doc.original_filename|default(doc.filename, true)|default('Untitled PDF', true) %}
-              {% set document_status = doc.status|default('INGESTED', true)|upper %}
-              <tr>
-                <td class="document-cell">
-                  <div class="document-cell__main">
-                    {{ document_icon() }}
-                    <div>
-                      <a class="document-link" href="/documents/{{ document_id }}">{{ filename }}</a>
-                      <span class="document-cell__meta">{{ doc.size_display|default(doc.size_bytes_display, true)|default('Size not reported', true) }}</span>
-                      {% if document_status == 'DELETE_CLEANUP' %}
-                        <span class="document-cell__meta document-cell__meta--warning">Downstream deletion complete; canonical PDF cleanup pending</span>
-                      {% endif %}
-                    </div>
-                  </div>
-                </td>
-                {% if current_query %}
-                  <td class="match-cell">
-                    {% if item.snippet|default(false) %}
-                      <p class="match-snippet">{{ item.snippet }}</p>
-                    {% else %}
-                      <span class="missing-value">No snippet reported</span>
-                    {% endif %}
-                    {% if item.score is defined and item.score is not none %}<span class="match-score">Score {{ '%.3f'|format(item.score) }}</span>{% endif %}
-                  </td>
-                {% endif %}
-                <td>{{ status_label(document_status) }}</td>
-                <td>{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</td>
-                <td>{{ doc.chunk_count|default('—', true) }}</td>
-                <td class="actions-cell">
-                  <div class="row-actions">
-                    {% if doc.can_preview|default(false) and document_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
-                      <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener">
-                        Open {{ external_icon() }}
-                      </a>
-                    {% endif %}
-                    {% if document_status == 'INGESTED' %}
-                      <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/library" data-confirm="Request deletion of {{ filename }}? The document will remain visible until the pipeline confirms every downstream copy was removed." data-confirm-label="Request deletion">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-                        <button class="button button--danger-text button--small" type="submit">Delete</button>
-                        <p class="form-error" data-form-error hidden></p>
-                      </form>
-                    {% endif %}
-                  </div>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      {{ pagination(page|default(1, true), total_pages|default(1, true), '/library', pagination_query|default('', true)) }}
-    {% elif current_query and not search_error|default(false) %}
-      {{ empty_state('No matching documents', 'Try a different phrase or search method.') }}
-    {% elif not search_error|default(false) %}
-      {{ empty_state('The library is empty', 'Uploaded PDFs appear here after the ingestion job completes.', '/upload', 'Upload PDFs') }}
-    {% endif %}
+    <div class="collection-ledger">
+      {% for item in collections %}
+        <article class="collection-entry collection-entry--{{ item.audience }}" aria-labelledby="collection-{{ item.key }}-title">
+          <div class="collection-entry__identity">
+            <div class="collection-entry__boundary">{{ audience_label(item.audience) }}</div>
+            <h3 id="collection-{{ item.key }}-title"><a href="{{ item.href }}">{{ item.display_name }}</a></h3>
+            <p>{{ item.description }}</p>
+            <code>{{ item.key }}</code>
+          </div>
+
+          {% if current_query %}
+            <div class="collection-entry__search-count{% if item.search_total == 0 %} is-zero{% endif %}">
+              {% if item.search_total is not none %}
+                <strong>{{ item.search_total }}</strong>
+                <span>matching document{% if item.search_total != 1 %}s{% endif %}</span>
+              {% else %}
+                <strong aria-label="Unavailable">—</strong>
+                <span>count unavailable</span>
+              {% endif %}
+            </div>
+          {% endif %}
+
+          <dl class="collection-entry__counts">
+            <div><dt>Available</dt><dd>{{ item.available }}</dd></div>
+            <div><dt>Processing</dt><dd>{{ item.processing }}</dd></div>
+            <div><dt>Needs review</dt><dd>{{ item.review_required }}</dd></div>
+            <div><dt>English</dt><dd>{{ item.english }}</dd></div>
+            <div><dt>Français</dt><dd>{{ item.french }}</dd></div>
+          </dl>
+
+          <div class="collection-entry__action">
+            <a class="button button--quiet" href="{{ item.href }}">
+              {% if current_query %}View matches{% else %}Browse collection{% endif %}
+              <span aria-hidden="true">→</span>
+            </a>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
   </section>
 {% endblock %}

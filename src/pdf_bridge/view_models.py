@@ -12,6 +12,12 @@ from pdf_bridge.models import (
     QueueOperation,
 )
 
+LANGUAGE_LABELS = {
+    "en": "English",
+    "fr": "Français",
+    "und": "Undetermined",
+}
+
 PREVIEW_BLOCKED_STATES = frozenset(
     {
         DocumentState.INGEST_FAILED,
@@ -51,6 +57,9 @@ def document_view(document: Document) -> dict[str, Any]:
         and document.storage_key is not None
         and document.state not in PREVIEW_BLOCKED_STATES
     )
+    language = getattr(document.language, "value", document.language)
+    language_status = getattr(document.language_status, "value", document.language_status)
+    confidence = document.language_confidence
     return {
         "id": str(document.id),
         "document_id": str(document.id),
@@ -85,6 +94,18 @@ def document_view(document: Document) -> dict[str, Any]:
         "pipeline_run_id": document.pipeline_run_id,
         "pipeline_metadata": document.pipeline_metadata,
         "error_message": document.last_error,
+        "collection_key": document.collection_key,
+        "language": language,
+        "language_label": LANGUAGE_LABELS.get(language, "Undetermined"),
+        "language_status": language_status,
+        "language_method": document.language_method,
+        "language_confidence": confidence,
+        "language_confidence_display": (
+            f"{confidence:.0%}" if confidence is not None else None
+        ),
+        "language_reason": document.language_reason,
+        "language_detected_at": document.language_detected_at,
+        "language_detected_at_display": format_time(document.language_detected_at),
         "can_preview": can_preview,
         "cleanup_pending": document.state in CLEANUP_PENDING_STATES,
     }

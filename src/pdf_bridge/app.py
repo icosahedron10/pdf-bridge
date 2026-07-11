@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -14,7 +15,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from pdf_bridge import __version__
 from pdf_bridge.api import router as api_router
 from pdf_bridge.config import Settings, get_settings
+from pdf_bridge.db import build_engine, build_session_factory
 from pdf_bridge.jobs import router as jobs_router
+from pdf_bridge.lifecycle import validate_collection_references
 from pdf_bridge.logging_config import configure_logging
 from pdf_bridge.middleware import RequestContextMiddleware, UploadSizeLimitMiddleware
 from pdf_bridge.problems import install_problem_handlers
@@ -31,6 +34,22 @@ def create_app(
     active_settings = settings or get_settings()
     configure_logging()
     expose_docs = active_settings.app_env != "enterprise"
+
+    @asynccontextmanager
+    async def lifespan(_application: FastAPI):
+        if active_settings.app_env != "test":
+            engine = build_engine(active_settings.database_url)
+            try:
+                factory = build_session_factory(engine)
+                with factory() as session:
+                    validate_collection_references(
+                        session,
+                        {collection.key for collection in active_settings.collections},
+                    )
+            finally:
+                engine.dispose()
+        yield
+
     application = FastAPI(
         title="PDF Bridge API",
         summary="A transparent upload and scheduled-ingestion bridge for PDF documents.",
@@ -38,6 +57,7 @@ def create_app(
         docs_url="/api/docs" if expose_docs else None,
         redoc_url=None,
         openapi_url="/api/openapi.json" if expose_docs else None,
+        lifespan=lifespan,
     )
     application.state.settings = active_settings
     application.state.scanner = scanner or scanner_from_settings(active_settings)

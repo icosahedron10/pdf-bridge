@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros/ui.html" import audience_label %}
 
 {% set file_limit = max_file_count|default(20, true) %}
 {% set byte_limit = max_file_bytes|default(52428800, true) %}
@@ -10,7 +11,7 @@
   <div class="page-heading">
     <div>
       <h1>Upload PDFs</h1>
-      <p>Add documents to the next ingestion run. Files remain in the queue until Jenkins collects them.</p>
+      <p>Choose the retrieval boundary first. The destination cannot change after files are selected.</p>
     </div>
     <a class="button button--quiet" href="/queue">View queue</a>
   </div>
@@ -37,14 +38,36 @@
             data-max-bytes="{{ byte_limit }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
 
-        <label class="drop-zone" id="drop-zone" for="pdf-files">
+        <fieldset class="collection-selector" data-collection-selector>
+          <legend>Destination collection <span aria-hidden="true">*</span></legend>
+          <p>One selection applies to every file in this upload.</p>
+          <div class="collection-selector__options">
+            {% for item in collections %}
+              <label class="collection-choice collection-choice--{{ item.audience }}">
+                <input type="radio" name="collection_key" value="{{ item.key }}" data-collection-choice data-collection-name="{{ item.display_name }}" required {% if selected_collection == item.key %}checked{% endif %}>
+                <span class="collection-choice__body">
+                  <span class="collection-choice__heading"><strong>{{ item.display_name }}</strong>{{ audience_label(item.audience) }}</span>
+                  <span>{{ item.description }}</span>
+                  <code>{{ item.key }}</code>
+                </span>
+              </label>
+            {% endfor %}
+          </div>
+        </fieldset>
+
+        <div class="destination-lock" data-destination-lock role="status" aria-live="polite" hidden>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
+          <span>Destination locked to <strong data-destination-name></strong> while files are selected.</span>
+        </div>
+
+        <label class="drop-zone" id="drop-zone" for="pdf-files" aria-disabled="true">
           <input id="pdf-files" name="files" type="file" accept=".pdf,application/pdf" multiple data-file-input>
           <svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">
             <path d="M11 4.75h12l6 6v24.5H11z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
             <path d="M23 5v6h6M20 29V16.5m-4.5 4L20 16l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
           <span class="drop-zone__title">Drop PDFs here or <span class="text-link">choose files</span></span>
-          <span class="drop-zone__help">Only .pdf files are accepted</span>
+          <span class="drop-zone__help" data-drop-help>Choose a destination collection to enable file selection</span>
         </label>
 
         <noscript>
@@ -113,20 +136,24 @@
       <ol class="check-list">
         <li>
           <span class="check-list__number">1</span>
-          <div><strong>File controls</strong><p>The bridge checks the extension, size, and PDF signature.</p></div>
+          <div><strong>Collection boundary</strong><p>The selected collection is recorded before the PDF enters the queue.</p></div>
         </li>
         <li>
           <span class="check-list__number">2</span>
-          <div><strong>Duplicate checks</strong><p>Filename matches are flagged first; matching file contents are rejected.</p></div>
+          <div><strong>File controls</strong><p>The bridge checks the extension, size, signature, and duplicates.</p></div>
         </li>
         <li>
           <span class="check-list__number">3</span>
           <div><strong>Malware scan</strong><p>ClamAV must report the file clean. Scanner errors block the upload.</p></div>
         </li>
+        <li>
+          <span class="check-list__number">4</span>
+          <div><strong>Language routing</strong><p>The downstream PDF parser reports English or French before indexing.</p></div>
+        </li>
       </ol>
       <div class="guidance-note">
-        <strong>PDFs are not opened or parsed here.</strong>
-        <p>The ingestion environment should still run its parser with least privilege and resource limits.</p>
+        <strong>Language starts as undetermined.</strong>
+        <p>PDF Bridge does not add a second parser runtime. The ingestion environment classifies text with its existing PDF parser.</p>
       </div>
       {% if scanner_available is defined %}
         <div class="dependency-status">

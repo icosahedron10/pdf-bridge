@@ -73,6 +73,46 @@ def _load_batch(db: Session, batch_id: UUID) -> JobBatch:
     return batch
 
 
+def _manifest_metadata(
+    operation: QueueOperation, *, configured_collection_keys: set[str]
+) -> tuple[str, str, bool, str]:
+    document = operation.document
+    collection_key = document.collection_key
+    if (
+        not collection_key
+        or len(collection_key) > 63
+        or not collection_key[0].isalnum()
+        or not collection_key[0].isascii()
+        or collection_key != collection_key.casefold()
+        or collection_key not in configured_collection_keys
+        or any(
+            not (character.isascii() and (character.isalnum() or character in {"-", "_"}))
+            for character in collection_key
+        )
+    ):
+        raise ProblemError(
+            status=500,
+            code="invalid-batch-document-metadata",
+            title="Batch document metadata is invalid",
+            detail="A queued document has no safe configured collection key.",
+        )
+
+    language = getattr(document.language, "value", document.language)
+    if language not in {"und", "en", "fr"}:
+        raise ProblemError(
+            status=500,
+            code="invalid-batch-document-metadata",
+            title="Batch document metadata is invalid",
+            detail="A queued document has an unsupported language value.",
+        )
+
+    classification_required = (
+        operation.operation_type == OperationType.INGEST and language == "und"
+    )
+    relative_path = f"pdfs/{language}/{collection_key}/{document.id}.pdf"
+    return collection_key, language, classification_required, relative_path
+
+
 @router.post(
     "/batches/claim",
     response_model=BatchClaimResponse,
@@ -134,22 +174,34 @@ def get_batch_manifest(
             title="Batch lease expired",
             detail="Claim this work again with a new request ID.",
         )
-    operations = [
-        BatchManifestItem(
-            operation_id=operation.id,
-            document_id=operation.document_id,
-            operation_type=operation.operation_type,
-            filename=operation.document.original_filename,
-            size_bytes=operation.document.size_bytes,
-            sha256=operation.document.sha256,
-            download_url=(
-                f"/api/v1/jobs/batches/{batch.id}/operations/{operation.id}/content"
-                if operation.operation_type == OperationType.INGEST
-                else None
-            ),
+    configured_collection_keys = {
+        collection.key for collection in request.app.state.settings.collections
+    }
+    operations = []
+    for operation in batch.operations:
+        collection_key, language, classification_required, relative_path = _manifest_metadata(
+            operation,
+            configured_collection_keys=configured_collection_keys,
         )
-        for operation in batch.operations
-    ]
+        operations.append(
+            BatchManifestItem(
+                operation_id=operation.id,
+                document_id=operation.document_id,
+                operation_type=operation.operation_type,
+                filename=operation.document.original_filename,
+                size_bytes=operation.document.size_bytes,
+                sha256=operation.document.sha256,
+                collection_key=collection_key,
+                language=language,
+                classification_required=classification_required,
+                relative_path=relative_path,
+                download_url=(
+                    f"/api/v1/jobs/batches/{batch.id}/operations/{operation.id}/content"
+                    if operation.operation_type == OperationType.INGEST
+                    else None
+                ),
+            )
+        )
     return BatchManifestResponse(
         version=batch.manifest_version,
         batch_id=batch.id,
@@ -313,5 +365,6 @@ def report_job_batch(
         completed_at=result.batch.completed_at,
         succeeded=result.succeeded,
         failed=result.failed,
+        review_required=result.review_required,
         idempotent_replay=result.idempotent_replay,
     )

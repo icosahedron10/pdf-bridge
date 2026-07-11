@@ -56,7 +56,7 @@ def import_manifest_command(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Strict version 1 historical import manifest.",
+            help="Strict version 2 historical import manifest.",
         ),
     ],
     source_root: Annotated[
@@ -115,6 +115,7 @@ def import_manifest_command(
                 max_bytes=settings.max_upload_bytes,
                 dry_run=dry_run,
                 actor_id=_validate_actor_id(actor_id),
+                configured_collections={collection.key for collection in settings.collections},
             )
         typer.echo(response.model_dump_json(indent=2))
     except Exception as exc:

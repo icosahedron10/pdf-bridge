@@ -34,6 +34,15 @@ def _components(*, failed: str | None = None) -> dict[str, str]:
     return values
 
 
+def _detected_language(language: str = "en") -> dict[str, object]:
+    return {
+        "language": language,
+        "status": "detected",
+        "method": "test-parser",
+        "confidence": 0.99,
+    }
+
+
 def _claim_and_stage(
     client: TestClient, job_headers: dict[str, str], request_id: str
 ) -> tuple[dict, dict]:
@@ -70,7 +79,12 @@ def test_end_to_end_ingest_search_and_delete(
     document_id = uploaded.json()["document"]["id"]
     batch, manifest = _claim_and_stage(client, job_headers, "jenkins-ingest-001")
     ingest_item = manifest["operations"][0]
+    assert manifest["version"] == 2
     assert ingest_item["operation_type"] == "INGEST"
+    assert ingest_item["collection_key"] == "customer"
+    assert ingest_item["language"] == "und"
+    assert ingest_item["classification_required"] is True
+    assert ingest_item["relative_path"] == f"pdfs/und/customer/{document_id}.pdf"
 
     downloaded = client.get(ingest_item["download_url"], headers=job_headers)
     assert downloaded.status_code == 200
@@ -82,9 +96,10 @@ def test_end_to_end_ingest_search_and_delete(
         "results": [
             {
                 "operation_id": ingest_item["operation_id"],
-                "success": True,
+                "outcome": "succeeded",
                 "chunk_count": 17,
                 "components": _components(),
+                "classification": _detected_language(),
             }
         ],
     }
@@ -133,19 +148,35 @@ def test_end_to_end_ingest_search_and_delete(
 
     def search_handler(request: httpx.Request) -> httpx.Response:
         request_payload = __import__("json").loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "query": request_payload["query"],
-                "mode": request_payload["mode"],
-                "hits": [
+        groups = []
+        for collection_key in request_payload["collections"]:
+            matches_customer = collection_key == "customer"
+            hits = (
+                [
                     {
                         "document_id": document_id,
                         "score": 0.91,
                         "snippet": "Quarterly retention policy",
                         "match_metadata": {"chunk": 3},
                     }
-                ],
+                ]
+                if matches_customer and request_payload["include_hits"]
+                else []
+            )
+            groups.append(
+                {
+                    "collection_key": collection_key,
+                    "total": 1 if matches_customer else 0,
+                    "hits": hits,
+                }
+            )
+        return httpx.Response(
+            200,
+            json={
+                "query": request_payload["query"],
+                "mode": request_payload["mode"],
+                "language": request_payload.get("language"),
+                "groups": groups,
             },
         )
 
@@ -156,13 +187,22 @@ def test_end_to_end_ingest_search_and_delete(
             search = client.post(
                 "/api/v1/search",
                 headers=csrf_headers,
-                json={"query": "retention", "mode": mode, "limit": 10},
+                json={
+                    "query": "retention",
+                    "mode": mode,
+                    "collections": ["customer"],
+                    "include_hits": True,
+                    "page_size": 10,
+                },
             )
             assert search.status_code == 200, search.text
-            assert search.json()["hits"][0]["document_id"] == document_id
+            assert search.json()["groups"][0]["hits"][0]["document_id"] == document_id
         library = client.get("/library?q=retention&mode=hybrid")
         assert library.status_code == 200
-        assert "Quarterly retention policy" in library.text
+        assert "matching document" in library.text
+        collection = client.get("/library/customer?q=retention&mode=hybrid")
+        assert collection.status_code == 200
+        assert "Quarterly retention policy" in collection.text
     finally:
         import asyncio
 
@@ -176,6 +216,10 @@ def test_end_to_end_ingest_search_and_delete(
     delete_item = delete_manifest["operations"][0]
     assert delete_item["operation_type"] == "DELETE"
     assert delete_item["download_url"] is None
+    assert delete_item["collection_key"] == "customer"
+    assert delete_item["language"] == "en"
+    assert delete_item["classification_required"] is False
+    assert delete_item["relative_path"] == f"pdfs/en/customer/{document_id}.pdf"
     deleted = client.post(
         f"/api/v1/jobs/batches/{delete_batch['batch_id']}/results",
         headers=job_headers,
@@ -184,7 +228,7 @@ def test_end_to_end_ingest_search_and_delete(
             "results": [
                 {
                     "operation_id": delete_item["operation_id"],
-                    "success": True,
+                    "outcome": "succeeded",
                     "components": _components(),
                 }
             ],
@@ -218,7 +262,7 @@ def test_failed_ingestion_can_retry(
             "results": [
                 {
                     "operation_id": operation_id,
-                    "success": False,
+                    "outcome": "failed",
                     "components": _components(failed="dense"),
                     "error": "Dense index write failed",
                 }
@@ -300,13 +344,14 @@ def test_mixed_batch_results_are_recorded_as_partial(
             "results": [
                 {
                     "operation_id": operations[0]["operation_id"],
-                    "success": True,
+                    "outcome": "succeeded",
                     "chunk_count": 3,
                     "components": _components(),
+                    "classification": _detected_language(),
                 },
                 {
                     "operation_id": operations[1]["operation_id"],
-                    "success": False,
+                    "outcome": "failed",
                     "components": _components(failed="dense"),
                     "error": "Dense write failed",
                 },
@@ -345,9 +390,10 @@ def test_failed_deletion_retains_canonical_pdf_and_can_retry(
                 "results": [
                     {
                         "operation_id": ingest_manifest["operations"][0]["operation_id"],
-                        "success": True,
+                        "outcome": "succeeded",
                         "chunk_count": 5,
                         "components": _components(),
+                        "classification": _detected_language(),
                     }
                 ],
             },
@@ -367,7 +413,7 @@ def test_failed_deletion_retains_canonical_pdf_and_can_retry(
             "results": [
                 {
                     "operation_id": delete_manifest["operations"][0]["operation_id"],
-                    "success": False,
+                    "outcome": "failed",
                     "components": _components(failed="bm25"),
                     "error": "BM25 removal failed",
                 }
@@ -552,9 +598,10 @@ def test_deletion_cleanup_failure_can_be_replayed(
         "results": [
             {
                 "operation_id": ingest_manifest["operations"][0]["operation_id"],
-                "success": True,
+                "outcome": "succeeded",
                 "chunk_count": 2,
                 "components": _components(),
+                "classification": _detected_language(),
             }
         ],
     }
@@ -578,7 +625,7 @@ def test_deletion_cleanup_failure_can_be_replayed(
         "results": [
             {
                 "operation_id": delete_manifest["operations"][0]["operation_id"],
-                "success": True,
+                "outcome": "succeeded",
                 "components": _components(),
             }
         ],

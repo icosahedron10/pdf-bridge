@@ -24,9 +24,24 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _upload_files(page: Page, base_url: str, files: list[dict]) -> list[str]:
+def _select_collection(page: Page, collection: str) -> None:
+    page.locator(f'input[name="collection_key"][value="{collection}"]').check()
+
+
+def _upload_files(
+    page: Page,
+    base_url: str,
+    files: list[dict],
+    *,
+    collection: str = "customer",
+) -> list[str]:
     page.goto(f"{base_url}/upload")
+    _select_collection(page, collection)
     page.locator("#pdf-files").set_input_files(files)
+    choices = page.locator('input[name="collection_key"]')
+    expect(choices.nth(0)).to_be_disabled()
+    expect(choices.nth(1)).to_be_disabled()
+    expect(page.locator("[data-destination-lock]")).to_contain_text("Destination locked")
     ready = page.locator("[data-file-status]", has_text="Ready to upload")
     expect(ready).to_have_count(len(files))
     page.get_by_role("button", name="Upload ready files").click()
@@ -41,7 +56,12 @@ def _upload_files(page: Page, base_url: str, files: list[dict]) -> list[str]:
     ]
 
 
-def _run_job_batch(client: httpx.Client, request_id: str) -> dict:
+def _run_job_batch(
+    client: httpx.Client,
+    request_id: str,
+    *,
+    review_required: bool = False,
+) -> dict:
     claim = client.post(
         "/api/v1/jobs/batches/claim",
         json={"request_id": request_id, "limit": 100},
@@ -59,9 +79,9 @@ def _run_job_batch(client: httpx.Client, request_id: str) -> dict:
     assert staged.status_code == 200, staged.text
     results = []
     for operation in manifest["operations"]:
-        result = {
+        result: dict[str, object] = {
             "operation_id": operation["operation_id"],
-            "success": True,
+            "outcome": "succeeded",
             "components": {
                 "pdf_source": "succeeded",
                 "markdown": "succeeded",
@@ -70,7 +90,36 @@ def _run_job_batch(client: httpx.Client, request_id: str) -> dict:
             },
         }
         if operation["operation_type"] == "INGEST":
-            result["chunk_count"] = 4
+            if review_required:
+                result.update(
+                    {
+                        "outcome": "review_required",
+                        "components": {
+                            "pdf_source": "succeeded",
+                            "markdown": "succeeded",
+                            "bm25": "not_applicable",
+                            "dense": "not_applicable",
+                        },
+                        "classification": {
+                            "language": "und",
+                            "status": "review_required",
+                            "method": "browser-test-parser",
+                            "reason": "low_confidence",
+                        },
+                    }
+                )
+            else:
+                result.update(
+                    {
+                        "chunk_count": 4,
+                        "classification": {
+                            "language": "en",
+                            "status": "detected",
+                            "method": "browser-test-parser",
+                            "confidence": 0.98,
+                        },
+                    }
+                )
         results.append(result)
     reported = client.post(
         f"/api/v1/jobs/batches/{batch['batch_id']}/results",
@@ -161,6 +210,7 @@ def test_duplicate_confirmation_exact_duplicate_and_queue_removal(live_server: s
         )
 
         page.goto(f"{live_server}/upload")
+        _select_collection(page, "customer")
         page.locator("#pdf-files").set_input_files(
             {"name": "revision.pdf", "mimeType": "application/pdf", "buffer": PDF_B}
         )
@@ -171,6 +221,7 @@ def test_duplicate_confirmation_exact_duplicate_and_queue_removal(live_server: s
         expect(page.get_by_text("Queued successfully", exact=False)).to_be_visible()
 
         page.goto(f"{live_server}/upload")
+        _select_collection(page, "customer")
         page.locator("#pdf-files").set_input_files(
             {"name": "renamed.pdf", "mimeType": "application/pdf", "buffer": PDF_A}
         )
@@ -186,6 +237,45 @@ def test_duplicate_confirmation_exact_duplicate_and_queue_removal(live_server: s
         expect(dialog).to_be_visible()
         dialog.get_by_role("button", name="Remove from queue").click()
         expect(page.get_by_text("revision.pdf")).to_have_count(1)
+        browser.close()
+
+
+@pytest.mark.skipif(
+    os.getenv("PDF_BRIDGE_RUN_BROWSER_TESTS") != "1",
+    reason="set PDF_BRIDGE_RUN_BROWSER_TESTS=1 after installing Playwright Chromium",
+)
+def test_review_workspace_records_audited_language_override(app, live_server: str) -> None:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1200, "height": 820})
+        _upload_files(
+            page,
+            live_server,
+            [{"name": "quebec-policy.pdf", "mimeType": "application/pdf", "buffer": PDF_A}],
+            collection="internal",
+        )
+        job_headers = {"Authorization": f"Bearer {app.state.settings.job_token.get_secret_value()}"}
+        with httpx.Client(base_url=live_server, headers=job_headers) as job_client:
+            _run_job_batch(job_client, "browser-review-job", review_required=True)
+
+        page.goto(f"{live_server}/review")
+        expect(page.get_by_text("quebec-policy.pdf")).to_be_visible()
+        expect(page.get_by_text("Internal only")).to_be_visible()
+        expect(page.get_by_text("Low Confidence", exact=False)).to_be_visible()
+        page.get_by_label("Language").select_option("fr")
+        page.get_by_label("Audit reason").fill("Verified by the Quebec policy owner")
+        def classification_finished(response) -> bool:
+            return response.url.endswith("/classification")
+
+        with page.expect_response(classification_finished) as info:
+            page.get_by_role("button", name="Record override").click()
+        classification_response = info.value
+        assert classification_response.status == 200, classification_response.text()
+        expect(page.get_by_text("No documents need review")).to_be_visible()
+
+        page.goto(f"{live_server}/queue?collection=internal&language=fr")
+        expect(page.get_by_text("quebec-policy.pdf")).to_be_visible()
+        expect(page.locator(".language-label")).to_contain_text("Français")
         browser.close()
 
 
@@ -213,22 +303,48 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
         job_headers = {"Authorization": f"Bearer {app.state.settings.job_token.get_secret_value()}"}
         with httpx.Client(base_url=live_server, headers=job_headers) as job_client:
             ingest_manifest = _run_job_batch(job_client, "browser-ingest-job")
+            assert ingest_manifest["version"] == 2
             assert ingest_manifest["operations"][0]["document_id"] == document_id
+            assert ingest_manifest["operations"][0]["collection_key"] == "customer"
+            assert ingest_manifest["operations"][0]["relative_path"].startswith(
+                "pdfs/und/customer/"
+            )
 
             def search_handler(request: httpx.Request) -> httpx.Response:
                 payload = json.loads(request.content)
+                groups = []
+                for collection in payload["collections"]:
+                    if not payload["include_hits"]:
+                        groups.append(
+                            {
+                                "collection_key": collection,
+                                "total": 1 if collection == "customer" else 0,
+                                "hits": [],
+                            }
+                        )
+                    else:
+                        groups.append(
+                            {
+                                "collection_key": collection,
+                                "total": 1,
+                                "hits": [
+                                    {
+                                        "document_id": document_id,
+                                        "score": 0.875,
+                                        "snippet": (
+                                            "<script>alert(1)</script> retention policy"
+                                        ),
+                                    }
+                                ],
+                            }
+                        )
                 return httpx.Response(
                     200,
                     json={
                         "query": payload["query"],
                         "mode": payload["mode"],
-                        "hits": [
-                            {
-                                "document_id": document_id,
-                                "score": 0.875,
-                                "snippet": "<script>alert(1)</script> retention policy",
-                            }
-                        ],
+                        "language": payload["language"],
+                        "groups": groups,
                     },
                 )
 
@@ -238,7 +354,22 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
                 page.goto(f"{live_server}/library")
                 page.locator("#library-query").fill("retention")
                 page.locator("#search-mode").select_option(mode)
-                page.get_by_role("button", name="Search").click()
+                page.get_by_role("button", name="Count matches").click()
+                expect(
+                    page.locator(
+                        ".collection-entry--customer .collection-entry__search-count strong"
+                    )
+                ).to_have_text("1")
+                expect(
+                    page.locator(
+                        ".collection-entry--internal .collection-entry__search-count strong"
+                    )
+                ).to_have_text("0")
+                customer_entry = page.locator("article").filter(has_text="Customer Product")
+                customer_entry.get_by_role("link", name="View matches").click()
+                expect(page).to_have_url(
+                    f"{live_server}/library/customer?q=retention&mode={mode}"
+                )
                 expect(page.get_by_text("searchable-handbook.pdf")).to_be_visible()
                 expect(page.get_by_text(f"using {mode} search.", exact=False)).to_be_visible()
                 expect(
@@ -246,7 +377,15 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
                 ).to_be_visible()
                 assert "<script>alert(1)</script>" not in page.content()
 
-            page.goto(f"{live_server}/library")
+            forged_response = page.goto(f"{live_server}/library/internal?q=retention")
+            assert forged_response is not None and forged_response.status == 502
+            boundary_error = page.get_by_text(
+                "No partial results or fallback search were shown"
+            )
+            expect(boundary_error).to_be_visible()
+            expect(page.get_by_text("searchable-handbook.pdf")).to_have_count(0)
+
+            page.goto(f"{live_server}/library/customer")
             page.get_by_role("button", name="Delete").click()
             dialog = page.locator("#confirm-dialog")
             expect(dialog).to_be_visible()

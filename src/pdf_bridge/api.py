@@ -26,14 +26,26 @@ from pdf_bridge.lifecycle import (
     cancel_queued_document,
     finalize_cancelled_storage,
     find_preflight_duplicates,
+    queue_classification_review,
     queue_document_deletion,
     register_staged_upload,
     retry_failed_document,
 )
-from pdf_bridge.models import Document, DocumentState, OperationType, QueueOperation
+from pdf_bridge.models import (
+    Document,
+    DocumentState,
+    LanguageCode,
+    LanguageStatus,
+    OperationType,
+    QueueOperation,
+)
 from pdf_bridge.problems import ProblemError
 from pdf_bridge.scanner import ScannerError, clamd_ping
 from pdf_bridge.schemas import (
+    ClassificationRequest,
+    CollectionLanguageCounts,
+    CollectionListResponse,
+    CollectionSummary,
     DeleteDocumentRequest,
     DocumentDetail,
     DocumentListResponse,
@@ -69,6 +81,52 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["PDF Bridge"], responses=problem_responses())
 idempotency_adapter = TypeAdapter(IdempotencyKey)
 
+LIBRARY_STATES = (
+    DocumentState.INGESTED,
+    DocumentState.DELETE_QUEUED,
+    DocumentState.DELETE_CLAIMED,
+    DocumentState.DELETE_CLEANUP,
+    DocumentState.DELETE_FAILED,
+)
+RETRIEVAL_STATES = (
+    DocumentState.INGESTED,
+    DocumentState.DELETE_QUEUED,
+    DocumentState.DELETE_CLAIMED,
+    DocumentState.DELETE_FAILED,
+)
+RETRIEVAL_LANGUAGES = (LanguageCode.EN, LanguageCode.FR)
+RETRIEVAL_LANGUAGE_STATUSES = (LanguageStatus.DETECTED, LanguageStatus.OVERRIDDEN)
+
+
+def _retrieval_catalog_filters(
+    *, collection_key: str | None = None, language: LanguageCode | None = None
+) -> list:
+    filters = [
+        Document.state.in_(RETRIEVAL_STATES),
+        Document.language.in_(RETRIEVAL_LANGUAGES),
+        Document.language_status.in_(RETRIEVAL_LANGUAGE_STATUSES),
+    ]
+    if collection_key is not None:
+        filters.append(Document.collection_key == collection_key)
+    if language is not None:
+        filters.append(Document.language == language)
+    return filters
+
+
+def _configured_collection(request: Request, collection_key: str):
+    collection = next(
+        (item for item in request.app.state.settings.collections if item.key == collection_key),
+        None,
+    )
+    if collection is None:
+        raise ProblemError(
+            status=422,
+            code="collection-not-configured",
+            title="Collection was rejected",
+            detail="Choose one of the collections configured for this PDF Bridge deployment.",
+        )
+    return collection
+
 
 def _document_summary(document: Document) -> DocumentSummary:
     return DocumentSummary.model_validate(document).model_copy(
@@ -82,6 +140,8 @@ def _duplicate_match(document: Document) -> DuplicateMatch:
         filename=document.original_filename,
         size_bytes=document.size_bytes,
         state=document.state,
+        collection_key=document.collection_key,
+        language=document.language,
         detail_url=f"/documents/{document.id}",
     )
 
@@ -125,36 +185,109 @@ def _get_document_detail(db: Session, document_id: UUID) -> Document:
     return document
 
 
+@router.get("/collections", response_model=CollectionListResponse)
+def list_collections(
+    request: Request,
+    _actor: Actor = Depends(get_actor),
+    db: Session = Depends(get_db),
+) -> CollectionListResponse:
+    processing_states = tuple(
+        state
+        for state in ACTIVE_DOCUMENT_STATES
+        if state not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+    )
+    items: list[CollectionSummary] = []
+    for definition in request.app.state.settings.collections:
+        available = (
+            db.scalar(
+                select(func.count()).select_from(Document).where(
+                    *_retrieval_catalog_filters(collection_key=definition.key),
+                )
+            )
+            or 0
+        )
+        processing = (
+            db.scalar(
+                select(func.count()).select_from(Document).where(
+                    Document.collection_key == definition.key,
+                    Document.state.in_(processing_states),
+                )
+            )
+            or 0
+        )
+        review = (
+            db.scalar(
+                select(func.count()).select_from(Document).where(
+                    Document.collection_key == definition.key,
+                    Document.state == DocumentState.CLASSIFICATION_REVIEW,
+                )
+            )
+            or 0
+        )
+        language_counts = {
+            language.value: (
+                db.scalar(
+                    select(func.count()).select_from(Document).where(
+                        *_retrieval_catalog_filters(
+                            collection_key=definition.key,
+                            language=language,
+                        ),
+                    )
+                )
+                or 0
+            )
+            for language in LanguageCode
+        }
+        items.append(
+            CollectionSummary(
+                key=definition.key,
+                display_name=definition.display_name,
+                description=definition.description,
+                audience=definition.audience,
+                available_documents=available,
+                processing_documents=processing,
+                review_documents=review,
+                languages=CollectionLanguageCounts(**language_counts),
+                detail_url=f"/library/{definition.key}",
+            )
+        )
+    return CollectionListResponse(items=items, total=len(items))
+
+
 @router.get("/documents", response_model=DocumentListResponse)
 def list_documents(
-    scope: Literal["library", "queue", "all"] = "all",
+    request: Request,
+    scope: Literal["library", "queue", "review", "all"] = "all",
     state: DocumentState | None = None,
+    collection_key: str | None = None,
+    language: LanguageCode | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     _actor: Actor = Depends(get_actor),
     db: Session = Depends(get_db),
 ) -> DocumentListResponse:
     filters = []
+    if collection_key is not None:
+        _configured_collection(request, collection_key)
+        filters.append(Document.collection_key == collection_key)
+    if language is not None:
+        filters.append(Document.language == language)
     if state is not None:
         filters.append(Document.state == state)
     elif scope == "library":
-        filters.append(
-            Document.state.in_(
-                (
-                    DocumentState.INGESTED,
-                    DocumentState.DELETE_QUEUED,
-                    DocumentState.DELETE_CLAIMED,
-                    DocumentState.DELETE_CLEANUP,
-                    DocumentState.DELETE_FAILED,
-                )
-            )
-        )
+        filters.extend(_retrieval_catalog_filters())
     elif scope == "queue":
         filters.append(
             Document.state.in_(
-                tuple(item for item in ACTIVE_DOCUMENT_STATES if item != DocumentState.INGESTED)
+                tuple(
+                    item
+                    for item in ACTIVE_DOCUMENT_STATES
+                    if item not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+                )
             )
         )
+    elif scope == "review":
+        filters.append(Document.state == DocumentState.CLASSIFICATION_REVIEW)
     total = db.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
     documents = db.scalars(
         select(Document)
@@ -228,10 +361,12 @@ def document_content(
 
 @router.post("/uploads/preflight", response_model=UploadPreflightResponse)
 def upload_preflight(
+    request: Request,
     payload: UploadPreflightRequest,
     _actor: Actor = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> UploadPreflightResponse:
+    _configured_collection(request, payload.collection_key)
     try:
         normalized = normalize_filename(payload.filename)
     except InvalidFilenameError as exc:
@@ -255,12 +390,14 @@ def upload_preflight(
 async def upload_document(
     request: Request,
     file: Annotated[UploadFile, File()],
+    collection_key: Annotated[str, Form()],
     possible_duplicate_confirmed: Annotated[bool, Form()] = False,
     form_idempotency_key: Annotated[str | None, Form(alias="idempotency_key")] = None,
     header_idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
     actor: Actor = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> UploadResponse:
+    _configured_collection(request, collection_key)
     raw_key = header_idempotency_key or form_idempotency_key
     try:
         idempotency_key = idempotency_adapter.validate_python(raw_key)
@@ -320,6 +457,7 @@ async def upload_document(
                 staged=staged,
                 layout=layout,
                 filename=filename,
+                collection_key=collection_key,
                 idempotency_key=idempotency_key,
                 actor_type=actor.kind,
                 actor_id=actor.identifier,
@@ -330,15 +468,25 @@ async def upload_document(
                 staged.path.unlink(missing_ok=True)
             try:
                 db.commit()
-            except IntegrityError:
+            except IntegrityError as exc:
                 db.rollback()
                 if registration.promoted is not None:
                     registration.promoted.path.unlink(missing_ok=True)
                 existing = db.scalar(
                     select(Document).where(Document.idempotency_key == idempotency_key)
                 )
-                if existing is None or existing.sha256 != staged.sha256:
+                if existing is None:
                     raise
+                if (
+                    existing.sha256 != staged.sha256
+                    or existing.size_bytes != staged.size_bytes
+                    or existing.normalized_filename != normalize_filename(filename)
+                    or existing.collection_key != collection_key
+                ):
+                    raise LifecycleError(
+                        "The idempotency key was already used for a different file.",
+                        code="idempotency-key-conflict",
+                    ) from exc
                 operation = db.scalar(
                     select(QueueOperation)
                     .where(
@@ -390,19 +538,32 @@ async def upload_document(
 
 @router.get("/queue", response_model=QueueListResponse)
 def list_queue(
+    request: Request,
+    collection_key: str | None = None,
+    language: LanguageCode | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
     _actor: Actor = Depends(get_actor),
     db: Session = Depends(get_db),
 ) -> QueueListResponse:
+    filters = [
+        Document.state.in_(
+            tuple(
+                item
+                for item in ACTIVE_DOCUMENT_STATES
+                if item not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+            )
+        )
+    ]
+    if collection_key is not None:
+        _configured_collection(request, collection_key)
+        filters.append(Document.collection_key == collection_key)
+    if language is not None:
+        filters.append(Document.language == language)
     query = (
         select(QueueOperation)
         .join(QueueOperation.document)
-        .where(
-            Document.state.in_(
-                tuple(item for item in ACTIVE_DOCUMENT_STATES if item != DocumentState.INGESTED)
-            )
-        )
+        .where(*filters)
         .options(joinedload(QueueOperation.document))
     )
     all_operations = list(db.scalars(query).all())
@@ -504,6 +665,49 @@ def retry_queue_item(
     )
 
 
+@router.post(
+    "/documents/{document_id}/classification",
+    response_model=DocumentMutationResponse,
+)
+def resolve_document_classification(
+    request: Request,
+    document_id: UUID,
+    payload: ClassificationRequest,
+    actor: Actor = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> DocumentMutationResponse:
+    language = payload.language if payload.action == "override" else None
+    reason = payload.reason if payload.action == "override" else None
+    with request.app.state.transition_lock:
+        existing = _get_document_detail(db, document_id)
+        collection_key = payload.collection_key or existing.collection_key
+        if collection_key is None:
+            raise ProblemError(
+                status=422,
+                code="collection-required",
+                title="Collection is required",
+                detail="Assign a configured collection before resolving this document.",
+            )
+        _configured_collection(request, collection_key)
+        try:
+            operation = queue_classification_review(
+                db,
+                document_id=document_id,
+                collection_key=collection_key,
+                language=language,
+                reason=reason,
+                actor_type=actor.kind,
+                actor_id=actor.identifier,
+            )
+            db.commit()
+        except LifecycleError as exc:
+            db.rollback()
+            raise _lifecycle_problem(exc) from exc
+    return DocumentMutationResponse(
+        document=_document_summary(operation.document), operation_id=operation.id
+    )
+
+
 @router.post("/documents/{document_id}/deletion", response_model=DocumentMutationResponse)
 def request_document_deletion(
     request: Request,
@@ -537,35 +741,56 @@ async def search_documents(
     _actor: Actor = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> SearchResponse:
+    for collection_key in payload.collections:
+        _configured_collection(request, collection_key)
     response = await search_retrieval(
         request.app.state.settings,
         payload,
         client=getattr(request.app.state, "search_http_client", None),
     )
-    ids = [hit.document_id for hit in response.hits]
-    known = set(
-        db.scalars(
-            select(Document.id).where(
-                Document.id.in_(ids),
-                Document.state.in_(
-                    (
-                        DocumentState.INGESTED,
-                        DocumentState.DELETE_QUEUED,
-                        DocumentState.DELETE_CLAIMED,
-                        DocumentState.DELETE_CLEANUP,
-                        DocumentState.DELETE_FAILED,
-                    )
+    for group in response.groups:
+        ids = [hit.document_id for hit in group.hits]
+        documents = (
+            db.scalars(
+                select(Document).where(
+                    Document.id.in_(ids),
+                    *_retrieval_catalog_filters(),
+                )
+            ).all()
+            if ids
+            else []
+        )
+        documents_by_id = {document.id: document for document in documents}
+        invalid_hit = any(
+            document_id not in documents_by_id
+            or documents_by_id[document_id].collection_key != group.collection_key
+            or (
+                payload.language is not None
+                and documents_by_id[document_id].language != payload.language
+            )
+            for document_id in ids
+        )
+        catalog_total = (
+            db.scalar(
+                select(func.count()).select_from(Document).where(
+                    *_retrieval_catalog_filters(
+                        collection_key=group.collection_key,
+                        language=payload.language,
+                    ),
+                )
+            )
+            or 0
+        )
+        if invalid_hit or group.total > catalog_total:
+            raise ProblemError(
+                status=502,
+                code="search-catalog-mismatch",
+                title="Search and catalog are out of sync",
+                detail=(
+                    "The retrieval response included a document or total outside its requested "
+                    "collection boundary. No partial results were returned."
                 ),
             )
-        ).all()
-    )
-    if any(document_id not in known for document_id in ids):
-        raise ProblemError(
-            status=502,
-            code="search-catalog-mismatch",
-            title="Search and catalog are out of sync",
-            detail="The retrieval response included an unknown or removed document ID.",
-        )
     return response
 
 

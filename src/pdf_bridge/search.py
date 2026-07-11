@@ -20,6 +20,15 @@ async def search_retrieval(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> SearchResponse:
+    configured = {collection.key for collection in settings.collections}
+    unknown = [key for key in request.collections if key not in configured]
+    if unknown:
+        raise ProblemError(
+            status=422,
+            code="collection-not-configured",
+            title="Search collection was rejected",
+            detail="Search may use only collections configured for this deployment.",
+        )
     if not settings.search_api_url:
         raise ProblemError(
             status=503,
@@ -50,14 +59,27 @@ async def search_retrieval(
                 if len(body) > MAX_SEARCH_RESPONSE_BYTES:
                     raise ValueError("retrieval response exceeded the configured limit")
         result = SearchResponse.model_validate(json.loads(body))
+        expected_groups = set(request.collections)
+        actual_groups = {group.collection_key for group in result.groups}
+        if request.include_hits:
+            offset = (request.page - 1) * request.page_size
+            invalid_hits = any(
+                len(group.hits) != min(request.page_size, max(group.total - offset, 0))
+                for group in result.groups
+            )
+        else:
+            invalid_hits = any(group.hits for group in result.groups)
         if (
             result.query != request.query
             or result.mode != request.mode
-            or len(result.hits) > request.limit
+            or result.language != request.language
+            or actual_groups != expected_groups
+            or len(result.groups) != len(request.collections)
+            or invalid_hits
         ):
             raise ValueError("retrieval response did not correlate to its request")
         return result
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
+    except httpx.RequestError as exc:
         raise ProblemError(
             status=503,
             code="search-unavailable",

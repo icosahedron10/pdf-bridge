@@ -17,6 +17,8 @@ from pdf_bridge.models import (
     Document,
     DocumentState,
     JobBatch,
+    LanguageCode,
+    LanguageStatus,
     OperationState,
     OperationType,
     QueueOperation,
@@ -29,6 +31,8 @@ from pdf_bridge.schemas import (
     HistoricalImportItemResult,
     HistoricalImportManifest,
     HistoricalImportResponse,
+    LanguageResultStatus,
+    PipelineOutcome,
 )
 from pdf_bridge.storage import (
     PromotedFile,
@@ -52,6 +56,7 @@ ACTIVE_DOCUMENT_STATES = (
     DocumentState.DELETE_CLEANUP,
     DocumentState.DELETE_FAILED,
     DocumentState.CANCEL_CLEANUP,
+    DocumentState.CLASSIFICATION_REVIEW,
 )
 
 
@@ -113,6 +118,7 @@ class BatchReport:
     batch: JobBatch
     succeeded: int
     failed: int
+    review_required: int = 0
     cleanup_items: tuple[DeletionCleanup, ...] = ()
     idempotent_replay: bool = False
 
@@ -172,12 +178,49 @@ def find_active_checksum_duplicate(session: Session, sha256: str) -> Document | 
     )
 
 
+def validate_collection_references(session: Session, configured_keys: set[str]) -> None:
+    """Fail startup when active catalog rows escape the configured collection boundary."""
+
+    unknown = list(
+        session.scalars(
+            select(Document.collection_key)
+            .where(
+                Document.state.in_(ACTIVE_DOCUMENT_STATES),
+                Document.collection_key.is_not(None),
+                Document.collection_key.not_in(configured_keys),
+            )
+            .distinct()
+        ).all()
+    )
+    improperly_unassigned = session.scalar(
+        select(func.count()).select_from(Document).where(
+            Document.state.in_(
+                tuple(
+                    state
+                    for state in ACTIVE_DOCUMENT_STATES
+                    if state != DocumentState.CLASSIFICATION_REVIEW
+                )
+            ),
+            Document.collection_key.is_(None),
+        )
+    )
+    if unknown:
+        raise RuntimeError(
+            "active documents reference unconfigured collections: " + ", ".join(sorted(unknown))
+        )
+    if improperly_unassigned:
+        raise RuntimeError(
+            "active documents without a collection must be held in classification review"
+        )
+
+
 def register_staged_upload(
     session: Session,
     *,
     staged: StagedFile,
     layout: StorageLayout,
     filename: str,
+    collection_key: str,
     idempotency_key: str,
     actor_type: str,
     actor_id: str,
@@ -198,6 +241,7 @@ def register_staged_upload(
             existing.sha256 != staged.sha256
             or existing.size_bytes != staged.size_bytes
             or existing.normalized_filename != normalize_filename(filename)
+            or existing.collection_key != collection_key
         ):
             raise LifecycleError(
                 "The idempotency key was already used for a different file.",
@@ -245,6 +289,9 @@ def register_staged_upload(
         scan_signature=scan_result.signature,
         scanned_at=scan_result.scanned_at,
         uploader_identity=actor_id,
+        collection_key=collection_key,
+        language=LanguageCode.UND,
+        language_status=LanguageStatus.PENDING,
     )
     operation = QueueOperation(
         document=document,
@@ -270,7 +317,12 @@ def register_staged_upload(
         actor_id=actor_id,
         document=document,
         operation=operation,
-        details={"status": DocumentState.QUEUED.value, "detail": "PDF queued for ingestion."},
+        details={
+            "status": DocumentState.QUEUED.value,
+            "collection_key": collection_key,
+            "language": LanguageCode.UND.value,
+            "detail": "PDF queued for ingestion and downstream language classification.",
+        },
     )
     _audit(
         session,
@@ -434,6 +486,113 @@ def retry_failed_document(
     return operation
 
 
+def queue_classification_review(
+    session: Session,
+    *,
+    document_id: uuid.UUID,
+    collection_key: str,
+    language: LanguageCode | None,
+    reason: str | None,
+    actor_type: str,
+    actor_id: str,
+) -> QueueOperation:
+    """Resolve a held document by re-detecting or applying an audited language override."""
+
+    document = session.get(Document, document_id)
+    if document is None:
+        raise LifecycleError("Document was not found.", code="document-not-found", status=404)
+    if document.state != DocumentState.CLASSIFICATION_REVIEW:
+        raise LifecycleError(
+            "Only a document held for classification review can be resolved.",
+            code="document-not-reviewable",
+        )
+    if document.collection_key is not None and document.collection_key != collection_key:
+        raise LifecycleError(
+            "A document's collection cannot change after it has entered the pipeline.",
+            code="collection-immutable",
+        )
+    if language is None and document.collection_key is not None:
+        raise LifecycleError(
+            "Automatic detection is only available while assigning an unassigned legacy "
+            "document. Override the language or remove this review item.",
+            code="classification-detect-not-allowed",
+        )
+    if not document.storage_key:
+        raise LifecycleError(
+            "The reviewed document has no canonical PDF storage key.",
+            code="catalog-inconsistent",
+            status=500,
+        )
+    if language is not None and language not in {LanguageCode.EN, LanguageCode.FR}:
+        raise LifecycleError(
+            "A language override must be English or French.",
+            code="invalid-language-override",
+            status=422,
+        )
+    if language is not None and not (reason or "").strip():
+        raise LifecycleError(
+            "A language override requires an audit reason.",
+            code="language-override-reason-required",
+            status=422,
+        )
+
+    latest_attempt = (
+        session.scalar(
+            select(func.max(QueueOperation.attempt)).where(
+                QueueOperation.document_id == document.id,
+                QueueOperation.operation_type == OperationType.INGEST,
+            )
+        )
+        or 0
+    )
+    operation = QueueOperation(
+        document=document,
+        operation_type=OperationType.INGEST,
+        state=OperationState.QUEUED,
+        attempt=latest_attempt + 1,
+    )
+    document.collection_key = collection_key
+    document.state = DocumentState.QUEUED
+    document.last_error = None
+    if language is None:
+        document.language = LanguageCode.UND
+        document.language_status = LanguageStatus.PENDING
+        document.language_method = None
+        document.language_confidence = None
+        document.language_reason = None
+        document.language_detected_at = None
+        event_type = "language_redetection_requested"
+        details: dict[str, Any] = {
+            "collection_key": collection_key,
+            "language": LanguageCode.UND.value,
+        }
+    else:
+        document.language = language
+        document.language_status = LanguageStatus.OVERRIDDEN
+        document.language_method = "operator_override"
+        document.language_confidence = None
+        document.language_reason = reason.strip() if reason else None
+        document.language_detected_at = utc_now()
+        event_type = "language_overridden"
+        details = {
+            "collection_key": collection_key,
+            "language": language.value,
+            "reason": document.language_reason,
+        }
+    session.add(operation)
+    session.flush()
+    _audit(
+        session,
+        event_type=event_type,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        document=document,
+        operation=operation,
+        details=details,
+    )
+    return operation
+
+
 def queue_document_deletion(
     session: Session,
     *,
@@ -461,10 +620,16 @@ def queue_document_deletion(
         return retry_failed_document(
             session, operation_id=failed.id, actor_type=actor_type, actor_id=actor_id
         )
-    if document.state != DocumentState.INGESTED:
+    if document.state not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}:
         raise LifecycleError(
-            "Only an ingested document can be queued for deletion.",
+            "Only an ingested or review-held document can be queued for deletion.",
             code="document-not-deletable",
+        )
+    if document.collection_key is None:
+        raise LifecycleError(
+            "Assign a collection before removing a legacy review document.",
+            code="collection-required",
+            status=422,
         )
     latest_attempt = (
         session.scalar(
@@ -494,6 +659,8 @@ def queue_document_deletion(
         details={
             "status": DocumentState.DELETE_QUEUED.value,
             "detail": reason or "Deletion queued for the pipeline.",
+            "collection_key": document.collection_key,
+            "language": document.language.value,
         },
     )
     return operation
@@ -691,7 +858,81 @@ def acknowledge_staged_batch(
 
 def _component_rows(result: Any) -> list[dict[str, Any]]:
     components = result.components.model_dump(mode="json")
-    return [{"name": name, "status": status} for name, status in components.items()]
+    rows = [{"name": name, "status": status} for name, status in components.items()]
+    if result.classification is not None:
+        classification = result.classification.model_dump(mode="json")
+        rows.append({"name": "language", **classification})
+    return rows
+
+
+def _result_operation_state(result: Any) -> OperationState:
+    if result.outcome == PipelineOutcome.SUCCEEDED:
+        return OperationState.SUCCEEDED
+    if result.outcome == PipelineOutcome.REVIEW_REQUIRED:
+        return OperationState.REVIEW_REQUIRED
+    return OperationState.FAILED
+
+
+def _validate_ingest_classification(document: Document, result: Any) -> None:
+    classification = result.classification
+    if result.outcome == PipelineOutcome.FAILED:
+        if classification is None:
+            return
+        if document.language_status == LanguageStatus.OVERRIDDEN:
+            if (
+                classification.status != LanguageResultStatus.OVERRIDDEN
+                or classification.language != document.language
+            ):
+                raise LifecycleError(
+                    "The failed pipeline result did not preserve the operator language override.",
+                    code="classification-override-mismatch",
+                    status=422,
+                )
+        elif classification.status == LanguageResultStatus.OVERRIDDEN:
+            raise LifecycleError(
+                "The pipeline cannot create an operator override.",
+                code="classification-result-invalid",
+                status=422,
+            )
+        return
+    if classification is None:
+        raise LifecycleError(
+            "Every non-failed ingestion result requires language classification.",
+            code="classification-result-missing",
+            status=422,
+        )
+    if document.language_status == LanguageStatus.OVERRIDDEN:
+        if (
+            result.outcome != PipelineOutcome.SUCCEEDED
+            or classification.status != LanguageResultStatus.OVERRIDDEN
+            or classification.language != document.language
+        ):
+            raise LifecycleError(
+                "The pipeline result did not preserve the operator language override.",
+                code="classification-override-mismatch",
+                status=422,
+            )
+        return
+    if result.outcome == PipelineOutcome.REVIEW_REQUIRED:
+        if classification.status != LanguageResultStatus.REVIEW_REQUIRED:
+            raise LifecycleError(
+                "A review-required outcome must include undetermined classification.",
+                code="classification-result-invalid",
+                status=422,
+            )
+        return
+    if classification.language not in {LanguageCode.EN, LanguageCode.FR}:
+        raise LifecycleError(
+            "A successful ingestion must resolve to English or French.",
+            code="classification-result-invalid",
+            status=422,
+        )
+    if classification.status != LanguageResultStatus.DETECTED:
+        raise LifecycleError(
+            "Automatic ingestion must report a detected language.",
+            code="classification-result-invalid",
+            status=422,
+        )
 
 
 def report_batch_results(
@@ -725,18 +966,8 @@ def report_batch_results(
         by_id = {operation.id: operation for operation in batch.operations}
         for result in request.results:
             operation = by_id[result.operation_id]
-            component_values = result.components.model_dump(mode="json").values()
-            effective_success = result.success and all(
-                value == "succeeded" for value in component_values
-            )
-            expected_state = (
-                OperationState.SUCCEEDED if effective_success else OperationState.FAILED
-            )
-            expected_error = (
-                None
-                if effective_success
-                else result.error or "Not every required downstream component succeeded."
-            )
+            expected_state = _result_operation_state(result)
+            expected_error = result.error if result.outcome == PipelineOutcome.FAILED else None
             if (
                 operation.state != expected_state
                 or operation.chunk_count != result.chunk_count
@@ -748,6 +979,10 @@ def report_batch_results(
                     code="batch-result-conflict",
                 )
         succeeded = sum(op.state == OperationState.SUCCEEDED for op in batch.operations)
+        review_required = sum(
+            op.state == OperationState.REVIEW_REQUIRED for op in batch.operations
+        )
+        failed = len(batch.operations) - succeeded - review_required
         cleanup_items = tuple(
             DeletionCleanup(operation.document.id, operation.document.storage_key)
             for operation in batch.operations
@@ -755,9 +990,10 @@ def report_batch_results(
             and operation.document.storage_key
         )
         return BatchReport(
-            batch,
+            batch=batch,
             succeeded=succeeded,
-            failed=len(batch.operations) - succeeded,
+            failed=failed,
+            review_required=review_required,
             cleanup_items=cleanup_items,
             idempotent_replay=True,
         )
@@ -767,29 +1003,54 @@ def report_batch_results(
     by_id = {operation.id: operation for operation in batch.operations}
     succeeded = 0
     failed = 0
+    review_required = 0
     cleanup_items: list[DeletionCleanup] = []
     completed_at = utc_now()
     for result in request.results:
         operation = by_id[result.operation_id]
         document = operation.document
         component_rows = _component_rows(result)
-        component_values = result.components.model_dump(mode="json").values()
-        success = result.success and all(value == "succeeded" for value in component_values)
+        if operation.operation_type == OperationType.INGEST:
+            _validate_ingest_classification(document, result)
+        elif result.outcome == PipelineOutcome.REVIEW_REQUIRED or result.classification is not None:
+            raise LifecycleError(
+                "Deletion results cannot contain language classification.",
+                code="classification-result-unexpected",
+                status=422,
+            )
 
         operation.pipeline_run_id = request.pipeline_run_id
         operation.chunk_count = result.chunk_count
         operation.component_results = component_rows
         operation.completed_at = completed_at
-        if success:
+        if result.outcome == PipelineOutcome.SUCCEEDED:
             operation.state = OperationState.SUCCEEDED
             operation.error = None
             document.last_error = None
             document.pipeline_run_id = request.pipeline_run_id
             if operation.operation_type == OperationType.INGEST:
+                classification = result.classification
+                if classification is None:  # guarded above; keeps the type checker honest
+                    raise AssertionError("ingestion classification unexpectedly missing")
                 document.state = DocumentState.INGESTED
                 document.ingested_at = completed_at
                 document.chunk_count = result.chunk_count
-                document.pipeline_metadata = {"components": component_rows}
+                document.language = classification.language
+                document.language_status = (
+                    LanguageStatus.OVERRIDDEN
+                    if classification.status == LanguageResultStatus.OVERRIDDEN
+                    else LanguageStatus.DETECTED
+                )
+                document.language_method = classification.method
+                document.language_confidence = classification.confidence
+                if classification.status != LanguageResultStatus.OVERRIDDEN:
+                    document.language_reason = None
+                document.language_detected_at = completed_at
+                document.pipeline_metadata = {
+                    "components": component_rows,
+                    "collection_key": document.collection_key,
+                    "language": classification.model_dump(mode="json"),
+                }
                 event_type = "ingestion_succeeded"
             else:
                 document.state = DocumentState.DELETE_CLEANUP
@@ -802,8 +1063,32 @@ def report_batch_results(
                 cleanup_items.append(DeletionCleanup(document.id, document.storage_key))
                 event_type = "deletion_cleanup_pending"
             succeeded += 1
+        elif result.outcome == PipelineOutcome.REVIEW_REQUIRED:
+            classification = result.classification
+            if classification is None:  # guarded above
+                raise AssertionError("review classification unexpectedly missing")
+            operation.state = OperationState.REVIEW_REQUIRED
+            operation.error = None
+            document.state = DocumentState.CLASSIFICATION_REVIEW
+            document.last_error = None
+            document.pipeline_run_id = request.pipeline_run_id
+            document.language = LanguageCode.UND
+            document.language_status = LanguageStatus.REVIEW_REQUIRED
+            document.language_method = classification.method
+            document.language_confidence = classification.confidence
+            document.language_reason = (
+                classification.reason.value if classification.reason else None
+            )
+            document.language_detected_at = completed_at
+            document.pipeline_metadata = {
+                "components": component_rows,
+                "collection_key": document.collection_key,
+                "language": classification.model_dump(mode="json"),
+            }
+            event_type = "language_review_required"
+            review_required += 1
         else:
-            message = result.error or "Not every required downstream component succeeded."
+            message = result.error or "The downstream operation failed."
             operation.state = OperationState.FAILED
             operation.error = message[:4000]
             document.last_error = message[:4000]
@@ -830,6 +1115,8 @@ def report_batch_results(
                 "status": document.state.value,
                 "pipeline_run_id": request.pipeline_run_id,
                 "detail": operation.error,
+                "collection_key": document.collection_key,
+                "language": document.language.value,
             },
         )
 
@@ -837,13 +1124,19 @@ def report_batch_results(
     batch.pipeline_run_id = request.pipeline_run_id
     batch.state = (
         BatchState.COMPLETED
-        if failed == 0
+        if failed == 0 and review_required == 0
         else BatchState.FAILED
-        if succeeded == 0
+        if succeeded == 0 and review_required == 0
         else BatchState.PARTIAL
     )
     session.flush()
-    return BatchReport(batch, succeeded, failed, tuple(cleanup_items))
+    return BatchReport(
+        batch=batch,
+        succeeded=succeeded,
+        failed=failed,
+        review_required=review_required,
+        cleanup_items=tuple(cleanup_items),
+    )
 
 
 def finalize_deleted_storage(
@@ -900,6 +1193,7 @@ def import_historical_manifest(
     max_bytes: int,
     dry_run: bool,
     actor_id: str,
+    configured_collections: set[str],
 ) -> HistoricalImportResponse:
     manifest = HistoricalImportManifest.model_validate_json(manifest_path.read_bytes())
     results: list[HistoricalImportItemResult] = []
@@ -908,6 +1202,12 @@ def import_historical_manifest(
     seen_checksums: set[str] = set()
     try:
         for entry in manifest.documents:
+            if entry.collection_key not in configured_collections:
+                raise LifecycleError(
+                    "Historical import references an unconfigured collection.",
+                    code="collection-not-configured",
+                    status=422,
+                )
             source = validate_source_path(source_root, entry.path)
             if source in seen_sources:
                 raise LifecycleError(
@@ -942,6 +1242,8 @@ def import_historical_manifest(
                             filename=filename,
                             sha256=staged.sha256,
                             size_bytes=staged.size_bytes,
+                            collection_key=entry.collection_key,
+                            language=entry.language,
                         )
                     )
                     continue
@@ -959,6 +1261,12 @@ def import_historical_manifest(
                     scan_signature=scan_result.signature,
                     scanned_at=scan_result.scanned_at,
                     uploader_identity=actor_id,
+                    collection_key=entry.collection_key,
+                    language=entry.language,
+                    language_status=LanguageStatus.OVERRIDDEN,
+                    language_method="historical_manifest",
+                    language_reason="Operator-attested historical import metadata.",
+                    language_detected_at=entry.ingested_at or utc_now(),
                     ingested_at=entry.ingested_at or utc_now(),
                     chunk_count=entry.chunk_count,
                     pipeline_run_id=entry.pipeline_run_id,
@@ -984,13 +1292,19 @@ def import_historical_manifest(
                     actor_id=actor_id,
                     document=document,
                     operation=operation,
-                    details={"status": DocumentState.INGESTED.value},
+                    details={
+                        "status": DocumentState.INGESTED.value,
+                        "collection_key": entry.collection_key,
+                        "language": entry.language.value,
+                    },
                 )
                 results.append(
                     HistoricalImportItemResult(
                         filename=filename,
                         sha256=staged.sha256,
                         size_bytes=staged.size_bytes,
+                        collection_key=entry.collection_key,
+                        language=entry.language,
                         document_id=document.id,
                     )
                 )

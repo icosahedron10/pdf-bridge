@@ -9,13 +9,13 @@ import ssl
 import tempfile
 import uuid
 from contextlib import AbstractContextManager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import httpx
 import typer
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from pdf_bridge.models import OperationType
 from pdf_bridge.schemas import (
@@ -50,6 +50,69 @@ class CliModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _language_value(language: object) -> str:
+    value = getattr(language, "value", language)
+    if value not in {"und", "en", "fr"}:
+        raise BridgeClientError(f"server returned unsupported document language: {value!r}")
+    return str(value)
+
+
+def _safe_collection_key(collection_key: str) -> str:
+    if (
+        not collection_key
+        or len(collection_key) > 63
+        or not collection_key[0].isalnum()
+        or not collection_key[0].isascii()
+        or collection_key != collection_key.casefold()
+        or any(
+            not (character.isascii() and (character.isalnum() or character in {"-", "_"}))
+            for character in collection_key
+        )
+    ):
+        raise BridgeClientError(
+            "server returned an unsafe collection key; expected lowercase ASCII letters, "
+            "digits, hyphens, or underscores"
+        )
+    return collection_key
+
+
+def _expected_relative_path(
+    *, document_id: uuid.UUID, collection_key: str, language: object
+) -> str:
+    safe_collection_key = _safe_collection_key(collection_key)
+    language_value = _language_value(language)
+    return f"pdfs/{language_value}/{safe_collection_key}/{document_id}.pdf"
+
+
+def _validate_relative_path(
+    relative_path: str,
+    *,
+    document_id: uuid.UUID,
+    collection_key: str,
+    language: object,
+) -> str:
+    expected = _expected_relative_path(
+        document_id=document_id,
+        collection_key=collection_key,
+        language=language,
+    )
+    if relative_path != expected:
+        raise BridgeClientError(
+            "server returned an unsafe or inconsistent relative_path; expected "
+            f"{expected!r}"
+        )
+    path = PurePosixPath(relative_path)
+    if (
+        path.is_absolute()
+        or str(path) != relative_path
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\\" in relative_path
+        or any(ord(character) < 32 for character in relative_path)
+    ):
+        raise BridgeClientError("server returned an unsafe relative_path")
+    return relative_path
+
+
 class StagedManifestItem(CliModel):
     operation_id: uuid.UUID
     document_id: uuid.UUID
@@ -57,19 +120,31 @@ class StagedManifestItem(CliModel):
     filename: str
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    local_path: str | None = None
+    collection_key: str
+    language: Literal["und", "en", "fr"]
+    classification_required: bool
+    relative_path: str
 
     @model_validator(mode="after")
-    def require_ingest_file(self) -> StagedManifestItem:
-        if self.operation_type == OperationType.INGEST and not self.local_path:
-            raise ValueError("INGEST operations require local_path")
-        if self.operation_type == OperationType.DELETE and self.local_path is not None:
-            raise ValueError("DELETE operations must not include local_path")
+    def validate_handoff_metadata(self) -> StagedManifestItem:
+        _validate_relative_path(
+            self.relative_path,
+            document_id=self.document_id,
+            collection_key=self.collection_key,
+            language=self.language,
+        )
+        expected_classification = (
+            self.operation_type == OperationType.INGEST and self.language == "und"
+        )
+        if self.classification_required != expected_classification:
+            raise ValueError(
+                "classification_required must be true only for und INGEST operations"
+            )
         return self
 
 
 class StagedManifest(CliModel):
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     batch_id: uuid.UUID
     request_id: str
     claimed_at: str
@@ -88,10 +163,18 @@ class PullResult(CliModel):
 
 
 class ReportFile(CliModel):
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     batch_id: uuid.UUID
     pipeline_run_id: str = Field(min_length=1, max_length=255)
     results: list[OperationResultInput] = Field(min_length=1, max_length=500)
+
+    @field_validator("pipeline_run_id")
+    @classmethod
+    def normalize_pipeline_run_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("pipeline_run_id must contain non-whitespace characters")
+        return normalized
 
     @model_validator(mode="after")
     def unique_results(self) -> ReportFile:
@@ -320,9 +403,12 @@ def _client(
 
 
 def _manifest_item(item: BatchManifestItem) -> StagedManifestItem:
-    local_path = None
-    if item.operation_type == OperationType.INGEST:
-        local_path = f"files/{item.operation_id}.pdf"
+    relative_path = _validate_relative_path(
+        item.relative_path,
+        document_id=item.document_id,
+        collection_key=item.collection_key,
+        language=item.language,
+    )
     return StagedManifestItem(
         operation_id=item.operation_id,
         document_id=item.document_id,
@@ -330,12 +416,15 @@ def _manifest_item(item: BatchManifestItem) -> StagedManifestItem:
         filename=item.filename,
         size_bytes=item.size_bytes,
         sha256=item.sha256,
-        local_path=local_path,
+        collection_key=item.collection_key,
+        language=_language_value(item.language),
+        classification_required=item.classification_required,
+        relative_path=relative_path,
     )
 
 
 def _local_manifest(remote: BatchManifestResponse) -> StagedManifest:
-    if remote.version != 1:
+    if remote.version != 2:
         raise BridgeClientError(f"unsupported server manifest version: {remote.version}")
     return StagedManifest(
         batch_id=remote.batch_id,
@@ -409,6 +498,28 @@ def _write_new_file(path: Path, body: bytes) -> None:
         os.fsync(output.fileno())
 
 
+def _staged_operation_path(root: Path, operation: StagedManifestItem) -> Path:
+    relative_path = _validate_relative_path(
+        operation.relative_path,
+        document_id=operation.document_id,
+        collection_key=operation.collection_key,
+        language=operation.language,
+    )
+    root_resolved = root.resolve(strict=True)
+    candidate = root
+    for part in PurePosixPath(relative_path).parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise BridgeClientError("staged relative_path contains a symlink")
+    try:
+        candidate.resolve(strict=False).relative_to(root_resolved)
+    except ValueError as exc:
+        raise BridgeClientError(
+            "staged relative_path resolves outside the batch directory"
+        ) from exc
+    return candidate
+
+
 def _validate_existing_batch(final_directory: Path, expected: StagedManifest) -> str:
     if final_directory.is_symlink() or not final_directory.is_dir():
         raise BridgeClientError(f"existing batch path is not a real directory: {final_directory}")
@@ -425,16 +536,16 @@ def _validate_existing_batch(final_directory: Path, expected: StagedManifest) ->
         raise BridgeClientError("existing batch manifest does not match the server batch")
 
     for operation in actual.operations:
-        if operation.local_path is None:
+        if operation.operation_type == OperationType.DELETE:
             continue
-        path = final_directory / Path(operation.local_path)
+        path = _staged_operation_path(final_directory, operation)
         if path.is_symlink() or not path.is_file():
             raise BridgeClientError(
-                f"staged file is missing or is a symlink: {operation.local_path}"
+                f"staged file is missing or is a symlink: {operation.relative_path}"
             )
         actual_sha256, actual_size = _sha256_file(path)
         if actual_size != operation.size_bytes or actual_sha256 != operation.sha256:
-            raise BridgeClientError(f"staged file failed verification: {operation.local_path}")
+            raise BridgeClientError(f"staged file failed verification: {operation.relative_path}")
     return hashlib.sha256(manifest_path.read_bytes()).hexdigest()
 
 
@@ -457,12 +568,12 @@ def _stage_new_batch(
         if len(remote_by_id) != len(remote.operations):
             raise BridgeClientError("server manifest contains duplicate operation IDs")
         for item in manifest.operations:
-            if item.local_path is None:
+            if item.operation_type == OperationType.DELETE:
                 continue
             _download_operation(
                 client,
                 remote_by_id[item.operation_id],
-                temporary_directory / Path(item.local_path),
+                _staged_operation_path(temporary_directory, item),
             )
 
         manifest_body = _manifest_bytes(manifest)
@@ -681,7 +792,7 @@ def pull(
 def report(
     report_path: Annotated[
         Path,
-        typer.Argument(exists=True, dir_okay=False, help="Version 1 pipeline result JSON file."),
+        typer.Argument(exists=True, dir_okay=False, help="Version 2 pipeline result JSON file."),
     ],
     pull_result_path: Annotated[
         Path,
