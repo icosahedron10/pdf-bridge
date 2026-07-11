@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="csrf-token" content="{{ csrf_token|default('', true) }}">
+    <title>{% block title %}PDF Bridge{% endblock %}</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/app.css">
+    {% block extra_head %}{% endblock %}
+  </head>
+  {% set current_path = request.url.path if request is defined else '' %}
+  {% set selected_page = active_page|default('', true) %}
+  <body data-page="{{ selected_page }}">
+    <a class="skip-link" href="#main-content">Skip to main content</a>
+
+    <header class="app-header">
+      <div class="app-header__inner">
+        <a class="brand" href="/library" aria-label="PDF Bridge library">
+          <svg class="brand__mark" viewBox="0 0 28 28" width="28" height="28" aria-hidden="true">
+            <rect x="4.5" y="3.5" width="19" height="21" rx="1.5" fill="none" stroke="currentColor"/>
+            <path d="M9 9h10M9 13h10M9 17h6" fill="none" stroke="currentColor" stroke-linecap="round"/>
+          </svg>
+          <span>PDF Bridge</span>
+        </a>
+
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="primary-navigation">
+          <span class="visually-hidden">Open navigation</span>
+          <svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true">
+            <path d="M3 5.25h14M3 10h14M3 14.75h14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
+
+        <nav class="primary-nav" id="primary-navigation" aria-label="Primary navigation">
+          <a href="/library" {% if selected_page == 'library' or current_path == '/library' %}aria-current="page"{% endif %}>Library</a>
+          <a href="/queue" {% if selected_page == 'queue' or current_path == '/queue' %}aria-current="page"{% endif %}>Queue</a>
+          <a href="/upload" {% if selected_page == 'upload' or current_path == '/upload' %}aria-current="page"{% endif %}>Upload PDFs</a>
+        </nav>
+
+        <div class="session-identity" title="Current identity">
+          <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+            <path d="M10 10.25a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm-6 6.5c.7-2.77 2.7-4.25 6-4.25s5.3 1.48 6 4.25" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"/>
+          </svg>
+          <span>{{ actor_display_name|default('POC workspace', true) }}</span>
+        </div>
+      </div>
+    </header>
+
+    <main class="page-shell" id="main-content" tabindex="-1">
+      {% block breadcrumbs %}{% endblock %}
+      {% block page_header %}{% endblock %}
+      {% include "partials/flash_messages.html" %}
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="app-footer">
+      <div class="app-footer__inner">
+        <span>PDF Bridge</span>
+        <span>{{ environment_name|default('Proof of concept', true) }}{% if app_version|default(false) %} · {{ app_version }}{% endif %}</span>
+      </div>
+    </footer>
+
+    <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-message">
+      <form method="dialog">
+        <div class="confirm-dialog__body">
+          <h2 id="confirm-dialog-title">Confirm action</h2>
+          <p id="confirm-dialog-message">Are you sure?</p>
+        </div>
+        <div class="confirm-dialog__actions">
+          <button class="button button--quiet" type="submit" value="cancel">Cancel</button>
+          <button class="button button--danger" id="confirm-dialog-accept" type="submit" value="confirm">Confirm</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="live-region visually-hidden" id="app-live-region" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/app.js" defer></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>

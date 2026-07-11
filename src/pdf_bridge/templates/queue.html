@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% from "macros/ui.html" import status_label, document_icon, external_icon, empty_state, pagination %}
+
+{% set selected_status = status_filter|default('all', true)|lower %}
+{% set selected_sort = sort|default('created_at', true) %}
+{% set selected_order = order|default('asc', true) %}
+{% set queue_items = operations|default([], true) %}
+
+{% block title %}Queue · PDF Bridge{% endblock %}
+
+{% block page_header %}
+  <div class="page-heading">
+    <div>
+      <h1>Queue</h1>
+      <p>Uploads, deletions, and retained-file cleanup still requiring bridge or pipeline work.</p>
+    </div>
+    <a class="button button--primary" href="/upload">Upload PDFs</a>
+  </div>
+{% endblock %}
+
+{% block content %}
+  {% if next_job_at|default(false) %}
+    <div class="run-note" role="status">
+      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.75v4.5l3 1.75" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      <span>Next scheduled collection: <strong>{{ next_job_at }}</strong></span>
+    </div>
+  {% endif %}
+
+  <section aria-labelledby="queue-list-title">
+    <form class="filter-toolbar" method="get" action="/queue">
+      <div class="field field--inline">
+        <label for="queue-status">Status</label>
+        <select id="queue-status" name="status">
+          <option value="all" {% if selected_status == 'all' %}selected{% endif %}>All statuses</option>
+          <option value="queued" {% if selected_status == 'queued' %}selected{% endif %}>Queued</option>
+          <option value="claimed" {% if selected_status == 'claimed' %}selected{% endif %}>Claimed</option>
+          <option value="staged" {% if selected_status == 'staged' %}selected{% endif %}>Staged</option>
+          <option value="ingest_failed" {% if selected_status == 'ingest_failed' %}selected{% endif %}>Ingest failed</option>
+          <option value="delete_queued" {% if selected_status == 'delete_queued' %}selected{% endif %}>Deletion queued</option>
+          <option value="delete_claimed" {% if selected_status == 'delete_claimed' %}selected{% endif %}>Deletion claimed</option>
+          <option value="delete_cleanup" {% if selected_status == 'delete_cleanup' %}selected{% endif %}>Deletion cleanup</option>
+          <option value="delete_failed" {% if selected_status == 'delete_failed' %}selected{% endif %}>Deletion failed</option>
+          <option value="cancel_cleanup" {% if selected_status == 'cancel_cleanup' %}selected{% endif %}>Cancellation cleanup</option>
+        </select>
+      </div>
+      <div class="field field--inline">
+        <label for="queue-sort">Sort by</label>
+        <select id="queue-sort" name="sort">
+          <option value="created_at" {% if selected_sort == 'created_at' %}selected{% endif %}>Date added</option>
+          <option value="status" {% if selected_sort == 'status' %}selected{% endif %}>Status</option>
+          <option value="filename" {% if selected_sort == 'filename' %}selected{% endif %}>Filename</option>
+        </select>
+      </div>
+      <div class="field field--inline">
+        <label for="queue-order">Order</label>
+        <select id="queue-order" name="order">
+          <option value="asc" {% if selected_order == 'asc' %}selected{% endif %}>Oldest first</option>
+          <option value="desc" {% if selected_order == 'desc' %}selected{% endif %}>Newest first</option>
+        </select>
+      </div>
+      <button class="button button--quiet" type="submit">Apply</button>
+      {% if selected_status != 'all' or selected_sort != 'created_at' or selected_order != 'asc' %}<a class="button button--text" href="/queue">Reset</a>{% endif %}
+    </form>
+
+    <div class="section-heading section-heading--queue">
+      <div>
+        <h2 id="queue-list-title">Queue operations</h2>
+        {% if operation_count is defined %}<p>{{ operation_count }} operation{% if operation_count != 1 %}s{% endif %} shown.</p>{% endif %}
+      </div>
+      {% if last_claim_at|default(false) %}<p class="section-heading__meta">Last Jenkins claim {{ last_claim_at }}</p>{% endif %}
+    </div>
+
+    {% if queue_items %}
+      <div class="table-frame">
+        <table class="data-table data-table--queue">
+          <caption class="visually-hidden">Queued ingestion, deletion, and cleanup operations</caption>
+          <thead>
+            <tr>
+              <th scope="col">Document</th>
+              <th scope="col">Operation</th>
+              <th scope="col">Status</th>
+              <th scope="col">Added</th>
+              <th scope="col">Batch</th>
+              <th scope="col" aria-label="Actions"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for operation in queue_items %}
+              {% set doc = operation.document if operation.document is defined else operation %}
+              {% set operation_id = operation.id|default(operation.operation_id, true) %}
+              {% set document_id = doc.id|default(doc.document_id, true) %}
+              {% set filename = doc.original_filename|default(doc.filename, true)|default('Untitled PDF', true) %}
+              {% set operation_status = operation.status|default(doc.status, true)|default('QUEUED', true)|upper %}
+              {% set operation_type = operation.operation_type|default(operation.type, true)|default('INGEST', true)|upper %}
+              <tr>
+                <td class="document-cell">
+                  <div class="document-cell__main">
+                    {{ document_icon() }}
+                    <div>
+                      <a class="document-link" href="/documents/{{ document_id }}">{{ filename }}</a>
+                      <span class="document-cell__meta">{{ doc.size_display|default(doc.size_bytes_display, true)|default('Size not reported', true) }}</span>
+                      {% if operation_status in ['DELETE_CLEANUP', 'CANCEL_CLEANUP'] %}
+                        <span class="document-cell__meta document-cell__meta--warning">Canonical PDF cleanup pending</span>
+                      {% endif %}
+                    </div>
+                  </div>
+                  {% if operation.error_message|default(false) %}
+                    <p class="row-error" title="{{ operation.error_message }}">{{ operation.error_message }}</p>
+                  {% endif %}
+                </td>
+                <td>{{ operation_type|replace('_', ' ')|title }}</td>
+                <td>{{ status_label(operation_status) }}</td>
+                <td>{{ operation.created_at_display|default(operation.created_at, true)|default('Not reported', true) }}</td>
+                <td>
+                  {% if operation.batch_id|default(false) %}
+                    <span class="mono compact-id" title="{{ operation.batch_id }}">{{ operation.batch_id }}</span>
+                  {% else %}
+                    <span class="missing-value">Not claimed</span>
+                  {% endif %}
+                </td>
+                <td class="actions-cell">
+                  <div class="row-actions">
+                    {% if doc.can_preview|default(false) and operation_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
+                      <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener">Open {{ external_icon() }}</a>
+                    {% endif %}
+                    {% if operation_status == 'QUEUED' %}
+                      <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Remove {{ filename }} from the queue? Its stored PDF will be removed and this cannot be undone." data-confirm-label="Remove from queue">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                        <button class="button button--danger-text button--small" type="submit">Remove</button>
+                        <p class="form-error" data-form-error hidden></p>
+                      </form>
+                    {% elif operation_status in ['INGEST_FAILED', 'DELETE_FAILED'] %}
+                      <form action="/api/v1/queue/{{ operation_id }}/retry" method="post" data-api-form data-method="POST" data-success-url="/queue">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                        <button class="button button--quiet button--small" type="submit">Retry</button>
+                        <p class="form-error" data-form-error hidden></p>
+                      </form>
+                    {% elif operation_status == 'CANCEL_CLEANUP' %}
+                      <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Retry cleanup for {{ filename }}? The bridge will attempt to remove the retained canonical PDF again." data-confirm-label="Retry cleanup">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                        <button class="button button--quiet button--small" type="submit">Retry cleanup</button>
+                        <p class="form-error" data-form-error hidden></p>
+                      </form>
+                    {% endif %}
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {{ pagination(page|default(1, true), total_pages|default(1, true), '/queue', pagination_query|default('', true)) }}
+    {% else %}
+      {% if selected_status != 'all' %}
+        {{ empty_state('No operations match this filter', 'Choose another status or reset the filters.') }}
+      {% else %}
+        {{ empty_state('The queue is clear', 'New uploads and deletion requests will appear here.', '/upload', 'Upload PDFs') }}
+      {% endif %}
+    {% endif %}
+  </section>
+{% endblock %}

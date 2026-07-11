@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+
+{% set file_limit = max_file_count|default(20, true) %}
+{% set byte_limit = max_file_bytes|default(52428800, true) %}
+{% set size_limit_label = max_file_size_display|default('50 MiB', true) %}
+
+{% block title %}Upload PDFs · PDF Bridge{% endblock %}
+
+{% block page_header %}
+  <div class="page-heading">
+    <div>
+      <h1>Upload PDFs</h1>
+      <p>Add documents to the next ingestion run. Files remain in the queue until Jenkins collects them.</p>
+    </div>
+    <a class="button button--quiet" href="/queue">View queue</a>
+  </div>
+{% endblock %}
+
+{% block content %}
+  <div class="upload-layout">
+    <section class="upload-workspace" aria-labelledby="select-files-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="select-files-title">Select files</h2>
+          <p>Up to {{ file_limit }} PDFs per selection, {{ size_limit_label }} per file.</p>
+        </div>
+      </div>
+
+      <form id="upload-form"
+            action="/api/v1/uploads"
+            method="post"
+            enctype="multipart/form-data"
+            data-upload-form
+            data-preflight-url="/api/v1/uploads/preflight"
+            data-upload-url="/api/v1/uploads"
+            data-max-files="{{ file_limit }}"
+            data-max-bytes="{{ byte_limit }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+
+        <label class="drop-zone" id="drop-zone" for="pdf-files">
+          <input id="pdf-files" name="files" type="file" accept=".pdf,application/pdf" multiple data-file-input>
+          <svg viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">
+            <path d="M11 4.75h12l6 6v24.5H11z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+            <path d="M23 5v6h6M20 29V16.5m-4.5 4L20 16l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="drop-zone__title">Drop PDFs here or <span class="text-link">choose files</span></span>
+          <span class="drop-zone__help">Only .pdf files are accepted</span>
+        </label>
+
+        <noscript>
+          <div class="notice notice--error" role="alert"><div><strong>JavaScript is required</strong><p>This upload flow uses per-file duplicate checks and idempotency protection.</p></div></div>
+        </noscript>
+
+        <div class="upload-selection" id="upload-selection" hidden>
+          <div class="upload-selection__header">
+            <h3>Selected files <span class="count-label" id="selected-file-count"></span></h3>
+            <button class="button button--text button--small" type="button" data-clear-files>Clear all</button>
+          </div>
+
+          <ol class="upload-list" id="upload-list" aria-label="Files selected for upload"></ol>
+
+          <div class="upload-actions">
+            <p class="upload-summary" id="upload-summary" aria-live="polite"></p>
+            <button class="button button--primary" id="start-upload" type="button" disabled>Upload ready files</button>
+          </div>
+        </div>
+
+        <div class="notice notice--error" id="upload-form-error" role="alert" hidden>
+          <div><strong>Review this selection</strong><p data-upload-error-message></p></div>
+        </div>
+      </form>
+
+      <template id="upload-row-template">
+        <li class="upload-item" data-upload-item>
+          <div class="upload-item__icon" aria-hidden="true">PDF</div>
+          <div class="upload-item__body">
+            <div class="upload-item__heading">
+              <div>
+                <strong class="upload-item__name" data-file-name></strong>
+                <span class="upload-item__size" data-file-size></span>
+              </div>
+              <button class="icon-button" type="button" data-remove-file aria-label="Remove file">
+                <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m3.25 3.25 9.5 9.5m0-9.5-9.5 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </button>
+            </div>
+
+            <div class="upload-item__status" data-file-status role="status">Checking filename and size…</div>
+            <progress class="file-progress" data-file-progress max="100" value="0" aria-label="Upload progress" hidden></progress>
+
+            <div class="duplicate-warning" data-duplicate-warning hidden>
+              <div>
+                <strong>Possible duplicate</strong>
+                <p data-duplicate-message>A document with the same filename and size already exists.</p>
+                <ul class="duplicate-matches" data-duplicate-matches></ul>
+              </div>
+              <label class="check-field">
+                <input type="checkbox" data-duplicate-confirm>
+                <span>Upload this file anyway</span>
+              </label>
+            </div>
+
+            <div class="exact-duplicate" data-exact-duplicate hidden>
+              <strong>Exact duplicate blocked.</strong>
+              <a data-existing-document-link href="/library">View existing document</a>
+            </div>
+          </div>
+        </li>
+      </template>
+    </section>
+
+    <aside class="upload-guidance" aria-labelledby="upload-checks-title">
+      <h2 id="upload-checks-title">Before a file is queued</h2>
+      <ol class="check-list">
+        <li>
+          <span class="check-list__number">1</span>
+          <div><strong>File controls</strong><p>The bridge checks the extension, size, and PDF signature.</p></div>
+        </li>
+        <li>
+          <span class="check-list__number">2</span>
+          <div><strong>Duplicate checks</strong><p>Filename matches are flagged first; matching file contents are rejected.</p></div>
+        </li>
+        <li>
+          <span class="check-list__number">3</span>
+          <div><strong>Malware scan</strong><p>ClamAV must report the file clean. Scanner errors block the upload.</p></div>
+        </li>
+      </ol>
+      <div class="guidance-note">
+        <strong>PDFs are not opened or parsed here.</strong>
+        <p>The ingestion environment should still run its parser with least privilege and resource limits.</p>
+      </div>
+      {% if scanner_available is defined %}
+        <div class="dependency-status">
+          <span>Malware scanner</span>
+          <span class="dependency-status__value {% if scanner_available %}is-available{% else %}is-unavailable{% endif %}">
+            {% if scanner_available %}Available{% else %}Unavailable — uploads blocked{% endif %}
+          </span>
+        </div>
+      {% endif %}
+    </aside>
+  </div>
+{% endblock %}
+
+{% block scripts %}<script src="/static/upload.js" defer></script>{% endblock %}

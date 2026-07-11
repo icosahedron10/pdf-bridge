@@ -1,0 +1,15 @@
+{% if flash_messages|default([], true) %}
+  <div class="flash-stack" aria-label="Notifications">
+    {% for flash in flash_messages %}
+      <div class="notice notice--{{ flash.level|default('info', true) }}" role="{% if flash.level == 'error' %}alert{% else %}status{% endif %}">
+        <div>
+          {% if flash.title %}<strong>{{ flash.title }}</strong>{% endif %}
+          <p>{{ flash.message }}</p>
+        </div>
+        <button class="icon-button" type="button" data-dismiss-notice aria-label="Dismiss notification">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="m3.25 3.25 9.5 9.5m0-9.5-9.5 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    {% endfor %}
+  </div>
+{% endif %}

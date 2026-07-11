@@ -1,0 +1,146 @@
+// Copy this file into the pipeline repository and review every trusted constant/credential ID.
+// The example assumes a Linux Jenkins agent with Python 3.12 and an external durable handoff path.
+pipeline {
+    agent { label 'python-3.12' }
+
+    options {
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timestamps()
+    }
+
+    environment {
+        // These are SCM-reviewed constants, never build parameters supplied by a trigger.
+        PDF_BRIDGE_URL = 'https://pdf-bridge.internal'
+        PDF_BRIDGE_JOB_ALLOWED_HOST = 'pdf-bridge.internal'
+        HANDOFF_ROOT = '/srv/rag/pdf-bridge-handoff'
+        INGEST_COMMAND = '/opt/rag/bin/run-ingestion'
+
+        // Point this at an approved internal index that serves the released wheel and dependencies.
+        PDF_BRIDGE_PACKAGE_INDEX = 'https://python-packages.internal/simple'
+        PDF_BRIDGE_CLIENT_VERSION = '0.1.0'
+        PULL_RESULT = 'pull-result.json'
+        PIPELINE_REPORT = 'report.json'
+    }
+
+    stages {
+        stage('Prepare clean workspace') {
+            steps {
+                deleteDir()
+                checkout scm
+            }
+        }
+
+        stage('Install bridge client') {
+            steps {
+                sh '''
+                    set -eu
+                    python3.12 -m venv .venv
+                    . .venv/bin/activate
+                    python -m pip install \
+                        --disable-pip-version-check \
+                        --only-binary=:all: \
+                        --index-url "$PDF_BRIDGE_PACKAGE_INDEX" \
+                        "pdf-bridge==$PDF_BRIDGE_CLIENT_VERSION"
+                    python - <<'PY'
+import os
+from importlib.metadata import version
+
+expected = os.environ["PDF_BRIDGE_CLIENT_VERSION"]
+actual = version("pdf-bridge")
+if actual != expected:
+    raise SystemExit(f"Expected pdf-bridge {expected}, installed {actual}")
+PY
+                '''
+            }
+        }
+
+        stage('Claim and stage') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'pdf-bridge-job-token',
+                        variable: 'PDF_BRIDGE_JOB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        rm -f "$PULL_RESULT" "$PIPELINE_REPORT" no-work batch-directory.txt
+                        . .venv/bin/activate
+                        pdf-bridge-job pull \
+                            --allowed-host "$PDF_BRIDGE_JOB_ALLOWED_HOST" \
+                            --destination "$HANDOFF_ROOT" \
+                            --request-id "$BUILD_TAG" \
+                            --result-file "$PULL_RESULT"
+                    '''
+                }
+            }
+        }
+
+        stage('Run retrieval ingestion') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    sh '''
+                        set -eu
+                        python - <<'PY'
+import json
+from pathlib import Path
+
+result = json.loads(Path("pull-result.json").read_text(encoding="utf-8"))
+if result["operation_count"] == 0:
+    Path("no-work").touch()
+else:
+    Path("batch-directory.txt").write_text(
+        result["batch_directory"], encoding="utf-8"
+    )
+PY
+                        if [ -f no-work ]; then
+                            echo 'PDF Bridge queue is empty'
+                            exit 0
+                        fi
+                        batch_directory=$(cat batch-directory.txt)
+                        "$INGEST_COMMAND" \
+                            --bridge-batch "$batch_directory/manifest.json" \
+                            --bridge-report "$PIPELINE_REPORT"
+                        test -s "$PIPELINE_REPORT"
+                    '''
+                }
+            }
+        }
+
+        stage('Report outcomes') {
+            when {
+                expression { fileExists(env.PIPELINE_REPORT) }
+            }
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'pdf-bridge-job-token',
+                        variable: 'PDF_BRIDGE_JOB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        . .venv/bin/activate
+                        pdf-bridge-job report "$PIPELINE_REPORT" \
+                            --pull-result "$PULL_RESULT" \
+                            --allowed-host "$PDF_BRIDGE_JOB_ALLOWED_HOST"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'pull-result.json,report.json',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+        }
+        cleanup {
+            deleteDir()
+        }
+    }
+}

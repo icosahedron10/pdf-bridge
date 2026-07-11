@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% set status = status_code|default(500, true) %}
+
+{% block title %}{{ status }} · PDF Bridge{% endblock %}
+
+{% block content %}
+  <section class="error-page" aria-labelledby="error-title">
+    <p class="error-page__code" aria-hidden="true">{{ status }}</p>
+    <div>
+      <h1 id="error-title">{{ title|default('Something went wrong', true) }}</h1>
+      <p>{{ message|default('The request could not be completed. Try again, or check the service health if the problem continues.', true) }}</p>
+      {% if request_id|default(false) %}<p class="error-page__request">Request ID <code>{{ request_id }}</code></p>{% endif %}
+      <div class="error-page__actions">
+        <a class="button button--primary" href="/library">Return to library</a>
+        {% if status >= 500 %}<a class="button button--quiet" href="/api/v1/health/ready">Check service readiness</a>{% endif %}
+      </div>
+    </div>
+  </section>
+{% endblock %}
