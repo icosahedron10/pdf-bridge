@@ -5,24 +5,22 @@
 {% set byte_limit = max_file_bytes|default(52428800, true) %}
 {% set size_limit_label = max_file_size_display|default('50 MiB', true) %}
 
-{% block title %}Upload PDFs · PDF Bridge{% endblock %}
+{% block title %}Upload · PDF Bridge{% endblock %}
 
 {% block page_header %}
   <div class="page-heading">
     <div>
-      <h1>Upload PDFs</h1>
-      <p>Choose the retrieval boundary first. The destination cannot change after files are selected.</p>
+      <h1>Upload</h1>
     </div>
     <a class="button button--quiet" href="/queue">View queue</a>
   </div>
 {% endblock %}
 
 {% block content %}
-  <div class="upload-layout">
     <section class="upload-workspace" aria-labelledby="select-files-title">
       <div class="section-heading">
         <div>
-          <h2 id="select-files-title">Select files</h2>
+          <h2 id="select-files-title">Add PDFs</h2>
           <p>Up to {{ file_limit }} PDFs per selection, {{ size_limit_label }} per file.</p>
         </div>
       </div>
@@ -38,27 +36,25 @@
             data-max-bytes="{{ byte_limit }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
 
+        {% if scanner_available is defined and not scanner_available %}
+          <div class="notice notice--error" role="alert">
+            <div><strong>Uploads are unavailable</strong><p>The malware scanner is offline.</p></div>
+          </div>
+        {% endif %}
+
         <fieldset class="collection-selector" data-collection-selector>
-          <legend>Destination collection <span aria-hidden="true">*</span></legend>
-          <p>One selection applies to every file in this upload.</p>
+          <legend>Collection <span aria-hidden="true">*</span></legend>
           <div class="collection-selector__options">
             {% for item in collections %}
               <label class="collection-choice collection-choice--{{ item.audience }}">
                 <input type="radio" name="collection_key" value="{{ item.key }}" data-collection-choice data-collection-name="{{ item.display_name }}" required {% if selected_collection == item.key %}checked{% endif %}>
                 <span class="collection-choice__body">
                   <span class="collection-choice__heading"><strong>{{ item.display_name }}</strong>{{ audience_label(item.audience) }}</span>
-                  <span>{{ item.description }}</span>
-                  <code>{{ item.key }}</code>
                 </span>
               </label>
             {% endfor %}
           </div>
         </fieldset>
-
-        <div class="destination-lock" data-destination-lock role="status" aria-live="polite" hidden>
-          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2" fill="none" stroke="currentColor" stroke-width="1.25"/></svg>
-          <span>Destination locked to <strong data-destination-name></strong> while files are selected.</span>
-        </div>
 
         <label class="drop-zone" id="drop-zone" for="pdf-files" aria-disabled="true">
           <input id="pdf-files" name="files" type="file" accept=".pdf,application/pdf" multiple data-file-input>
@@ -67,7 +63,7 @@
             <path d="M23 5v6h6M20 29V16.5m-4.5 4L20 16l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
           <span class="drop-zone__title">Drop PDFs here or <span class="text-link">choose files</span></span>
-          <span class="drop-zone__help" data-drop-help>Choose a destination collection to enable file selection</span>
+          <span class="drop-zone__help" data-drop-help>Choose a collection first</span>
         </label>
 
         <noscript>
@@ -83,7 +79,7 @@
           <ol class="upload-list" id="upload-list" aria-label="Files selected for upload"></ol>
 
           <div class="upload-actions">
-            <p class="upload-summary" id="upload-summary" aria-live="polite"></p>
+            <p class="upload-summary" id="upload-summary" aria-live="polite" aria-atomic="true"></p>
             <button class="button button--primary" id="start-upload" type="button" disabled>Upload ready files</button>
           </div>
         </div>
@@ -107,7 +103,7 @@
               </button>
             </div>
 
-            <div class="upload-item__status" data-file-status role="status">Checking filename and size…</div>
+            <div class="upload-item__status" data-file-status>Checking filename and size…</div>
             <progress class="file-progress" data-file-progress max="100" value="0" aria-label="Upload progress" hidden></progress>
 
             <div class="duplicate-warning" data-duplicate-warning hidden>
@@ -130,41 +126,6 @@
         </li>
       </template>
     </section>
-
-    <aside class="upload-guidance" aria-labelledby="upload-checks-title">
-      <h2 id="upload-checks-title">Before a file is queued</h2>
-      <ol class="check-list">
-        <li>
-          <span class="check-list__number">1</span>
-          <div><strong>Collection boundary</strong><p>The selected collection is recorded before the PDF enters the queue.</p></div>
-        </li>
-        <li>
-          <span class="check-list__number">2</span>
-          <div><strong>File controls</strong><p>The bridge checks the extension, size, signature, and duplicates.</p></div>
-        </li>
-        <li>
-          <span class="check-list__number">3</span>
-          <div><strong>Malware scan</strong><p>ClamAV must report the file clean. Scanner errors block the upload.</p></div>
-        </li>
-        <li>
-          <span class="check-list__number">4</span>
-          <div><strong>Language routing</strong><p>The downstream PDF parser reports English or French before indexing.</p></div>
-        </li>
-      </ol>
-      <div class="guidance-note">
-        <strong>Language starts as undetermined.</strong>
-        <p>PDF Bridge does not add a second parser runtime. The ingestion environment classifies text with its existing PDF parser.</p>
-      </div>
-      {% if scanner_available is defined %}
-        <div class="dependency-status">
-          <span>Malware scanner</span>
-          <span class="dependency-status__value {% if scanner_available %}is-available{% else %}is-unavailable{% endif %}">
-            {% if scanner_available %}Available{% else %}Unavailable — uploads blocked{% endif %}
-          </span>
-        </div>
-      {% endif %}
-    </aside>
-  </div>
 {% endblock %}
 
 {% block scripts %}<script src="/static/upload.js" defer></script>{% endblock %}

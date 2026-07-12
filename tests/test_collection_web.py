@@ -5,7 +5,7 @@ import json
 import uuid
 
 import httpx
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge.models import (
@@ -87,7 +87,8 @@ def test_collection_overview_and_browse_are_strictly_scoped(
     assert customer_page.status_code == 200
     assert customer.original_filename in customer_page.text
     assert internal.original_filename not in customer_page.text
-    assert "Every result and document on this page is constrained to" in customer_page.text
+    assert "Customer-facing" in customer_page.text
+    assert "<code>customer</code>" in customer_page.text
 
     internal_page = client.get("/library/internal?language=fr")
     assert internal_page.status_code == 200

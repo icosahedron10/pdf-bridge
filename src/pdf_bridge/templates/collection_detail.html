@@ -28,11 +28,6 @@
 {% endblock %}
 
 {% block content %}
-  <div class="corpus-boundary corpus-boundary--{{ collection.audience }}" role="note">
-    <strong>{% if collection.audience == 'customer' %}Customer-facing corpus{% else %}Internal-only corpus{% endif %}</strong>
-    <span>Every result and document on this page is constrained to <code>{{ collection.key }}</code>.</span>
-  </div>
-
   <section aria-labelledby="collection-search-title">
     <h2 class="visually-hidden" id="collection-search-title">Search {{ collection.display_name }}</h2>
     <form class="search-toolbar" method="get" action="/library/{{ collection.key }}">
@@ -116,24 +111,24 @@
                   </div>
                 </td>
                 {% if current_query %}
-                  <td class="match-cell">
+                  <td class="match-cell" data-label="Match">
                     {% if item.snippet|default(false) %}<p class="match-snippet">{{ item.snippet }}</p>{% else %}<span class="missing-value">No snippet reported</span>{% endif %}
                     {% if item.score is defined and item.score is not none %}<span class="match-score">Score {{ '%.3f'|format(item.score) }}</span>{% endif %}
                   </td>
                 {% endif %}
-                <td>{{ language_label(doc.language, doc.language_status) }}</td>
-                <td>{{ status_label(document_status) }}</td>
-                <td>{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</td>
-                <td>{{ doc.chunk_count|default('—', true) }}</td>
+                <td data-label="Language">{{ language_label(doc.language, doc.language_status) }}</td>
+                <td data-label="Status">{{ status_label(document_status) }}</td>
+                <td data-label="Ingested">{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</td>
+                <td data-label="Chunks">{{ doc.chunk_count|default('—', true) }}</td>
                 <td class="actions-cell">
                   <div class="row-actions">
                     {% if doc.can_preview|default(false) and document_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
-                      <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener">Open {{ external_icon() }}</a>
+                      <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener" aria-label="Open {{ filename }} in a new tab">Open {{ external_icon() }}</a>
                     {% endif %}
                     {% if document_status == 'INGESTED' %}
                       <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/library/{{ collection.key }}" data-confirm="Request deletion of {{ filename }}? The document will remain visible until the pipeline confirms every downstream copy was removed." data-confirm-label="Request deletion">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-                        <button class="button button--danger-text button--small" type="submit">Delete</button>
+                        <button class="button button--danger-text button--small" type="submit" aria-label="Delete {{ filename }}">Delete</button>
                         <p class="form-error" data-form-error hidden></p>
                       </form>
                     {% endif %}

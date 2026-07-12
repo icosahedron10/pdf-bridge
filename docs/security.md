@@ -19,7 +19,8 @@ network until your security team approves the complete path.
   path-safe ASCII and is immutable after queuing.
 - Canonical bridge paths derive only from UUIDs. User filenames, collection names, and languages
   are metadata and never shape canonical object paths.
-- Browser mutations require a signed session, same-origin request, and CSRF token. CORS is absent.
+- Browser mutations require an encrypted and authenticated session, same-origin request, and CSRF
+  token. CORS is absent.
 - Trusted-host checks reject unexpected Host headers.
 - The container disables Uvicorn's forwarded-header rewriting; trusted-header mode checks the
   direct peer against `TRUSTED_PROXY_CIDRS` before accepting the identity header.

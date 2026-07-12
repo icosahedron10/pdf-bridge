@@ -6,7 +6,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 
 from pdf_bridge.models import (
     BatchState,
@@ -456,20 +456,24 @@ def test_concurrent_claims_never_overlap(
     )
 
     def claim(request_id: str) -> dict:
-        with TestClient(app) as worker:
-            response = worker.post(
-                "/api/v1/jobs/batches/claim",
-                headers=job_headers,
-                json={"request_id": request_id, "limit": 1},
-            )
-            assert response.status_code == 200, response.text
-            batch = response.json()
-            manifest = worker.get(
-                f"/api/v1/jobs/batches/{batch['batch_id']}/manifest",
-                headers=job_headers,
-            )
-            assert manifest.status_code == 200
-            return manifest.json()
+        worker = TestClient(
+            app,
+            base_url="http://testserver",
+            raise_server_exceptions=True,
+        )
+        response = worker.post(
+            "/api/v1/jobs/batches/claim",
+            headers=job_headers,
+            json={"request_id": request_id, "limit": 1},
+        )
+        assert response.status_code == 200, response.text
+        batch = response.json()
+        manifest = worker.get(
+            f"/api/v1/jobs/batches/{batch['batch_id']}/manifest",
+            headers=job_headers,
+        )
+        assert manifest.status_code == 200
+        return manifest.json()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         manifests = list(executor.map(claim, ["concurrent-claim-a", "concurrent-claim-b"]))

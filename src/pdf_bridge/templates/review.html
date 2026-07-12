@@ -9,16 +9,15 @@
   <div class="page-heading">
     <div>
       <h1>Needs review</h1>
-      <p>Documents remain outside retrieval until their collection and language are resolved.</p>
     </div>
-    <a class="button button--primary" href="/upload">Upload PDFs</a>
+    <a class="button button--primary" href="/upload">Upload</a>
   </div>
 {% endblock %}
 
 {% block content %}
   <div class="corpus-boundary corpus-boundary--review" role="note">
     <strong>Not exposed to retrieval</strong>
-    <span>These PDFs have no searchable BM25 or dense-index content while review is required.</span>
+    <span>Resolve the collection or language before these PDFs can be searched.</span>
   </div>
 
   <section aria-labelledby="review-list-title">
@@ -37,7 +36,7 @@
 
     <div class="section-heading">
       <div>
-        <h2 id="review-list-title">Classification review</h2>
+        <h2 id="review-list-title">Documents</h2>
         <p>{{ review_count }} document{% if review_count != 1 %}s{% endif %} awaiting a decision.</p>
       </div>
     </div>
@@ -71,14 +70,13 @@
               </dl>
             </div>
 
-            <div class="review-entry__actions">
+            <div class="review-entry__actions{% if doc.collection_key %} review-entry__actions--single{% endif %}">
               {% if not doc.collection_key %}
                 <form class="review-action-form" action="/api/v1/documents/{{ doc.id }}/classification" method="post" data-api-form data-method="POST" data-success-url="/review" data-success-message="Language detection queued">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
                   <input type="hidden" name="action" value="detect">
                   <div>
                     <h4>Assign and detect</h4>
-                    <p>Lock the destination, then return the PDF to the downstream parser.</p>
                   </div>
                   <div class="field">
                     <label for="detect-collection-{{ doc.id }}">Collection</label>
@@ -97,8 +95,7 @@
                 <input type="hidden" name="action" value="override">
                 {% if doc.collection_key %}<input type="hidden" name="collection_key" value="{{ doc.collection_key }}">{% endif %}
                 <div>
-                  <h4>Audited override</h4>
-                  <p>Confirm the language manually and record why.</p>
+                  <h4>Set language</h4>
                 </div>
                 {% if not doc.collection_key %}
                   <div class="field">
@@ -121,7 +118,7 @@
                   <label for="override-reason-{{ doc.id }}">Audit reason</label>
                   <input id="override-reason-{{ doc.id }}" name="reason" type="text" maxlength="500" required placeholder="How was the language verified?">
                 </div>
-                <button class="button button--quiet" type="submit">Record override</button>
+                <button class="button button--quiet" type="submit">Save language</button>
                 <p class="form-error" data-form-error hidden></p>
               </form>
 

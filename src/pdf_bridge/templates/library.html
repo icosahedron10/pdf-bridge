@@ -11,11 +11,10 @@
   <div class="page-heading">
     <div>
       <h1>Collections</h1>
-      <p>Corpus boundaries configured for retrieval. Every document belongs to one collection and one audience.</p>
     </div>
     <a class="button button--primary" href="/upload">
       <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 11.75v-9m-3.25 3L8 2.5l3.25 3M3 9.75v3.5h10v-3.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      Upload PDFs
+      Upload
     </a>
   </div>
 {% endblock %}
@@ -27,7 +26,7 @@
       <div class="search-field">
         <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m12.5 12.5 4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
         <label class="visually-hidden" for="library-query">Count matches in every collection</label>
-        <input id="library-query" name="q" type="search" value="{{ current_query }}" placeholder="Where is this topic located?" autocomplete="off">
+        <input id="library-query" name="q" type="search" value="{{ current_query }}" placeholder="Search across collections" autocomplete="off">
       </div>
       <div class="field field--inline">
         <label for="search-mode">Method</label>
@@ -45,7 +44,7 @@
           <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
         </select>
       </div>
-      <button class="button button--primary" type="submit">Count matches</button>
+      <button class="button button--primary" type="submit">Search</button>
       {% if current_query %}<a class="button button--quiet" href="/library">Clear</a>{% endif %}
     </form>
   </section>
@@ -62,7 +61,7 @@
   {% if unassigned_review_count|default(0) %}
     <div class="notice notice--warning" role="status">
       <div>
-        <strong>{{ unassigned_review_count }} unassigned document{% if unassigned_review_count != 1 %}s{% endif %} need review</strong>
+        <strong>{{ unassigned_review_count }} unassigned document{% if unassigned_review_count != 1 %}s need{% else %} needs{% endif %} review</strong>
         <p>Assign a collection before these documents can enter either retrieval corpus.</p>
       </div>
       <a class="button button--quiet button--small" href="/review?collection=unassigned">Open review</a>
@@ -70,13 +69,8 @@
   {% endif %}
 
   <section class="collection-register" aria-labelledby="collection-register-title">
-    <div class="section-heading">
-      <div>
-        <h2 id="collection-register-title">Configured collection register</h2>
-        <p>{{ collections|length }} collection{% if collections|length != 1 %}s{% endif %}. Counts reflect the PDF Bridge catalog.</p>
-      </div>
-      {% if current_query %}<p class="section-heading__meta">Exact accepted matches for “{{ current_query }}”</p>{% endif %}
-    </div>
+    <h2 class="visually-hidden" id="collection-register-title">Collection list</h2>
+    {% if current_query %}<p class="collection-register__summary">Matches for “{{ current_query }}”</p>{% endif %}
 
     <div class="collection-ledger">
       {% for item in collections %}
@@ -85,7 +79,6 @@
             <div class="collection-entry__boundary">{{ audience_label(item.audience) }}</div>
             <h3 id="collection-{{ item.key }}-title"><a href="{{ item.href }}">{{ item.display_name }}</a></h3>
             <p>{{ item.description }}</p>
-            <code>{{ item.key }}</code>
           </div>
 
           {% if current_query %}
@@ -104,8 +97,6 @@
             <div><dt>Available</dt><dd>{{ item.available }}</dd></div>
             <div><dt>Processing</dt><dd>{{ item.processing }}</dd></div>
             <div><dt>Needs review</dt><dd>{{ item.review_required }}</dd></div>
-            <div><dt>English</dt><dd>{{ item.english }}</dd></div>
-            <div><dt>Français</dt><dd>{{ item.french }}</dd></div>
           </dl>
 
           <div class="collection-entry__action">

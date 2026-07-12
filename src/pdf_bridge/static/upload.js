@@ -6,8 +6,6 @@
 
   const fileInput = form.querySelector("[data-file-input]");
   const collectionChoices = Array.from(form.querySelectorAll("[data-collection-choice]"));
-  const destinationLock = form.querySelector("[data-destination-lock]");
-  const destinationName = form.querySelector("[data-destination-name]");
   const dropHelp = form.querySelector("[data-drop-help]");
   const dropZone = document.getElementById("drop-zone");
   const selection = document.getElementById("upload-selection");
@@ -46,11 +44,9 @@
     dropZone.setAttribute("aria-disabled", String(!collection || uploading));
     if (dropHelp) {
       dropHelp.textContent = collection
-        ? "Only .pdf files are accepted"
-        : "Choose a destination collection to enable file selection";
+        ? "PDF files only"
+        : "Choose a collection first";
     }
-    if (destinationLock) destinationLock.hidden = !locked || !collection;
-    if (destinationName) destinationName.textContent = collection?.name || "";
   }
 
   function announce(message) {

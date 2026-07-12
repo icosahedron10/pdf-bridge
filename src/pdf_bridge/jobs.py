@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import FileResponse
+from litestar import Request, Response, Router, get, post
+from litestar.di import NamedDependency, Provide
+from litestar.openapi.datastructures import ResponseSpec
+from litestar.params import FromPath, JSONBody
+from litestar.response import File
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
-from pdf_bridge.db import get_db
 from pdf_bridge.lifecycle import (
     LifecycleError,
     acknowledge_staged_batch,
@@ -41,7 +43,7 @@ from pdf_bridge.storage import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/jobs", tags=["Jenkins"], responses=problem_responses())
+_PROBLEM_RESPONSES = problem_responses()
 
 
 def _problem(exc: LifecycleError) -> ProblemError:
@@ -113,23 +115,30 @@ def _manifest_metadata(
     return collection_key, language, classification_required, relative_path
 
 
-@router.post(
+@post(
     "/batches/claim",
-    response_model=BatchClaimResponse,
-    responses={204: {"description": "No queued operations for this request ID"}},
+    status_code=200,
+    responses={
+        **_PROBLEM_RESPONSES,
+        204: ResponseSpec(
+            data_container=None,
+            description="No queued operations for this request ID",
+        ),
+    },
+    sync_to_thread=True,
 )
 def claim_job_batch(
-    payload: BatchClaimRequest,
     request: Request,
-    actor: Actor = Depends(require_job_token),
-    db: Session = Depends(get_db),
-):
+    data: JSONBody[BatchClaimRequest],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> BatchClaimResponse | Response[None]:
     with request.app.state.transition_lock:
         try:
             result = claim_batch(
                 db,
-                request_id=payload.request_id,
-                limit=payload.limit,
+                request_id=data.request_id,
+                limit=data.limit,
                 lease_minutes=request.app.state.settings.claim_lease_minutes,
                 actor_id=actor.identifier,
             )
@@ -144,7 +153,7 @@ def claim_job_batch(
             raise _problem(exc) from exc
     batch = result.batch
     if batch.state == BatchState.EMPTY:
-        return Response(status_code=204)
+        return Response(content=None, status_code=204)
     return BatchClaimResponse(
         batch_id=batch.id,
         request_id=batch.request_id,
@@ -156,12 +165,16 @@ def claim_job_batch(
     )
 
 
-@router.get("/batches/{batch_id}/manifest", response_model=BatchManifestResponse)
+@get(
+    "/batches/{batch_id:uuid}/manifest",
+    responses=_PROBLEM_RESPONSES,
+    sync_to_thread=True,
+)
 def get_batch_manifest(
     request: Request,
-    batch_id: UUID,
-    _actor: Actor = Depends(require_job_token),
-    db: Session = Depends(get_db),
+    batch_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> BatchManifestResponse:
     with request.app.state.transition_lock:
         expire_claims(db)
@@ -213,17 +226,19 @@ def get_batch_manifest(
     )
 
 
-@router.get(
-    "/batches/{batch_id}/operations/{operation_id}/content",
-    response_class=FileResponse,
+@get(
+    "/batches/{batch_id:uuid}/operations/{operation_id:uuid}/content",
+    media_type="application/pdf",
+    responses=_PROBLEM_RESPONSES,
+    sync_to_thread=True,
 )
 def download_batch_operation(
     request: Request,
-    batch_id: UUID,
-    operation_id: UUID,
-    _actor: Actor = Depends(require_job_token),
-    db: Session = Depends(get_db),
-) -> FileResponse:
+    batch_id: FromPath[UUID],
+    operation_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> File:
     with request.app.state.transition_lock:
         expire_claims(db)
         db.commit()
@@ -275,7 +290,7 @@ def download_batch_operation(
             title="Stored PDF is missing",
             detail="The catalog and canonical storage are inconsistent.",
         )
-    return FileResponse(
+    return File(
         path,
         media_type="application/pdf",
         filename=f"{operation.id}.pdf",
@@ -284,18 +299,23 @@ def download_batch_operation(
     )
 
 
-@router.post("/batches/{batch_id}/staged", response_model=BatchStageResponse)
+@post(
+    "/batches/{batch_id:uuid}/staged",
+    status_code=200,
+    responses=_PROBLEM_RESPONSES,
+    sync_to_thread=True,
+)
 def stage_job_batch(
     request: Request,
-    batch_id: UUID,
-    payload: BatchStageRequest,
-    _actor: Actor = Depends(require_job_token),
-    db: Session = Depends(get_db),
+    batch_id: FromPath[UUID],
+    data: JSONBody[BatchStageRequest],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> BatchStageResponse:
     with request.app.state.transition_lock:
         try:
             result = acknowledge_staged_batch(
-                db, batch_id=batch_id, operation_ids=payload.operation_ids
+                db, batch_id=batch_id, operation_ids=data.operation_ids
             )
             db.commit()
         except LifecycleError as exc:
@@ -316,17 +336,22 @@ def stage_job_batch(
     )
 
 
-@router.post("/batches/{batch_id}/results", response_model=BatchResultsResponse)
+@post(
+    "/batches/{batch_id:uuid}/results",
+    status_code=200,
+    responses=_PROBLEM_RESPONSES,
+    sync_to_thread=True,
+)
 def report_job_batch(
     request: Request,
-    batch_id: UUID,
-    payload: BatchResultsRequest,
-    _actor: Actor = Depends(require_job_token),
-    db: Session = Depends(get_db),
+    batch_id: FromPath[UUID],
+    data: JSONBody[BatchResultsRequest],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
 ) -> BatchResultsResponse:
     with request.app.state.transition_lock:
         try:
-            result = report_batch_results(db, batch_id=batch_id, request=payload)
+            result = report_batch_results(db, batch_id=batch_id, request=data)
             db.commit()
         except LifecycleError as exc:
             db.rollback()
@@ -368,3 +393,18 @@ def report_job_batch(
         review_required=result.review_required,
         idempotent_replay=result.idempotent_replay,
     )
+
+
+jobs_router = Router(
+    path="/api/v1/jobs",
+    route_handlers=[
+        claim_job_batch,
+        get_batch_manifest,
+        download_batch_operation,
+        stage_job_batch,
+        report_job_batch,
+    ],
+    dependencies={"actor": Provide(require_job_token, sync_to_thread=False)},
+    tags=["Jenkins"],
+)
+router = jobs_router

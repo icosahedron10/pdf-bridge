@@ -23,6 +23,7 @@ APP_ROOT = Path(__file__).resolve().parents[2]
 DEVELOPMENT_SESSION_SECRET = "development-only-change-me"
 HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 COLLECTION_KEY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+BRAND_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -76,6 +77,12 @@ class Settings(BaseSettings):
     app_env: Literal["development", "test", "enterprise"] = "development"
     auth_mode: Literal["anonymous-poc", "trusted-header"] = "anonymous-poc"
 
+    brand_primary_1: str = "#173f34"
+    brand_primary_2: str = "#0f3028"
+    brand_secondary_1: str = "#d5a846"
+    brand_secondary_2: str = "#d9c78f"
+    theme_default: Literal["system", "light", "dark"] = "system"
+
     storage_root: Path
     database_url: str = ""
     collections: list[CollectionDefinition] = Field(min_length=1, max_length=50)
@@ -101,6 +108,19 @@ class Settings(BaseSettings):
     search_api_token: SecretStr | None = None
     search_api_timeout: float = 10.0
     claim_lease_minutes: int = 30
+
+    @field_validator(
+        "brand_primary_1",
+        "brand_primary_2",
+        "brand_secondary_1",
+        "brand_secondary_2",
+        mode="before",
+    )
+    @classmethod
+    def validate_brand_color(cls, value: object) -> str:
+        if not isinstance(value, str) or not BRAND_COLOR.fullmatch(value):
+            raise ValueError("brand colors must use strict six-digit #RRGGBB hexadecimal values")
+        return value
 
     @model_validator(mode="after")
     def validate_and_prepare(self) -> Settings:

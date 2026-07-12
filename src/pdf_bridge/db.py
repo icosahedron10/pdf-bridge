@@ -70,7 +70,7 @@ def get_session_factory() -> sessionmaker[Session]:
 
 
 def get_db() -> Iterator[Session]:
-    """FastAPI dependency; commit is deliberately owned by route/domain code."""
+    """Request dependency; commit is deliberately owned by route/domain code."""
 
     with get_session_factory()() as session:
         yield session

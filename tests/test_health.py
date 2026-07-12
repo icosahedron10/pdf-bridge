@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 
 from pdf_bridge import api
 

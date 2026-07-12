@@ -4,7 +4,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge.models import (

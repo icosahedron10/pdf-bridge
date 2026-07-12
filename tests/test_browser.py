@@ -41,7 +41,6 @@ def _upload_files(
     choices = page.locator('input[name="collection_key"]')
     expect(choices.nth(0)).to_be_disabled()
     expect(choices.nth(1)).to_be_disabled()
-    expect(page.locator("[data-destination-lock]")).to_contain_text("Destination locked")
     ready = page.locator("[data-file-status]", has_text="Ready to upload")
     expect(ready).to_have_count(len(files))
     page.get_by_role("button", name="Upload ready files").click()
@@ -147,6 +146,128 @@ def live_server(app) -> Iterator[str]:
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+@pytest.mark.skipif(
+    os.getenv("PDF_BRIDGE_RUN_BROWSER_TESTS") != "1",
+    reason="set PDF_BRIDGE_RUN_BROWSER_TESTS=1 after installing Playwright Chromium",
+)
+def test_deployment_theme_system_override_persistence_and_accessibility(
+    app, live_server: str
+) -> None:
+    app.state.settings.brand_primary_1 = "#123456"
+    app.state.settings.brand_primary_2 = "#234567"
+    app.state.settings.brand_secondary_1 = "#805500"
+    app.state.settings.brand_secondary_2 = "#ffeeaa"
+    app.state.settings.theme_default = "system"
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        context = browser.new_context(color_scheme="dark")
+        page = context.new_page()
+        page.goto(f"{live_server}/library")
+
+        root = page.locator("html")
+        toggle = page.locator("[data-theme-toggle]")
+        expect(root).to_have_attribute("data-theme", "dark")
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        expect(page.get_by_role("button", name="Dark mode")).to_be_visible()
+        expect(toggle).to_have_attribute("title", "Switch to light mode")
+
+        computed = page.evaluate(
+            """() => {
+                const rootStyles = getComputedStyle(document.documentElement);
+                const primaryStyles = getComputedStyle(document.querySelector(".button--primary"));
+                return {
+                    action: rootStyles.getPropertyValue("--color-action").trim(),
+                    actionHover: rootStyles.getPropertyValue("--color-action-hover").trim(),
+                    focus: rootStyles.getPropertyValue("--color-focus").trim(),
+                    accent: rootStyles.getPropertyValue("--color-accent").trim(),
+                    primaryBackground: primaryStyles.backgroundColor
+                };
+            }"""
+        )
+        assert computed == {
+            "action": "#123456",
+            "actionHover": "#234567",
+            "focus": "#805500",
+            "accent": "#ffeeaa",
+            "primaryBackground": "rgb(18, 52, 86)",
+        }
+
+        page.emulate_media(color_scheme="light")
+        expect(root).to_have_attribute("data-theme", "light")
+        expect(toggle).to_have_attribute("aria-pressed", "false")
+        expect(page.get_by_role("button", name="Dark mode")).to_be_visible()
+        expect(toggle).to_have_attribute("title", "Switch to dark mode")
+
+        toggle.click()
+        expect(root).to_have_attribute("data-theme", "dark")
+        expect(toggle).to_have_attribute("aria-pressed", "true")
+        expect(page.get_by_role("button", name="Dark mode")).to_be_visible()
+        expect(toggle).to_have_attribute("title", "Switch to light mode")
+        assert page.evaluate("localStorage.getItem('pdf-bridge:theme')") == "dark"
+
+        page.emulate_media(color_scheme="dark")
+        page.emulate_media(color_scheme="light")
+        expect(root).to_have_attribute("data-theme", "dark")
+        page.reload()
+        expect(root).to_have_attribute("data-theme", "dark")
+
+        toggle.click()
+        expect(root).to_have_attribute("data-theme", "light")
+        assert page.evaluate("localStorage.getItem('pdf-bridge:theme')") == "light"
+        page.emulate_media(color_scheme="dark")
+        page.reload()
+        expect(root).to_have_attribute("data-theme", "light")
+        expect(page.get_by_role("button", name="Dark mode")).to_be_visible()
+        expect(toggle).to_have_attribute("title", "Switch to dark mode")
+
+        page.evaluate("localStorage.removeItem('pdf-bridge:theme')")
+        app.state.settings.theme_default = "light"
+        page.reload()
+        expect(root).to_have_attribute("data-theme-default", "light")
+        expect(root).to_have_attribute("data-theme", "light")
+        page.emulate_media(color_scheme="dark")
+        expect(root).to_have_attribute("data-theme", "light")
+
+        app.state.settings.brand_primary_1 = "#ffffff"
+        app.state.settings.brand_primary_2 = "#ffffff"
+        page.goto(f"{live_server}/upload")
+        hostile_palette_styles = page.evaluate(
+            """() => {
+                const rootStyles = getComputedStyle(document.documentElement);
+                const primaryStyles = getComputedStyle(document.querySelector(".button--primary"));
+                return {
+                    action: rootStyles.getPropertyValue("--color-action").trim(),
+                    primaryText: primaryStyles.color
+                };
+            }"""
+        )
+        assert hostile_palette_styles == {
+            "action": "#ffffff",
+            "primaryText": "rgb(0, 0, 0)",
+        }
+
+        page.get_by_role("button", name="Dark mode").click()
+        expect(root).to_have_attribute("data-theme", "dark")
+        page.emulate_media(media="print", color_scheme="dark")
+        print_styles = page.evaluate(
+            """() => {
+                const bodyStyles = getComputedStyle(document.body);
+                return {
+                    background: bodyStyles.backgroundColor,
+                    text: bodyStyles.color
+                };
+            }"""
+        )
+        assert print_styles == {
+            "background": "rgb(255, 255, 255)",
+            "text": "rgb(32, 36, 31)",
+        }
+
+        context.close()
+        browser.close()
 
 
 @pytest.mark.skipif(
@@ -268,7 +389,7 @@ def test_review_workspace_records_audited_language_override(app, live_server: st
             return response.url.endswith("/classification")
 
         with page.expect_response(classification_finished) as info:
-            page.get_by_role("button", name="Record override").click()
+            page.get_by_role("button", name="Save language").click()
         classification_response = info.value
         assert classification_response.status == 200, classification_response.text()
         expect(page.get_by_text("No documents need review")).to_be_visible()
@@ -354,7 +475,7 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
                 page.goto(f"{live_server}/library")
                 page.locator("#library-query").fill("retention")
                 page.locator("#search-mode").select_option(mode)
-                page.get_by_role("button", name="Count matches").click()
+                page.get_by_role("button", name="Search", exact=True).click()
                 expect(
                     page.locator(
                         ".collection-entry--customer .collection-entry__search-count strong"

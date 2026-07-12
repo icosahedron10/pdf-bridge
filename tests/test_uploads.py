@@ -8,11 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
+from litestar.testing import TestClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from pdf_bridge.db import get_db
+from pdf_bridge.app import create_app
 from pdf_bridge.models import (
     Document,
     DocumentState,
@@ -24,7 +24,7 @@ from pdf_bridge.models import (
 )
 from pdf_bridge.scanner import ScannerProtocolError, ScannerUnavailableError, ScanResult
 from pdf_bridge.storage import StorageLayout, stream_upload
-from tests.conftest import PDF_A, PDF_B
+from tests.conftest import PDF_A, PDF_B, clean_scanner
 
 
 def test_upload_preview_duplicate_and_idempotent_replay(
@@ -261,39 +261,125 @@ def test_cancel_cleanup_failure_can_be_retried(
         assert document.storage_key is None
 
 
-def test_untrusted_host_is_rejected(client: TestClient) -> None:
-    response = client.get("/library", headers={"Host": "evil.example"})
+def test_trusted_host_accepts_arbitrary_valid_ports(client: TestClient) -> None:
+    matched = client.get("/library", headers={"Host": "testserver:49152"})
+    unmatched = client.get(
+        "/api/v1/does-not-exist",
+        headers={"Host": "testserver:65535"},
+    )
+
+    assert matched.status_code == 200
+    assert unmatched.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("path", "host"),
+    (
+        ("/library", "evil.example:443"),
+        ("/api/v1/does-not-exist", "evil.example"),
+        ("/library", "testserver:not-a-port"),
+        ("/library", "testserver:"),
+        ("/library", "testserver..example"),
+        ("/api/v1/does-not-exist", ""),
+    ),
+)
+def test_invalid_hosts_are_rejected_before_routing(
+    client: TestClient,
+    path: str,
+    host: str,
+) -> None:
+    response = client.get(path, headers={"Host": host})
+
     assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["status_code"] == 400
+    assert response.headers["x-request-id"]
+    assert response.headers["cache-control"] == "no-store"
 
 
-def test_concurrent_distinct_uploads_are_all_registered(app) -> None:
-    # Build FastAPI/Pydantic route adapters once before worker threads exercise
-    # runtime concurrency; schema generation itself is not the subject here.
-    app.openapi()
+def test_trusted_host_wildcard_accepts_only_subdomains(
+    settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    wildcard_settings = settings.model_copy(
+        update={"allowed_hosts": ["*.example.test"]}
+    )
 
+    def db_provider():
+        with session_factory() as session:
+            yield session
+
+    application = create_app(
+        wildcard_settings,
+        scanner=clean_scanner,
+        db_provider=db_provider,
+    )
+    with TestClient(
+        application,
+        base_url="http://bridge.example.test",
+        raise_server_exceptions=True,
+    ) as test_client:
+        accepted = test_client.get(
+            "/api/v1/health/live",
+            headers={"Host": "bridge.example.test:8443"},
+        )
+        rejected_apex = test_client.get(
+            "/api/v1/health/live",
+            headers={"Host": "example.test:8443"},
+        )
+        rejected_empty_label = test_client.get(
+            "/api/v1/health/live",
+            headers={"Host": ".example.test:8443"},
+        )
+        rejected_double_dot = test_client.get(
+            "/api/v1/health/live",
+            headers={"Host": "evil..example.test:8443"},
+        )
+
+    assert accepted.status_code == 200
+    assert rejected_apex.status_code == 400
+    assert rejected_empty_label.status_code == 400
+    assert rejected_double_dot.status_code == 400
+
+
+def test_concurrent_distinct_uploads_are_all_registered(
+    app,
+) -> None:
     def upload(index: int) -> tuple[int, str]:
-        with TestClient(app) as worker:
-            page = worker.get("/upload")
-            token_match = re.search(r'<meta name="csrf-token" content="([^"]+)"', page.text)
-            assert token_match
-            key = f"concurrent-file-key-{index}"
-            response = worker.post(
-                "/api/v1/uploads",
-                headers={"X-CSRF-Token": token_match.group(1), "Idempotency-Key": key},
-                files={
-                    "file": (
-                        f"concurrent-{index}.pdf",
-                        PDF_A + f"% distinct {index}\n".encode(),
-                        "application/pdf",
-                    )
-                },
-                data={
-                    "idempotency_key": key,
-                    "possible_duplicate_confirmed": "false",
-                    "collection_key": "customer",
-                },
-            )
-            return response.status_code, response.json().get("document", {}).get("id", "")
+        # Do not enter multiple concurrent lifespan contexts for one Litestar
+        # app. Independent non-context clients preserve separate browser
+        # sessions while sharing the app's transition lock.
+        worker = TestClient(
+            app,
+            base_url="http://testserver",
+            raise_server_exceptions=True,
+        )
+        page = worker.get("/upload")
+        token_match = re.search(
+            r'<meta name="csrf-token" content="([^"]+)"', page.text
+        )
+        assert token_match
+        key = f"concurrent-file-key-{index}"
+        response = worker.post(
+            "/api/v1/uploads",
+            headers={
+                "X-CSRF-Token": token_match.group(1),
+                "Idempotency-Key": key,
+            },
+            files={
+                "file": (
+                    f"concurrent-{index}.pdf",
+                    PDF_A + f"% distinct {index}\n".encode(),
+                    "application/pdf",
+                )
+            },
+            data={
+                "idempotency_key": key,
+                "possible_duplicate_confirmed": "false",
+                "collection_key": "customer",
+            },
+        )
+        return response.status_code, response.json().get("document", {}).get("id", "")
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(upload, range(4)))
@@ -303,9 +389,7 @@ def test_concurrent_distinct_uploads_are_all_registered(app) -> None:
 
 @pytest.mark.parametrize("matching_winner", [True, False])
 def test_idempotency_commit_race_uses_the_winning_catalog_row(
-    app,
-    client: TestClient,
-    csrf_headers: dict[str, str],
+    settings,
     session_factory: sessionmaker[Session],
     monkeypatch: pytest.MonkeyPatch,
     matching_winner: bool,
@@ -352,22 +436,37 @@ def test_idempotency_commit_race_uses_the_winning_catalog_row(
             winner_session.commit()
         raise IntegrityError("simulated idempotency race", {}, Exception("unique"))
 
-    original_override = app.dependency_overrides[get_db]
-    app.dependency_overrides[get_db] = database_override
+    application = create_app(
+        settings,
+        scanner=clean_scanner,
+        db_provider=database_override,
+    )
     monkeypatch.setattr(racing_session, "commit", race_commit)
     try:
-        response = client.post(
-            "/api/v1/uploads",
-            headers={**csrf_headers, "Idempotency-Key": "commit-race-key"},
-            files={"file": ("race.pdf", PDF_A, "application/pdf")},
-            data={
-                "idempotency_key": "commit-race-key",
-                "possible_duplicate_confirmed": "false",
-                "collection_key": "customer",
-            },
-        )
+        with TestClient(
+            application,
+            base_url="http://testserver",
+            raise_server_exceptions=True,
+        ) as race_client:
+            page = race_client.get("/upload")
+            token_match = re.search(
+                r'<meta name="csrf-token" content="([^"]+)"', page.text
+            )
+            assert token_match
+            response = race_client.post(
+                "/api/v1/uploads",
+                headers={
+                    "X-CSRF-Token": token_match.group(1),
+                    "Idempotency-Key": "commit-race-key",
+                },
+                files={"file": ("race.pdf", PDF_A, "application/pdf")},
+                data={
+                    "idempotency_key": "commit-race-key",
+                    "possible_duplicate_confirmed": "false",
+                    "collection_key": "customer",
+                },
+            )
     finally:
-        app.dependency_overrides[get_db] = original_override
         racing_session.close()
 
     if matching_winner:
