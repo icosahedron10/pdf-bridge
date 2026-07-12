@@ -7,9 +7,9 @@ import json
 import httpx
 from pydantic import ValidationError
 
-from pdf_bridge.config import Settings
-from pdf_bridge.problems import ProblemError
-from pdf_bridge.schemas import SearchRequest, SearchResponse
+from pdf_bridge.contracts.schemas import SearchRequest, SearchResponse
+from pdf_bridge.core.config import Settings
+from pdf_bridge.services.errors import ServiceError
 
 MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -23,20 +23,18 @@ async def search_retrieval(
     configured = {collection.key for collection in settings.collections}
     unknown = [key for key in request.collections if key not in configured]
     if unknown:
-        raise ProblemError(
+        raise ServiceError(
+            "Search may use only collections configured for this deployment.",
             status=422,
             code="collection-not-configured",
             title="Search collection was rejected",
-            detail="Search may use only collections configured for this deployment.",
         )
     if not settings.search_api_url:
-        raise ProblemError(
+        raise ServiceError(
+            "Browsing remains available, but the retrieval search endpoint is not configured.",
             status=503,
             code="search-not-configured",
             title="Search is not configured",
-            detail=(
-                "Browsing remains available, but the retrieval search endpoint is not configured."
-            ),
         )
 
     headers = {"Accept": "application/json"}
@@ -80,27 +78,25 @@ async def search_retrieval(
             raise ValueError("retrieval response did not correlate to its request")
         return result
     except httpx.RequestError as exc:
-        raise ProblemError(
+        raise ServiceError(
+            "The retrieval service could not be reached. No fallback search was used.",
             status=503,
             code="search-unavailable",
             title="Search is temporarily unavailable",
-            detail="The retrieval service could not be reached. No fallback search was used.",
         ) from exc
     except httpx.HTTPStatusError as exc:
-        raise ProblemError(
+        raise ServiceError(
+            "The retrieval service rejected the request. No fallback search was used.",
             status=502,
             code="search-upstream-error",
             title="Search service returned an error",
-            detail="The retrieval service rejected the request. No fallback search was used.",
         ) from exc
     except (ValueError, ValidationError) as exc:
-        raise ProblemError(
+        raise ServiceError(
+            "The retrieval service returned data that did not match the configured contract.",
             status=502,
             code="search-invalid-response",
             title="Search response was invalid",
-            detail=(
-                "The retrieval service returned data that did not match the configured contract."
-            ),
         ) from exc
     finally:
         if owns_client:

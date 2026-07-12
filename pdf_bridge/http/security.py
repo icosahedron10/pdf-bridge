@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from litestar import Request
 
-from pdf_bridge.problems import ProblemError
+from pdf_bridge.http.problems import ProblemError
 
 
 @dataclass(frozen=True, slots=True)

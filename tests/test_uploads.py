@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge.app import create_app
-from pdf_bridge.models import (
+from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
     OperationState,
@@ -22,8 +22,8 @@ from pdf_bridge.models import (
     ScanState,
     utc_now,
 )
-from pdf_bridge.scanner import ScannerProtocolError, ScannerUnavailableError, ScanResult
-from pdf_bridge.storage import StorageLayout, stream_upload
+from pdf_bridge.services.scanner import ScannerProtocolError, ScannerUnavailableError, ScanResult
+from pdf_bridge.services.storage import StorageLayout, stream_upload
 from tests.conftest import PDF_A, PDF_B, clean_scanner
 
 
@@ -232,7 +232,7 @@ def test_cancel_cleanup_failure_can_be_retried(
     document_id = uploaded.json()["document"]["id"]
     operation_id = uploaded.json()["operation_id"]
 
-    from pdf_bridge import api
+    from pdf_bridge.controllers import api
 
     original_remove = api.remove_storage_key
 

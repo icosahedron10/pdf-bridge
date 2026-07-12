@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import httpx
 from litestar.testing import TestClient
 
-from pdf_bridge.models import (
+from pdf_bridge.persistence.models import (
     BatchState,
     Document,
     DocumentState,
@@ -635,7 +635,7 @@ def test_deletion_cleanup_failure_can_be_replayed(
         ],
     }
 
-    from pdf_bridge import jobs
+    from pdf_bridge.controllers import jobs
 
     original_remove = jobs.remove_storage_key
 

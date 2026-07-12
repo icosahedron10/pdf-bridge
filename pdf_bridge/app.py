@@ -21,16 +21,16 @@ from litestar.template.config import TemplateConfig
 from sqlalchemy.orm import Session
 
 from pdf_bridge import __version__
-from pdf_bridge.api import create_api_routers
-from pdf_bridge.config import Settings, get_settings
-from pdf_bridge.db import build_engine, build_session_factory, get_db
-from pdf_bridge.jobs import jobs_router
-from pdf_bridge.lifecycle import validate_collection_references
-from pdf_bridge.logging_config import configure_logging
-from pdf_bridge.middleware import PortAwareTrustedHostMiddleware, RequestContextMiddleware
-from pdf_bridge.problems import exception_handlers
-from pdf_bridge.scanner import Scanner, scanner_from_settings
-from pdf_bridge.web import TEMPLATE_ROOT, web_router
+from pdf_bridge.controllers.api import create_api_routers
+from pdf_bridge.controllers.jobs import jobs_router
+from pdf_bridge.controllers.web import TEMPLATE_ROOT, web_router
+from pdf_bridge.core.config import Settings, get_settings
+from pdf_bridge.core.logging_config import configure_logging
+from pdf_bridge.http.middleware import PortAwareTrustedHostMiddleware, RequestContextMiddleware
+from pdf_bridge.http.problems import exception_handlers
+from pdf_bridge.persistence.db import build_engine, build_session_factory, get_db
+from pdf_bridge.services.lifecycle import validate_collection_references
+from pdf_bridge.services.scanner import Scanner, scanner_from_settings
 
 DBProvider = Callable[[], Iterator[Session]]
 UPLOAD_REQUEST_OVERHEAD_BYTES = 1_048_576

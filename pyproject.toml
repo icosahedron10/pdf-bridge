@@ -30,15 +30,15 @@ dev = [
 ]
 
 [project.scripts]
-pdf-bridge = "pdf_bridge.admin_cli:app"
-pdf-bridge-job = "pdf_bridge.job_cli:app"
+pdf-bridge = "pdf_bridge.controllers.admin_cli:app"
+pdf-bridge-job = "pdf_bridge.controllers.job_cli:app"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["pdf_bridge*"]
 
 [tool.setuptools.package-data]
 pdf_bridge = ["templates/**/*.html", "static/**/*"]

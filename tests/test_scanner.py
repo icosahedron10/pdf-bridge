@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from pdf_bridge.models import ScanState
-from pdf_bridge.scanner import ScannerProtocolError, _parse_scan_response
+from pdf_bridge.persistence.models import ScanState
+from pdf_bridge.services.scanner import ScannerProtocolError, _parse_scan_response
 
 
 def test_clamd_response_parser_handles_clean_and_infected() -> None:

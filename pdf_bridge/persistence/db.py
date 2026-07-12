@@ -11,7 +11,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from .config import get_settings
+from pdf_bridge.core.config import get_settings
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -70,7 +70,7 @@ def get_session_factory() -> sessionmaker[Session]:
 
 
 def get_db() -> Iterator[Session]:
-    """Request dependency; commit is deliberately owned by route/domain code."""
+    """Request dependency; commit and rollback are deliberately manager-owned."""
 
     with get_session_factory()() as session:
         yield session

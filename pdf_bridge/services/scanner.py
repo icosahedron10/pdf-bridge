@@ -10,8 +10,8 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
-from .config import Settings
-from .models import ScanState, utc_now
+from pdf_bridge.core.config import Settings
+from pdf_bridge.persistence.models import ScanState, utc_now
 
 CLAMD_CHUNK_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024

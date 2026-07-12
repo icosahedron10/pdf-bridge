@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pdf_bridge.config import Settings
+from pdf_bridge.core.config import Settings
 
 MINIMUM_TEXT_CONTRAST = 4.5
 FOREGROUND_CANDIDATES = ("#000000", "#ffffff")

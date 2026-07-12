@@ -7,7 +7,7 @@ import pytest
 from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from pdf_bridge.models import (
+from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
     LanguageCode,
@@ -18,7 +18,7 @@ from pdf_bridge.models import (
     ScanState,
     utc_now,
 )
-from pdf_bridge.view_models import document_view
+from pdf_bridge.presentation.view_models import document_view
 
 
 def _cleanup_document(*, state: DocumentState, filename: str) -> Document:

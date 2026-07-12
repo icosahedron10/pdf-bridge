@@ -20,6 +20,65 @@ flowchart LR
     A["Chatbot manager"] -->|"authenticated allowed intersection"| Q
 ```
 
+## Internal application structure
+
+The Python application uses one-way internal dependencies:
+
+```mermaid
+flowchart LR
+    A["app.py\ncomposition root"] --> C["controllers/"]
+    A --> H["http/"]
+    A --> P["persistence/"]
+    A --> O["core/"]
+    C --> M["managers/"]
+    C --> H
+    H --> K["contracts/"]
+    M --> S["services/"]
+    S --> V["presentation/"]
+    S --> K["contracts/"]
+    S --> P
+    V --> K
+    V --> P
+    K --> P
+    P --> O
+```
+
+`app.py` is the composition root and the only implementation module at the package root. It
+assembles Litestar, HTTP middleware, persistence providers, and runtime collaborators, then
+registers the controllers. Controller modules also contain the two Typer command adapters.
+Controllers own transport concerns: routes and command declarations, input binding,
+authentication dependencies, response/output construction, and translation of deliberate service
+failures into public errors. They do not construct SQL.
+
+Managers are deliberately thin. They coordinate service calls and own orchestration concerns such
+as locks, transaction commit or rollback sequencing, and multi-step cleanup. Business rules,
+queries, filesystem operations, and external-service implementations belong in services rather
+than managers.
+
+Services own the bulk of application behavior. They enforce lifecycle and catalog rules, execute
+SQL queries, and integrate with ClamAV, retrieval HTTP, and canonical storage. Services may depend
+on `core`, `persistence`, `contracts`, `presentation`, and peer services; they do not depend back on
+managers, controllers, the application composition root, or Litestar transport types.
+
+The foundation packages have narrow technical responsibilities:
+
+- `core/` owns configuration and logging and imports no other application layer.
+- `persistence/` owns SQLAlchemy database setup and ORM models and may depend on `core/`.
+- `contracts/` owns Pydantic API and job-client wire contracts. It may use persistence enums but
+  does not depend on presentation, services, managers, controllers, or HTTP adapters.
+- `http/` owns middleware, request security, and problem responses. It is a transport foundation,
+  not a home for routes or business workflows.
+- `presentation/` owns serializers, themes, and view models. It may format contract and persistence
+  values but does not call services or orchestration layers.
+
+Imports may skip downward across these layers when a lower-level type or helper is needed, but they
+must never point upward. Package initializers do not re-export implementations, and canonical
+module names omit redundant `_controller`, `_manager`, and `_service` suffixes.
+
+The **chatbot manager** shown in the system diagram is an external application responsible for
+end-user retrieval authorization. It is unrelated to the internal `pdf_bridge.managers` package;
+the shared word “manager” does not imply code ownership or a runtime dependency between them.
+
 ## Ownership boundaries
 
 PDF Bridge owns:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 
-from pdf_bridge.logging_config import JsonFormatter
+from pdf_bridge.core.logging_config import JsonFormatter
 
 
 def test_exception_logs_omit_exception_messages_and_local_paths(tmp_path) -> None:

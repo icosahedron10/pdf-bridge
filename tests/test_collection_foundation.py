@@ -10,14 +10,20 @@ from alembic.config import Config
 from pydantic import SecretStr, ValidationError
 from sqlalchemy.exc import IntegrityError
 
-from pdf_bridge.config import Settings
-from pdf_bridge.lifecycle import validate_collection_references
-from pdf_bridge.models import Document, DocumentState, LanguageCode, LanguageStatus, ScanState
-from pdf_bridge.schemas import (
+from pdf_bridge.contracts.schemas import (
     BatchResultsRequest,
     LanguageClassificationResult,
     OperationResultInput,
 )
+from pdf_bridge.core.config import Settings
+from pdf_bridge.persistence.models import (
+    Document,
+    DocumentState,
+    LanguageCode,
+    LanguageStatus,
+    ScanState,
+)
+from pdf_bridge.services.lifecycle import validate_collection_references
 
 
 def _settings_values(storage_root: Path) -> dict[str, object]:

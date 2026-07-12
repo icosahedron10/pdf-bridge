@@ -8,9 +8,9 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from pdf_bridge import models  # noqa: F401 -- registers mapped tables
-from pdf_bridge.config import get_settings
-from pdf_bridge.db import Base
+from pdf_bridge.core.config import get_settings
+from pdf_bridge.persistence import models  # noqa: F401 -- registers mapped tables
+from pdf_bridge.persistence.db import Base
 
 config = context.config
 if config.config_file_name is not None:

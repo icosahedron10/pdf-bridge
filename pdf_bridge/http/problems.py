@@ -6,8 +6,10 @@ import logging
 from typing import Any
 
 from litestar import Request, Response
+from litestar.openapi.datastructures import ResponseSpec
 
-from pdf_bridge.middleware import ensure_request_id
+from pdf_bridge.contracts.schemas import ProblemDetail
+from pdf_bridge.http.middleware import ensure_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,31 @@ class ProblemError(Exception):
         self.title = title
         self.detail = detail
         self.extra = extra or {}
+
+
+def problem_responses() -> dict[int, ResponseSpec]:
+    """Build the common OpenAPI declarations for problem-detail responses."""
+
+    descriptions = {
+        401: "Authentication failed",
+        403: "Request was not authorized",
+        404: "Resource was not found",
+        409: "State or duplicate conflict",
+        413: "Upload is too large",
+        422: "Request was deliberately rejected",
+        500: "Catalog or storage inconsistency",
+        502: "Invalid retrieval service response",
+        503: "Required dependency is unavailable",
+    }
+    return {
+        status: ResponseSpec(
+            data_container=ProblemDetail,
+            description=description,
+            media_type="application/problem+json",
+            generate_examples=False,
+        )
+        for status, description in descriptions.items()
+    }
 
 
 def problem_response(

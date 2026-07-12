@@ -9,13 +9,13 @@ from litestar.testing import RequestFactory, TestClient
 from pydantic import SecretStr, ValidationError
 
 from pdf_bridge.app import create_app
-from pdf_bridge.config import Settings
-from pdf_bridge.db import build_engine, create_schema
-from pdf_bridge.lifecycle import LifecycleError, import_historical_manifest
-from pdf_bridge.models import Document, DocumentState
-from pdf_bridge.problems import ProblemError
-from pdf_bridge.security import get_actor
-from pdf_bridge.storage import StorageLayout, UnsafePathError, validate_source_path
+from pdf_bridge.core.config import Settings
+from pdf_bridge.http.problems import ProblemError
+from pdf_bridge.http.security import get_actor
+from pdf_bridge.persistence.db import build_engine, create_schema
+from pdf_bridge.persistence.models import Document, DocumentState
+from pdf_bridge.services.lifecycle import LifecycleError, import_historical_manifest
+from pdf_bridge.services.storage import StorageLayout, UnsafePathError, validate_source_path
 from tests.conftest import PDF_A, clean_scanner
 
 

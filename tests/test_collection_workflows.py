@@ -9,7 +9,7 @@ import pytest
 from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
-from pdf_bridge.models import (
+from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
     LanguageCode,

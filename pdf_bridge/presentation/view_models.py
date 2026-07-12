@@ -5,12 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from pdf_bridge.models import (
-    AuditEvent,
-    Document,
-    DocumentState,
-    QueueOperation,
-)
+from pdf_bridge.persistence.models import AuditEvent, Document, DocumentState, QueueOperation
 
 LANGUAGE_LABELS = {
     "en": "English",
@@ -28,7 +23,9 @@ PREVIEW_BLOCKED_STATES = frozenset(
         DocumentState.CANCELLED,
     }
 )
-CLEANUP_PENDING_STATES = frozenset({DocumentState.DELETE_CLEANUP, DocumentState.CANCEL_CLEANUP})
+CLEANUP_PENDING_STATES = frozenset(
+    {DocumentState.DELETE_CLEANUP, DocumentState.CANCEL_CLEANUP}
+)
 
 
 def format_size(size_bytes: int) -> str:

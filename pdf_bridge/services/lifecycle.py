@@ -11,7 +11,15 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from pdf_bridge.models import (
+from pdf_bridge.contracts.schemas import (
+    BatchResultsRequest,
+    HistoricalImportItemResult,
+    HistoricalImportManifest,
+    HistoricalImportResponse,
+    LanguageResultStatus,
+    PipelineOutcome,
+)
+from pdf_bridge.persistence.models import (
     AuditEvent,
     BatchState,
     Document,
@@ -25,16 +33,8 @@ from pdf_bridge.models import (
     ScanState,
     utc_now,
 )
-from pdf_bridge.scanner import Scanner, ScanResult
-from pdf_bridge.schemas import (
-    BatchResultsRequest,
-    HistoricalImportItemResult,
-    HistoricalImportManifest,
-    HistoricalImportResponse,
-    LanguageResultStatus,
-    PipelineOutcome,
-)
-from pdf_bridge.storage import (
+from pdf_bridge.services.scanner import Scanner, ScanResult
+from pdf_bridge.services.storage import (
     PromotedFile,
     StagedFile,
     StorageLayout,

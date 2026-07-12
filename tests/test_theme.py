@@ -8,13 +8,13 @@ from litestar.testing import TestClient
 from pydantic import SecretStr, ValidationError
 
 from pdf_bridge.app import create_app
-from pdf_bridge.config import Settings
+from pdf_bridge.core.config import Settings
 from tests.conftest import clean_scanner
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-APP_CSS = REPOSITORY_ROOT / "src" / "pdf_bridge" / "static" / "app.css"
+APP_CSS = REPOSITORY_ROOT / "pdf_bridge" / "static" / "app.css"
 STATIC_ROOT = APP_CSS.parent
-TEMPLATE_ROOT = REPOSITORY_ROOT / "src" / "pdf_bridge" / "templates"
+TEMPLATE_ROOT = REPOSITORY_ROOT / "pdf_bridge" / "templates"
 
 BRAND_FIELDS = (
     "brand_primary_1",

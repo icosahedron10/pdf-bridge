@@ -12,19 +12,16 @@ import respx
 from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
 
-from pdf_bridge import admin_cli
-from pdf_bridge.admin_cli import app as admin_app
-from pdf_bridge.job_cli import (
-    BridgeClientError,
-    _local_manifest,
-    _problem_message,
-    _stage_new_batch,
-)
-from pdf_bridge.job_cli import (
+from pdf_bridge.contracts.job_contracts import BridgeClientError
+from pdf_bridge.contracts.schemas import BatchManifestItem, BatchManifestResponse
+from pdf_bridge.controllers import admin_cli
+from pdf_bridge.controllers.admin_cli import app as admin_app
+from pdf_bridge.controllers.job_cli import (
     app as job_app,
 )
-from pdf_bridge.models import BatchState, OperationType
-from pdf_bridge.schemas import BatchManifestItem, BatchManifestResponse
+from pdf_bridge.persistence.models import BatchState, OperationType
+from pdf_bridge.services.job_http import _problem_message
+from pdf_bridge.services.job_staging import _local_manifest, _stage_new_batch
 from tests.conftest import PDF_A, clean_scanner
 
 runner = CliRunner()

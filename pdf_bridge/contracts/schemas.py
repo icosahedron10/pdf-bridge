@@ -8,7 +8,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Generic, Literal, TypeVar
 
-from litestar.openapi.datastructures import ResponseSpec
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -18,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from .models import (
+from pdf_bridge.persistence.models import (
     BatchState,
     DocumentState,
     LanguageCode,
@@ -82,31 +81,6 @@ class ProblemDetail(ApiModel):
     request_id: str | None = None
     duplicate: DuplicateMatch | None = None
     possible_duplicates: list[DuplicateMatch] = Field(default_factory=list, max_length=100)
-
-
-def problem_responses() -> dict[int, ResponseSpec]:
-    """Common OpenAPI declarations for the API's problem-details responses."""
-
-    descriptions = {
-        401: "Authentication failed",
-        403: "Request was not authorized",
-        404: "Resource was not found",
-        409: "State or duplicate conflict",
-        413: "Upload is too large",
-        422: "Request was deliberately rejected",
-        500: "Catalog or storage inconsistency",
-        502: "Invalid retrieval service response",
-        503: "Required dependency is unavailable",
-    }
-    return {
-        status: ResponseSpec(
-            data_container=ProblemDetail,
-            description=description,
-            media_type="application/problem+json",
-            generate_examples=False,
-        )
-        for status, description in descriptions.items()
-    }
 
 
 class DocumentSummary(ApiModel):

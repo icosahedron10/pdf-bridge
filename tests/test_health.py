@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from litestar.testing import TestClient
 
-from pdf_bridge import api
+from pdf_bridge.controllers import api
 
 
 def test_health_endpoints_report_dependency_state(client: TestClient, monkeypatch) -> None:

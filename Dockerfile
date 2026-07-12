@@ -12,7 +12,7 @@ RUN addgroup --system --gid 10001 pdfbridge \
     && install -d -o pdfbridge -g pdfbridge -m 0700 /var/lib/pdf-bridge
 
 COPY pyproject.toml README.md ./
-COPY src ./src
+COPY pdf_bridge ./pdf_bridge
 RUN python -m pip install --no-cache-dir .
 
 COPY alembic.ini ./

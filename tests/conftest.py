@@ -25,10 +25,14 @@ os.environ.setdefault(
 )
 
 from pdf_bridge.app import create_app  # noqa: E402
-from pdf_bridge.config import Settings  # noqa: E402
-from pdf_bridge.db import build_engine, build_session_factory, create_schema  # noqa: E402
-from pdf_bridge.models import ScanState, utc_now  # noqa: E402
-from pdf_bridge.scanner import ScanResult  # noqa: E402
+from pdf_bridge.core.config import Settings  # noqa: E402
+from pdf_bridge.persistence.db import (  # noqa: E402
+    build_engine,
+    build_session_factory,
+    create_schema,
+)
+from pdf_bridge.persistence.models import ScanState, utc_now  # noqa: E402
+from pdf_bridge.services.scanner import ScanResult  # noqa: E402
 
 PDF_A = b"%PDF-1.4\n% bridge test\n1 0 obj\n<< /Type /Catalog /Value (A) >>\nendobj\n%%EOF\n"
 PDF_B = b"%PDF-1.4\n% bridge test\n1 0 obj\n<< /Type /Catalog /Value (B) >>\nendobj\n%%EOF\n"

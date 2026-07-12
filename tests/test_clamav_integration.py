@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from pdf_bridge.models import ScanState
-from pdf_bridge.scanner import clamd_scan_path
+from pdf_bridge.persistence.models import ScanState
+from pdf_bridge.services.scanner import clamd_scan_path
 
 pytestmark = pytest.mark.clamav
 
