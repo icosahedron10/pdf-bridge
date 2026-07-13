@@ -4,10 +4,19 @@ import json
 import uuid
 
 import httpx
+import pytest
 from litestar.testing import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
+from pdf_bridge.contracts.schemas import (
+    CollectionSearchGroup,
+    SearchHit,
+    SearchRequest,
+    SearchResponse,
+)
 from pdf_bridge.persistence.models import Document, DocumentState, ScanState, utc_now
+from pdf_bridge.services import catalog
+from pdf_bridge.services.errors import ServiceError
 from tests.conftest import PDF_A
 
 
@@ -372,3 +381,35 @@ def test_customer_search_rejects_forged_internal_document(
         assert response.json()["code"] == "search-catalog-mismatch"
     finally:
         search_client.close()
+
+
+def test_catalog_search_validation_rejects_duplicate_eligible_hits(
+    session_factory: sessionmaker[Session],
+) -> None:
+    document = _catalog_document(
+        filename="public-product.pdf",
+        collection_key="customer",
+        state=DocumentState.INGESTED,
+    )
+    request = SearchRequest(query="product", collections=["customer"])
+    hit = SearchHit(document_id=document.id, score=0.99, snippet="Eligible result")
+    response = SearchResponse.model_construct(
+        query=request.query,
+        mode=request.mode,
+        groups=[
+            CollectionSearchGroup.model_construct(
+                collection_key="customer",
+                total=1,
+                hits=[hit, hit],
+            )
+        ],
+    )
+
+    with session_factory() as session:
+        session.add(document)
+        session.commit()
+        with pytest.raises(ServiceError) as exc_info:
+            catalog.validate_search_response(session, request, response)
+
+    assert exc_info.value.status == 502
+    assert exc_info.value.code == "search-catalog-mismatch"

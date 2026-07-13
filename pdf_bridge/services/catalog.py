@@ -493,7 +493,7 @@ def validate_search_response(
             else []
         )
         documents_by_id = {document.id: document for document in documents}
-        invalid_hit = any(
+        invalid_hit = len(ids) != len(set(ids)) or any(
             document_id not in documents_by_id
             or documents_by_id[document_id].collection_key != group.collection_key
             for document_id in ids
