@@ -111,20 +111,3 @@ async def require_csrf(request: Request) -> Actor:
             detail="Refresh the page and retry the action.",
         )
     return get_actor(request)
-
-
-def require_job_token(request: Request) -> Actor:
-    """Authenticate a Jenkins request with the configured bearer token."""
-
-    settings = request.app.state.settings
-    authorization = request.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    expected = settings.job_token.get_secret_value() if settings.job_token else ""
-    if scheme.casefold() != "bearer" or not token or not hmac.compare_digest(token, expected):
-        raise ProblemError(
-            status=401,
-            code="job-authentication-failed",
-            title="Job authentication failed",
-            detail="A valid Jenkins service token is required.",
-        )
-    return Actor(identifier="jenkins", kind="service")

@@ -23,14 +23,18 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge import __version__
 from pdf_bridge.controllers.api import create_api_routers
-from pdf_bridge.controllers.jobs import jobs_router
 from pdf_bridge.controllers.web import TEMPLATE_ROOT, web_router
 from pdf_bridge.core.config import Settings, get_settings
 from pdf_bridge.core.logging_config import configure_logging
 from pdf_bridge.http.middleware import PortAwareTrustedHostMiddleware, RequestContextMiddleware
 from pdf_bridge.http.problems import exception_handlers
+from pdf_bridge.managers.worker import (
+    AnalysisWorker,
+    WorkerProviders,
+    providers_from_settings,
+)
 from pdf_bridge.persistence.db import build_engine, build_session_factory
-from pdf_bridge.services.lifecycle import validate_collection_references
+from pdf_bridge.services.intake import validate_collection_references
 from pdf_bridge.services.scanner import Scanner, scanner_from_settings
 
 DBProvider = Callable[[], Iterator[Session]]
@@ -67,7 +71,7 @@ def _openapi_config(settings: Settings) -> OpenAPIConfig | None:
         return None
     return OpenAPIConfig(
         title="PDF Bridge API",
-        summary="A transparent upload and scheduled-ingestion bridge for PDF documents.",
+        summary="A transparent upload, analysis, and semantic-intake bridge for PDFs.",
         version=__version__,
         path="/api",
         openapi_router=Router(
@@ -95,17 +99,28 @@ def create_app(
     scanner: Scanner | None = None,
     search_http_client: httpx.Client | None = None,
     db_provider: DBProvider | None = None,
+    worker: AnalysisWorker | None = None,
+    worker_providers: WorkerProviders | None = None,
 ) -> Litestar:
-    """Assemble and configure the PDF Bridge Litestar application."""
+    """Assemble and configure the PDF Bridge Litestar application.
+
+    The internal analysis worker is lifespan-owned: it starts with the app,
+    recovers durable leases, and stops before the engine is disposed. Tests
+    may inject a preconstructed worker (or disable it via settings) and drive
+    operations synchronously instead.
+    """
 
     active_settings = settings or get_settings()
-    if db_provider is not None and active_settings.app_env != "test":
-        raise RuntimeError("custom database providers are supported only in test mode")
+    if active_settings.app_env != "test":
+        if db_provider is not None:
+            raise RuntimeError("custom database providers are supported only in test mode")
+        if worker is not None:
+            raise RuntimeError("custom workers are supported only in test mode")
     configure_logging()
 
     @asynccontextmanager
     async def lifespan(application: Litestar):
-        """Own the engine, session factory, and retrieval client for the app.
+        """Own the engine, session factory, worker, and HTTP clients.
 
         Owned resources are built from the settings given to ``create_app`` so
         the validated database is the served database, and they are always
@@ -115,7 +130,10 @@ def create_app(
 
         engine: Engine | None = None
         owned_search_client: httpx.Client | None = None
+        owned_provider_client: httpx.Client | None = None
+        owned_worker: AnalysisWorker | None = None
         try:
+            factory: sessionmaker[Session] | None = None
             if db_provider is None:
                 engine = build_engine(active_settings.database_url)
                 factory = build_session_factory(engine)
@@ -128,8 +146,31 @@ def create_app(
             if search_http_client is None:
                 owned_search_client = httpx.Client(timeout=active_settings.search_api_timeout)
                 application.state.search_http_client = owned_search_client
+
+            if worker is not None:
+                application.state.worker = worker
+            elif active_settings.worker_enabled and factory is not None:
+                if worker_providers is None:
+                    if active_settings.embedding_api_url or active_settings.llm_api_url:
+                        owned_provider_client = httpx.Client()
+                    providers = providers_from_settings(
+                        active_settings, http_client=owned_provider_client
+                    )
+                else:
+                    providers = worker_providers
+                owned_worker = AnalysisWorker(
+                    settings=active_settings,
+                    session_factory=factory,
+                    providers=providers,
+                )
+                owned_worker.start()
+                application.state.worker = owned_worker
             yield
         finally:
+            if owned_worker is not None:
+                owned_worker.stop()
+            if owned_provider_client is not None:
+                owned_provider_client.close()
             if owned_search_client is not None:
                 owned_search_client.close()
             if engine is not None:
@@ -144,6 +185,8 @@ def create_app(
     }
     if search_http_client is not None:
         state_values["search_http_client"] = search_http_client
+    if worker is not None:
+        state_values["worker"] = worker
 
     session_config = CookieBackendConfig(
         secret=_session_key(active_settings),
@@ -162,7 +205,6 @@ def create_app(
     application = Litestar(
         route_handlers=[
             *create_api_routers(upload_request_limit),
-            jobs_router,
             web_router,
             create_static_files_router(path="/static", directories=[static_root]),
         ],

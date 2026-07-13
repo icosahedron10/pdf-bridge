@@ -96,7 +96,6 @@
                     <div>
                       <a class="document-link" href="/documents/{{ document_id }}">{{ filename }}</a>
                       <span class="document-cell__meta">{{ doc.size_display|default(doc.size_bytes_display, true)|default('Size not reported', true) }} · <code>{{ collection.key }}</code></span>
-                      {% if document_status == 'DELETE_CLEANUP' %}<span class="document-cell__meta document-cell__meta--warning">Downstream deletion complete; canonical PDF cleanup pending</span>{% endif %}
                     </div>
                   </div>
                 </td>
@@ -111,11 +110,11 @@
                 <td data-label="Chunks">{{ doc.chunk_count|default('—', true) }}</td>
                 <td class="actions-cell">
                   <div class="row-actions">
-                    {% if doc.can_preview|default(false) and document_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
+                    {% if doc.can_preview|default(false) %}
                       <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener" aria-label="Open {{ filename }} in a new tab">Open {{ external_icon() }}</a>
                     {% endif %}
                     {% if document_status == 'INGESTED' %}
-                      <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/library/{{ collection.key }}" data-confirm="Request deletion of {{ filename }}? The document will remain visible until the pipeline confirms every downstream copy was removed." data-confirm-label="Request deletion">
+                      <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/library/{{ collection.key }}" data-confirm="Delete {{ filename }}? The worker will remove and verify its active index points before purging the PDF and retained analysis." data-confirm-label="Delete document">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
                         <button class="button button--danger-text button--small" type="submit" aria-label="Delete {{ filename }}">Delete</button>
                         <p class="form-error" data-form-error hidden></p>

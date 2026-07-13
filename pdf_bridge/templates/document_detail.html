@@ -1,13 +1,16 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import status_label, audience_label, value_or_missing, document_icon, external_icon %}
+{% from "macros/ui.html" import status_label, audience_label, document_icon, external_icon %}
 
 {% set doc = document %}
-{% set document_id = doc.id|default(doc.document_id, true) %}
-{% set filename = doc.original_filename|default(doc.filename, true)|default('Untitled PDF', true) %}
+{% set document_id = doc.id %}
+{% set filename = doc.original_filename|default('Untitled PDF', true) %}
 {% set document_status = doc.status|default('UNKNOWN', true)|upper %}
 {% set operation = active_operation|default(none, true) %}
-{% set operation_id = operation.id|default(operation.operation_id, true) if operation else none %}
-{% set is_queue = document_status in ['QUEUED', 'CLAIMED', 'STAGED', 'INGEST_FAILED', 'DELETE_QUEUED', 'DELETE_CLAIMED', 'DELETE_CLEANUP', 'DELETE_FAILED', 'CANCEL_CLEANUP'] %}
+{% set operation_id = operation.id if operation else none %}
+{% set queue_states = ['ANALYZING', 'REVIEW_REQUIRED', 'INGESTING', 'INGEST_FAILED', 'REPLACING', 'REPLACE_FAILED', 'DELETING', 'DELETE_FAILED', 'CLEANUP_PENDING', 'CLEANUP_FAILED'] %}
+{% set cancellable_states = ['ANALYZING', 'REVIEW_REQUIRED', 'INGESTING', 'INGEST_FAILED', 'REPLACING', 'REPLACE_FAILED'] %}
+{% set retryable_states = ['INGEST_FAILED', 'REPLACE_FAILED', 'DELETE_FAILED', 'CLEANUP_FAILED'] %}
+{% set is_queue = document_status in queue_states %}
 
 {% block title %}{{ filename }} · PDF Bridge{% endblock %}
 
@@ -20,8 +23,7 @@
     {% else %}
       <a href="/library">Collections</a>
     {% endif %}
-    <span aria-hidden="true">/</span>
-    <span aria-current="page">Document details</span>
+    <span aria-hidden="true">/</span><span aria-current="page">Document details</span>
   </nav>
 {% endblock %}
 
@@ -30,39 +32,33 @@
     <div class="document-title">
       {{ document_icon() }}
       <div>
-        <div class="document-title__line">
-          <h1>{{ filename }}</h1>
-          {{ status_label(document_status) }}
-        </div>
+        <div class="document-title__line"><h1>{{ filename }}</h1>{{ status_label(document_status) }}</div>
         <p class="document-title__context"><span class="mono">{{ document_id }}</span>{% if collection %} · {{ audience_label(collection.audience) }}{% endif %}</p>
       </div>
     </div>
     <div class="page-heading__actions">
-      {% if doc.can_preview|default(false) and document_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] and doc.scan_status|default('UNKNOWN', true)|upper == 'CLEAN' %}
+      {% if doc.can_preview|default(false) %}
         <a class="button button--quiet" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener">Open PDF {{ external_icon() }}</a>
       {% endif %}
-      {% if document_status == 'INGESTED' %}
-        <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}" data-confirm="Request deletion of {{ filename }}? It will remain visible until the pipeline confirms every downstream copy was removed." data-confirm-label="Request deletion">
+      {% if document_status == 'REVIEW_REQUIRED' %}
+        <a class="button button--primary" href="/upload#upload-{{ document_id }}">Review analysis</a>
+      {% elif document_status == 'INGESTED' %}
+        <form action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}" data-confirm="Delete {{ filename }}? The worker will remove and verify its active index points before purging the PDF and retained analysis." data-confirm-label="Delete document">
           <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-          <button class="button button--danger" type="submit">Request deletion</button>
+          <button class="button button--danger" type="submit">Delete document</button>
           <p class="form-error" data-form-error hidden></p>
         </form>
-      {% elif document_status == 'QUEUED' and operation_id %}
-        <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Remove {{ filename }} from the queue? Its stored PDF will be removed and this cannot be undone." data-confirm-label="Remove from queue">
+      {% elif document_status in retryable_states and operation and operation.retryable|default(false) %}
+        <form action="/api/v1/uploads/{{ document_id }}/retry" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-          <button class="button button--danger" type="submit">Remove from queue</button>
+          <button class="button button--primary" type="submit">Retry work</button>
           <p class="form-error" data-form-error hidden></p>
         </form>
-      {% elif document_status in ['INGEST_FAILED', 'DELETE_FAILED'] and operation_id %}
-        <form action="/api/v1/queue/{{ operation_id }}/retry" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}">
+      {% endif %}
+      {% if document_status in cancellable_states %}
+        <form action="/api/v1/uploads/{{ document_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Cancel {{ filename }}? Its PDF, full analysis, and private screening points will be removed. This cannot be undone." data-confirm-label="Cancel upload">
           <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-          <button class="button button--primary" type="submit">Retry operation</button>
-          <p class="form-error" data-form-error hidden></p>
-        </form>
-      {% elif document_status == 'CANCEL_CLEANUP' and operation_id %}
-        <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Retry cleanup for {{ filename }}? The bridge will attempt to remove the retained canonical PDF again." data-confirm-label="Retry cleanup">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-          <button class="button button--primary" type="submit">Retry cleanup</button>
+          <button class="button button--danger-text" type="submit">Cancel upload</button>
           <p class="form-error" data-form-error hidden></p>
         </form>
       {% endif %}
@@ -71,62 +67,77 @@
 {% endblock %}
 
 {% block content %}
-  {% if document_status in ['DELETE_QUEUED', 'DELETE_CLAIMED'] %}
-    <div class="notice notice--warning" role="status">
-      <div>
-        <strong>Deletion is pending</strong>
-        <p>This record and PDF remain available until the pipeline confirms removal from the source, markdown output, BM25 index, and dense index.</p>
-      </div>
-    </div>
-  {% elif document_status == 'DELETE_CLEANUP' %}
-    <div class="notice notice--warning" role="status">
-      <div>
-        <strong>Downstream deletion is complete; canonical cleanup is pending</strong>
-        <p>The pipeline reported removal from the PDF source, markdown output, BM25 index, and dense index. The bridge still retains its canonical PDF until storage cleanup finishes, so preview is disabled.</p>
-      </div>
-    </div>
-  {% elif document_status == 'CANCEL_CLEANUP' %}
-    <div class="notice notice--warning" role="status">
-      <div>
-        <strong>Queue removal is waiting for storage cleanup</strong>
-        <p>This upload is no longer eligible for ingestion, but the bridge still retains its canonical PDF. Inspect storage if needed, then retry cleanup to finish the cancellation. Preview is disabled.</p>
-      </div>
-    </div>
+  {% if document_status == 'REVIEW_REQUIRED' %}
+    <div class="notice notice--warning" role="status"><div><strong>An operator decision is required</strong><p>Analysis found advisory evidence or could not complete every semantic check. Review every candidate before choosing Keep, Replace, or Cancel.</p></div></div>
+  {% elif document_status == 'REPLACING' %}
+    <div class="notice notice--warning" role="status"><div><strong>Safe replacement is in progress</strong><p>The new analysis points are prepared first. The worker then removes and verifies the old active points before publishing this document, so a temporary availability gap is possible but overlap is not.</p></div></div>
+  {% elif document_status == 'DELETING' %}
+    <div class="notice notice--warning" role="status"><div><strong>Deletion is in progress</strong><p>The worker is removing and verifying active points before purging retained content.</p></div></div>
+  {% elif document_status in ['CLEANUP_PENDING', 'CLEANUP_FAILED'] %}
+    <div class="notice notice--warning" role="status"><div><strong>Private content cleanup is not complete</strong><p>The document is unavailable to retrieval. Canonical content, analysis artifacts, or screening points still require cleanup, so preview is disabled.</p></div></div>
+  {% elif document_status == 'REJECTED' %}
+    <div class="notice notice--error" role="alert"><div><strong>The PDF could not be analyzed safely</strong><p>{{ doc.rejection_reason|default('The parser rejected this document and retained content was removed.', true)|replace('_', ' ') }}</p></div></div>
   {% endif %}
 
   {% if doc.error_message|default(false) or (operation and operation.error_message|default(false)) %}
-    <div class="notice notice--error" role="alert">
-      <div>
-        <strong>The latest operation failed</strong>
-        <p>{{ operation.error_message|default(doc.error_message, true) }}</p>
-      </div>
-    </div>
+    <div class="notice notice--error" role="alert"><div><strong>The latest work failed</strong><p>{{ operation.error_message|default(doc.error_message, true) }}</p></div></div>
   {% endif %}
 
   <div class="detail-layout">
     <div class="detail-main">
-      <section class="detail-section" aria-labelledby="lifecycle-title">
-        <div class="section-heading">
-          <div>
-            <h2 id="lifecycle-title">Activity</h2>
+      <section class="detail-section" aria-labelledby="analysis-title">
+        <div class="section-heading"><div><h2 id="analysis-title">Analysis</h2></div>{% if document_status == 'REVIEW_REQUIRED' %}<a class="button button--quiet button--small" href="/upload#upload-{{ document_id }}">Review evidence</a>{% endif %}</div>
+        {% if analysis %}
+          <div class="analysis-summary-grid">
+            <dl class="analysis-facts">
+              <div><dt>Revision</dt><dd>{{ analysis.revision }}</dd></div>
+              <div><dt>Status</dt><dd>{{ status_label(analysis.status) }}</dd></div>
+              <div><dt>Candidates</dt><dd>{{ analysis.candidate_count }}</dd></div>
+              <div><dt>Classified</dt><dd>{{ analysis.classified_count }}</dd></div>
+              <div><dt>Pages</dt><dd>{{ analysis.page_count|default('Not reported', true) }}</dd></div>
+              <div><dt>Chunks</dt><dd>{{ analysis.chunk_count|default('Not reported', true) }}</dd></div>
+            </dl>
+            <div class="analysis-completeness">
+              <p><strong>Semantic comparison:</strong> {{ 'Complete' if analysis.semantic_complete else 'Incomplete' }}</p>
+              <p><strong>Candidate classification:</strong> {{ 'Complete' if analysis.classification_complete else 'Incomplete' }}</p>
+              {% if analysis.incomplete_reasons %}
+                <ul>{% for reason in analysis.incomplete_reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+              {% elif analysis.auto_ingest_eligible %}
+                <p>No advisory candidate requires review.</p>
+              {% endif %}
+            </div>
           </div>
-        </div>
+        {% else %}
+          <div class="missing-panel">Analysis has not produced a durable revision yet.</div>
+        {% endif %}
+      </section>
 
+      {% if decisions|default([], true) %}
+        <section class="detail-section" aria-labelledby="decision-title">
+          <div class="section-heading"><div><h2 id="decision-title">Decisions</h2></div></div>
+          <div class="table-frame">
+            <table class="data-table">
+              <thead><tr><th scope="col">Decision</th><th scope="col">Revision</th><th scope="col">Actor</th><th scope="col">Recorded</th><th scope="col">Target</th></tr></thead>
+              <tbody>{% for decision in decisions %}<tr><td>{{ status_label(decision.action) }}</td><td>{{ decision.analysis_revision }}</td><td>{{ decision.actor_id }}</td><td>{{ decision.created_at_display }}</td><td>{% if decision.target_document_id %}<a class="mono" href="/documents/{{ decision.target_document_id }}">{{ decision.target_document_id }}</a>{% else %}<span class="missing-value">None</span>{% endif %}</td></tr>{% endfor %}</tbody>
+            </table>
+          </div>
+        </section>
+      {% endif %}
+
+      <section class="detail-section" aria-labelledby="lifecycle-title">
+        <div class="section-heading"><div><h2 id="lifecycle-title">Activity</h2></div></div>
         {% if audit_events|default([], true) %}
           <ol class="event-ledger">
             {% for event in audit_events %}
               <li class="event-ledger__item">
                 <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
                 <div class="event-ledger__content">
-                  <div class="event-ledger__heading">
-                    <h3>{{ event.title|default(event.event_type, true)|default('Lifecycle event', true)|replace('_', ' ')|title }}</h3>
-                    {% if event.status|default(false) %}{{ status_label(event.status) }}{% endif %}
-                  </div>
+                  <div class="event-ledger__heading"><h3>{{ event.title|default(event.event_type, true)|default('Lifecycle event', true)|replace('_', ' ')|title }}</h3>{% if event.status|default(false) %}{{ status_label(event.status) }}{% endif %}</div>
                   <dl class="event-ledger__metadata">
-                    <div><dt>Recorded</dt><dd>{{ event.occurred_at_display|default(event.created_at_display, true)|default(event.created_at, true)|default('Not reported', true) }}</dd></div>
-                    <div><dt>Actor</dt><dd>{{ event.actor_display|default(event.actor, true)|default('System', true) }}</dd></div>
-                    {% if event.batch_id|default(false) %}<div><dt>Batch</dt><dd class="mono">{{ event.batch_id }}</dd></div>{% endif %}
-                    {% if event.pipeline_run_id|default(false) %}<div><dt>Pipeline run</dt><dd class="mono">{{ event.pipeline_run_id }}</dd></div>{% endif %}
+                    <div><dt>Recorded</dt><dd>{{ event.occurred_at_display|default('Not reported', true) }}</dd></div>
+                    <div><dt>Actor</dt><dd>{{ event.actor_display|default('System', true) }}</dd></div>
+                    {% if event.operation_id|default(false) %}<div><dt>Operation</dt><dd class="mono">{{ event.operation_id }}</dd></div>{% endif %}
+                    {% if event.analysis_revision|default(false) %}<div><dt>Analysis revision</dt><dd>{{ event.analysis_revision }}</dd></div>{% endif %}
                   </dl>
                   {% if event.detail|default(false) %}<p class="event-ledger__detail">{{ event.detail }}</p>{% endif %}
                 </div>
@@ -135,55 +146,19 @@
           </ol>
         {% else %}
           <ol class="event-ledger event-ledger--fallback">
-            <li class="event-ledger__item">
-              <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
-              <div class="event-ledger__content"><div class="event-ledger__heading"><h3>Upload received</h3></div><dl class="event-ledger__metadata"><div><dt>Recorded</dt><dd>{{ doc.created_at_display|default(doc.created_at, true)|default('Not reported', true) }}</dd></div><div><dt>Actor</dt><dd>{{ doc.uploaded_by|default('Not reported', true) }}</dd></div></dl></div>
-            </li>
-            <li class="event-ledger__item">
-              <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
-              <div class="event-ledger__content"><div class="event-ledger__heading"><h3>Malware scan</h3>{% if doc.scan_status|default(false) %}{{ status_label(doc.scan_status) }}{% endif %}</div><dl class="event-ledger__metadata"><div><dt>Recorded</dt><dd>{{ doc.scan_completed_at_display|default(doc.scan_completed_at, true)|default('Not reported', true) }}</dd></div><div><dt>Scanner</dt><dd>{{ doc.scan_engine_version|default('Not reported', true) }}</dd></div></dl></div>
-            </li>
-            <li class="event-ledger__item">
-              <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
-              <div class="event-ledger__content"><div class="event-ledger__heading"><h3>Jenkins collection</h3>{% if operation %}{{ status_label(operation.status) }}{% endif %}</div><dl class="event-ledger__metadata"><div><dt>Claimed</dt><dd>{{ operation.claimed_at_display|default(operation.claimed_at, true)|default('Not reported', true) if operation else 'Not reported' }}</dd></div><div><dt>Staged</dt><dd>{{ operation.staged_at_display|default(operation.staged_at, true)|default('Not reported', true) if operation else 'Not reported' }}</dd></div></dl></div>
-            </li>
-            <li class="event-ledger__item">
-              <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
-              <div class="event-ledger__content"><div class="event-ledger__heading"><h3>Pipeline result</h3></div><dl class="event-ledger__metadata"><div><dt>Ingested</dt><dd>{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</dd></div><div><dt>Pipeline run</dt><dd class="mono">{{ doc.pipeline_run_id|default('Not reported', true) }}</dd></div></dl></div>
-            </li>
-            <li class="event-ledger__item">
-              <div class="event-ledger__rail" aria-hidden="true"><span></span></div>
-              <div class="event-ledger__content"><div class="event-ledger__heading"><h3>Deletion result</h3></div><dl class="event-ledger__metadata"><div><dt>Requested</dt><dd>{{ doc.deletion_requested_at_display|default(doc.deletion_requested_at, true)|default('Not reported', true) }}</dd></div><div><dt>Completed</dt><dd>{{ doc.deleted_at_display|default(doc.deleted_at, true)|default('Not reported', true) }}</dd></div></dl></div>
-            </li>
+            <li class="event-ledger__item"><div class="event-ledger__rail" aria-hidden="true"><span></span></div><div class="event-ledger__content"><div class="event-ledger__heading"><h3>Upload received</h3></div><dl class="event-ledger__metadata"><div><dt>Recorded</dt><dd>{{ doc.created_at_display|default('Not reported', true) }}</dd></div><div><dt>Actor</dt><dd>{{ doc.uploaded_by|default('Not reported', true) }}</dd></div></dl></div></li>
+            <li class="event-ledger__item"><div class="event-ledger__rail" aria-hidden="true"><span></span></div><div class="event-ledger__content"><div class="event-ledger__heading"><h3>Malware scan</h3>{{ status_label(doc.scan_status|default('UNKNOWN', true)) }}</div><dl class="event-ledger__metadata"><div><dt>Recorded</dt><dd>{{ doc.scan_completed_at_display|default('Not reported', true) }}</dd></div><div><dt>Scanner</dt><dd>{{ doc.scan_engine_version|default('Not reported', true) }}</dd></div></dl></div></li>
+            {% if operation %}<li class="event-ledger__item"><div class="event-ledger__rail" aria-hidden="true"><span></span></div><div class="event-ledger__content"><div class="event-ledger__heading"><h3>{{ operation.operation_type|replace('_', ' ')|title }}</h3>{{ status_label(operation.operation_status) }}</div><dl class="event-ledger__metadata"><div><dt>Phase</dt><dd>{{ operation.phase|replace('_', ' ')|title }}</dd></div><div><dt>Updated</dt><dd>{{ operation.updated_at_display|default(operation.created_at_display, true)|default('Not reported', true) }}</dd></div></dl></div></li>{% endif %}
           </ol>
         {% endif %}
       </section>
 
-      <section class="detail-section" aria-labelledby="pipeline-title">
-        <div class="section-heading">
-          <div>
-            <h2 id="pipeline-title">Downstream components</h2>
-          </div>
-        </div>
-        {% if pipeline_components|default([], true) %}
-          <div class="table-frame">
-            <table class="data-table data-table--components">
-              <thead><tr><th scope="col">Component</th><th scope="col">Status</th><th scope="col">Updated</th><th scope="col">Detail</th></tr></thead>
-              <tbody>
-                {% for component in pipeline_components %}
-                  {% set component_key = component.name|default(component.component, true)|default('unknown', true)|lower %}
-                  <tr>
-                    <th scope="row">{% if component_key == 'pdf_source' %}PDF source{% elif component_key == 'bm25' %}BM25{% else %}{{ component_key|replace('_', ' ')|title }}{% endif %}</th>
-                    <td>{{ status_label(component.status|default('NOT_REPORTED', true)) }}</td>
-                    <td>{{ component.completed_at_display|default(component.updated_at_display, true)|default('Not reported', true) }}</td>
-                    <td>{% if component.detail is defined and component.detail is not none and component.detail != '' %}{{ component.detail }}{% elif component.item_count is defined and component.item_count is not none %}{{ component.item_count }}{% else %}<span class="missing-value">Not reported</span>{% endif %}</td>
-                  </tr>
-                {% endfor %}
-              </tbody>
-            </table>
-          </div>
+      <section class="detail-section" aria-labelledby="worker-title">
+        <div class="section-heading"><div><h2 id="worker-title">Latest worker operation</h2></div></div>
+        {% if operation %}
+          <div class="table-frame"><table class="data-table data-table--components"><thead><tr><th scope="col">Type</th><th scope="col">State</th><th scope="col">Phase</th><th scope="col">Attempt</th><th scope="col">Started</th><th scope="col">Completed</th></tr></thead><tbody><tr><td>{{ operation.operation_type|replace('_', ' ')|title }}</td><td>{{ status_label(operation.operation_status) }}</td><td>{{ status_label(operation.phase) }}</td><td>{{ operation.attempt }}</td><td>{{ operation.started_at_display|default('Not reported', true) }}</td><td>{{ operation.completed_at_display|default('Not reported', true) }}</td></tr></tbody></table></div>
         {% else %}
-          <div class="missing-panel">No component results have been reported by the pipeline.</div>
+          <div class="missing-panel">No durable worker operation is recorded.</div>
         {% endif %}
       </section>
     </div>
@@ -194,27 +169,23 @@
         <div><dt>Collection</dt><dd>{% if collection %}<a href="/library/{{ collection.key }}">{{ collection.display_name }}</a><br>{% endif %}<code>{{ doc.collection_key }}</code></dd></div>
         <div><dt>Audience</dt><dd>{% if collection %}{{ audience_label(collection.audience) }}{% else %}<span class="missing-value">Not assigned</span>{% endif %}</dd></div>
         <div><dt>Original filename</dt><dd>{{ filename }}</dd></div>
-        <div><dt>Size</dt><dd>{{ doc.size_display|default(doc.size_bytes_display, true)|default(doc.size_bytes, true)|default('Not reported', true) }}</dd></div>
+        <div><dt>Size</dt><dd>{{ doc.size_display|default('Not reported', true) }}</dd></div>
         <div><dt>Media type</dt><dd>{{ doc.media_type|default('application/pdf', true) }}</dd></div>
-        <div>
-          <dt>SHA-256 checksum</dt>
-          <dd class="checksum-value">
-            {% if doc.sha256|default(false) %}
-              <code>{{ doc.sha256 }}</code>
-              <button class="copy-button" type="button" data-copy-value="{{ doc.sha256 }}">Copy</button>
-            {% else %}<span class="missing-value">Not reported</span>{% endif %}
-          </dd>
-        </div>
-        <div><dt>Scan result</dt><dd>{% if doc.scan_status|default(false) %}{{ status_label(doc.scan_status) }}{% else %}<span class="missing-value">Not reported</span>{% endif %}</dd></div>
-        <div><dt>Uploaded</dt><dd>{{ doc.created_at_display|default(doc.created_at, true)|default('Not reported', true) }}</dd></div>
+        <div><dt>SHA-256 checksum</dt><dd class="checksum-value">{% if doc.sha256|default(false) %}<code>{{ doc.sha256 }}</code><button class="copy-button" type="button" data-copy-value="{{ doc.sha256 }}">Copy</button>{% else %}<span class="missing-value">Not reported</span>{% endif %}</dd></div>
+        <div><dt>Scan result</dt><dd>{{ status_label(doc.scan_status|default('UNKNOWN', true)) }}</dd></div>
+        <div><dt>Uploaded</dt><dd>{{ doc.created_at_display|default('Not reported', true) }}</dd></div>
         <div><dt>Uploaded by</dt><dd>{{ doc.uploaded_by|default('Not reported', true) }}</dd></div>
-        <div><dt>Ingested</dt><dd>{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</dd></div>
+        <div><dt>Ingested</dt><dd>{{ doc.ingested_at_display|default('Not reported', true) }}</dd></div>
+        <div><dt>Page count</dt><dd>{{ doc.page_count|default('Not reported', true) }}</dd></div>
         <div><dt>Chunk count</dt><dd>{{ doc.chunk_count|default('Not reported', true) }}</dd></div>
-        <div><dt>Pipeline run ID</dt><dd class="mono">{{ doc.pipeline_run_id|default('Not reported', true) }}</dd></div>
+        <div><dt>Analysis revision</dt><dd>{{ doc.analysis_revision|default(0) }}</dd></div>
+        {% if analysis and analysis.pipeline_fingerprint %}<div><dt>Pipeline fingerprint</dt><dd class="mono">{{ analysis.pipeline_fingerprint }}</dd></div>{% endif %}
+        {% if doc.analysis_manifest_hash|default(false) %}<div><dt>Analysis manifest hash</dt><dd class="checksum-value"><code>{{ doc.analysis_manifest_hash }}</code></dd></div>{% endif %}
+        {% if doc.replaced_by_document_id|default(false) %}<div><dt>Replaced by</dt><dd><a class="mono" href="/documents/{{ doc.replaced_by_document_id }}">{{ doc.replaced_by_document_id }}</a></dd></div>{% endif %}
         {% if operation %}
           <div><dt>Operation ID</dt><dd class="mono">{{ operation_id }}</dd></div>
-          <div><dt>Job batch</dt><dd class="mono">{{ operation.batch_id|default('Not claimed', true) }}</dd></div>
-          <div><dt>Lease expires</dt><dd>{{ operation.lease_expires_at_display|default(operation.lease_expires_at, true)|default('Not reported', true) }}</dd></div>
+          <div><dt>Operation phase</dt><dd>{{ status_label(operation.phase) }}</dd></div>
+          <div><dt>Lease expires</dt><dd>{{ operation.lease_expires_at_display|default('Not reported', true) }}</dd></div>
         {% endif %}
       </dl>
     </aside>

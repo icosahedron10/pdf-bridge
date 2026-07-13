@@ -1,202 +1,155 @@
 # Architecture and lifecycle
 
-PDF Bridge is the catalog and control plane between operators, durable source storage, Jenkins, the
-existing parser/RAG pipeline, and grouped retrieval. The bridge owns document identity and
-lifecycle. The downstream pipeline owns derived artifacts and retrieval indexes.
+PDF Bridge is the durable control plane and ingestion owner for PDF retrieval. Operators, the
+internal worker, provider endpoints, Qdrant, and the external retrieval service share stable UUID
+and collection identities, but only Bridge mutates lifecycle state.
 
-## System boundary
+## Boundaries
 
-```mermaid
-flowchart LR
-    O["Operator browser"] -->|"upload, browse, search, retry, delete"| B["PDF Bridge"]
-    B --> D[("Catalog")]
-    B --> S["Canonical PDF storage"]
-    B --> V["ClamAV"]
-    J["Jenkins bridge client"] -->|"claim / stage / report"| B
-    B -->|"version 2 collection manifest"| J
-    J --> H["Handoff storage"]
-    J --> P["Parser and RAG pipeline"]
-    P --> Q[("BM25 and Qdrant")]
-    B -->|"correlated grouped request"| R["Retrieval service"]
-    R --> Q
-    R -->|"document UUID hits"| B
-    C["External chatbot"] -->|"authorized retrieval outside PDF Bridge"| R
-```
-
-Bridge search is an operator workspace feature. The external chatbot reaches the retrieval service
-directly: its end-user authorization and answer generation happen outside PDF Bridge, which never
-proxies or authenticates chatbot traffic.
-
-The interfaces remain under `/api/v1`. Batch manifests, batch report files, and historical import
-manifests remain version 2. Their version numbers are stable even though this disposable POC reset
-changes the version 2 shapes atomically.
-
-## Ownership
-
-| Component | Owns | Does not own |
+| Component | Owns | Must not own |
 |---|---|---|
-| PDF Bridge | UUID, collection, hash, canonical bytes, lifecycle, queue, audit history, retrieval eligibility | Parsing, derived artifacts, retrieval ranking, chatbot end-user authorization |
-| ClamAV | Malware verdict for uploaded bytes | Document lifecycle or downstream ingestion |
-| Jenkins client | Leasing, verified staging, pipeline invocation, complete result reporting | Catalog mutation outside the job API |
-| Parser/RAG pipeline | PDF source copy, Markdown, chunks, BM25, dense/Qdrant data, downstream deletion | UUID or collection assignment |
-| Retrieval service | Grouped ranking and pagination | Deciding which catalog documents are eligible |
+| Browser/API | Upload, polling, evidence display, explicit decisions, retries, deletion requests | Parser/index mutations or inferred collection placement |
+| PDF Bridge | Canonical bytes, catalog, analysis artifacts, decisions, audit hashes, outbox, Qdrant mutations | Chatbot-user authorization |
+| ClamAV | Synchronous malware verdict | Parsing or lifecycle state |
+| Parser subprocess | Page-mapped extraction under hard limits | Network access, indexing, decisions, or durable state |
+| Embedding/LLM providers | Configured model inference | Candidate suppression or mutations |
+| Qdrant | Active and screening vector persistence | Catalog authority |
+| External retrieval | Keyword/semantic/hybrid query execution over active aliases | Screening access or document lifecycle mutation |
 
-Every integration carries the bridge document UUID and immutable `collection_key`. User filenames
-are display metadata and never determine routing or identity.
-
-## Application structure
-
-Controllers translate HTTP and CLI requests. Managers coordinate use cases and own transaction
-boundaries. Services implement storage, lifecycle, staging, and retrieval rules. Pydantic contracts
-validate every public or job boundary. SQLAlchemy models in the persistence layer map the catalog;
-there is no separate repository layer.
-
-Dependencies point inward:
-
-```text
-controllers -> managers -> services -> persistence
-                   |            |
-                   +--> contracts <--+
-```
-
-Lifecycle mutation stays in the lifecycle service so web, API, CLI, and Jenkins paths cannot invent
-different transitions.
+There is no batch API, handoff manifest, pipeline report, service token, or external job consumer.
 
 ## Persistence
 
-The `documents` table stores:
+SQLite is authoritative for:
 
-- the bridge UUID, display filename, SHA-256, byte size, and canonical storage key;
-- required immutable `collection_key`, including for deleted and cancelled tombstones;
-- scan and lifecycle state, uploader identity, timestamps, errors, chunk count, and pipeline metadata.
+- documents and terminal tombstones;
+- durable work operations, attempts, leases, heartbeats, and visible phases;
+- analysis revisions, page-mapped chunks, candidates, validated findings, and completeness;
+- immutable Keep/Replace/Cancel decisions and replacement workflows;
+- compressed-artifact pointers, ordered index outbox entries, collection epochs, and append-only
+  audit events.
 
-The catalog also stores queue operations, batches and leases, component result rows, and audit
-events. `ix_documents_collection_state` supports collection-scoped lifecycle queries. There are no
-additional routing dimensions in the document schema.
+Canonical PDFs and compressed private analysis artifacts live beneath the configured storage root.
+Heavy artifacts include extracted text, chunks, dense/sparse vectors, candidate snapshots, prompts,
+and raw model output. Before purge, Bridge hashes a canonical manifest binding content, pipeline,
+artifacts, decision, actor, target, and timestamps. Tombstones retain that hash and content-free
+metadata, not excerpts, vectors, prompts, or raw output.
 
-Migration `0002_collection_partitioning` intentionally upgrades only an empty version-1 catalog.
-If any version-1 document exists, the migration fails with a reset-required error instead of
-guessing a collection. This is a disposable-catalog cutover, not a compatibility migration.
-
-At startup, every document row must have a collection. Active documents must reference a configured
-collection; historical tombstones keep their required collection even if that collection is later
-removed from active configuration.
-
-## Identity and storage
-
-The bridge derives its canonical object key from the UUID, not from user input. Jenkins stages each
-manifest item at exactly:
-
-```text
-pdfs/{collection_key}/{document_id}.pdf
-```
-
-The staged path must be relative, canonical, free of traversal, and consistent with both manifest
-fields. The handoff tree and downstream corpus are independently disposable; they are not the
-bridge's canonical storage.
-
-## Document lifecycle
+## Upload and analysis
 
 ```mermaid
 stateDiagram-v2
-    [*] --> QUEUED: clean upload
-    QUEUED --> CLAIMED: batch claim
-    CLAIMED --> STAGED: verified handoff
-    STAGED --> INGESTED: successful result
-    STAGED --> INGEST_FAILED: failed result
-    INGEST_FAILED --> QUEUED: retry
-    QUEUED --> CANCEL_CLEANUP: remove before ingestion
-    CLAIMED --> CANCEL_CLEANUP: cancel claimed work
-    STAGED --> CANCEL_CLEANUP: cancel staged work
-    CANCEL_CLEANUP --> CANCELLED: cleanup succeeds
-    INGESTED --> DELETE_QUEUED: remove
-    DELETE_QUEUED --> DELETE_CLAIMED: batch claim
-    DELETE_CLAIMED --> DELETE_CLEANUP: successful downstream delete
-    DELETE_CLAIMED --> DELETE_FAILED: failed downstream delete
-    DELETE_FAILED --> DELETE_QUEUED: retry
-    DELETE_CLEANUP --> DELETED: canonical cleanup succeeds
+    [*] --> ANALYZING: clean upload promoted / ANALYZE queued
+    ANALYZING --> REJECTED: parser or text gate fails / cleanup succeeds
+    ANALYZING --> INGESTING: complete analysis has no warning or candidate
+    ANALYZING --> REVIEW_REQUIRED: candidate, filename warning, or incomplete check
+    REVIEW_REQUIRED --> INGESTING: Keep
+    REVIEW_REQUIRED --> REPLACING: Replace one eligible candidate
+    REVIEW_REQUIRED --> CANCELLED: Cancel / cleanup succeeds
+    INGESTING --> INGESTED: active points verified
+    INGESTING --> INGEST_FAILED: retry budget exhausted
+    INGEST_FAILED --> INGESTING: Retry
+    REPLACING --> INGESTED: old removal and new publication verified
+    REPLACING --> REPLACE_FAILED: replacement step fails
+    REPLACE_FAILED --> REPLACING: Retry
+    INGESTED --> DELETING: deletion requested
+    DELETING --> DELETED: active removal and purge verified
+    DELETING --> DELETE_FAILED: removal fails
+    DELETE_FAILED --> DELETING: Retry
 ```
 
-Ingestion has one binary operation result: success or failure. A successful result requires PDF
-source, Markdown, BM25, and dense components all to be `succeeded`, and it forbids an error. A
-failed result requires a nonblank error and enters `INGEST_FAILED`, where ordinary retry is
-available. Encrypted files, OCR-only files, empty text, parser crashes, and component failures all
-follow that same failure path when they prevent complete ingestion.
+Terminal `REJECTED`, `CANCELLED`, and `DELETED` rows are audit tombstones with no source,
+analysis, or index content.
 
-Deletion is available only through the normal lifecycle. An ingested document can be queued for
-delete, and a failed downstream delete can be retried. Pre-ingestion removal uses cancellation and
-cleanup; no alternate resolution workflow mutates document placement.
+The synchronous upload path does only bounded streaming, hashing, format validation, ClamAV scan,
+canonical promotion, and one short catalog transaction. It returns `202` as soon as `ANALYZE` is
+durable. Parsing, inference, and Qdrant calls happen after the transaction closes.
 
-## Upload and duplicate handling
+The extraction child uses pinned pypdf with page and character limits inside the child; the parent
+also enforces wall time, normalized-character and chunk budgets, and text-quality gates. Linux CPU
+and address-space limits are defense in depth. This subprocess is not a complete parser sandbox.
 
-1. The operator chooses a configured collection and uploads a PDF.
-2. The framework spools each multipart file part to bounded temporary storage while parsing the
-   request. The bridge validates request bounds, copies the part into a private `quarantine/`
-   staging file under the storage root while hashing the bytes and checking PDF shape, and invokes
-   ClamAV on the quarantined copy. `temporary/` is reserved for historical import staging.
-3. A clean PDF is promoted atomically from quarantine to canonical storage and receives an ingest
-   operation.
-4. Exact active duplicates return the existing document identity and collection without creating
-   another operation.
-5. Rejected or infected bytes never become available content.
+## Candidate and review contract
 
-The selected collection is required at creation and never changes.
+All matching stays inside the selected logical collection. Exact byte duplicates are the sole
+collection-scoped hard duplicate failure. Deterministic candidates include identical normalized
+text, filename family, one dense score of at least `0.86`, scores of at least `0.72` across two
+incoming chunks, or repeated strong BM25 placement. RRF orders candidates without combining raw
+dense and sparse scores.
 
-## Batch handoff protocol
+The top 12 deterministic candidates receive independent classifier and skeptical-verifier calls.
+PDF excerpts are marked untrusted, tools are not offered, structured output is retried once, and
+every chunk reference and quote is checked against retained source. LLM labels are explanatory only
+and cannot remove a candidate, choose a replacement, or publish content. Qualifying overflow is
+persisted and always forces review.
 
-Jenkins claims work with an idempotent request identifier. A version 2 manifest item contains only:
+Reviews never expire. A decision names the exact analysis revision and is rejected if that revision
+or collection epoch is stale. Keep records an advisory override. If publication providers remain
+unavailable, the retained ingestion operation may be retried without another decision.
 
-- `operation_id`, `document_id`, `operation_type`;
-- `filename`, `size_bytes`, `sha256`;
-- `collection_key`, exact `relative_path`, and optional `download_url`.
+## Qdrant layout
 
-Jenkins verifies staged bytes against size and SHA-256 before acknowledging every operation ID. A
-batch result supplies `pipeline_run_id` plus exactly one entry per staged operation. Each entry has
-`operation_id`, `success`, optional `chunk_count`, the four strict component results, and optional
-`error`. Unknown, missing, duplicate, or extra operation IDs reject the report as a whole.
+Each logical collection has a physical collection named `pdf-bridge-{key}-v{epoch}` and a stable
+alias equal to the collection key. Pending and not-yet-published points use the private
+`pdf-bridge-screening-v1` collection. Point IDs are deterministic UUIDv5 values, and every point
+contains both named vectors:
 
-Batch aggregation contains only `succeeded` and `failed` counts. Empty claims, lease expiry,
-idempotent replays, and cleanup recovery remain explicit states.
+- `content_dense` for semantic search;
+- `content_bm25` for keyword search.
 
-## Retrieval boundary
+Payloads include `schema_version`, `document_id`, `analysis_id`, `chunk_id`, `chunk_index`,
+`collection_key`, page range, text hash, bounded text, `published`, and `screening`. Dense-only or
+BM25-only points are never considered a complete publication.
 
-Search through PDF Bridge is operator-only: the operator API and web search use the same catalog
-predicate — the document must be in an eligible lifecycle state and belong to the requested
-collection. Chatbot authorization and generation remain outside the bridge. Eligible documents are `INGESTED`, `DELETE_QUEUED`,
-`DELETE_CLAIMED`, and `DELETE_FAILED`; cleanup and tombstone states are excluded.
+SQL outbox entries make mutations durable. Qdrant calls use idempotent point IDs, wait for apply,
+strong write ordering, and exact document point counts. A crash may repeat a mutation; reconciliation
+must converge to the outbox and catalog state.
 
-The bridge sends grouped requests to retrieval and validates the complete response before exposing
-any hit:
+The Bridge credential is administrative because it owns collections and aliases. Self-hosted
+Qdrant enables API authentication and JWT RBAC. Retrieval receives only a collection-scoped
+read-only JWT covering active aliases; it receives no admin key and no permission for the screening
+collection or collection-list operations beyond its scoped view.
 
-- query, mode, requested group set, and pagination must correlate;
-- every UUID must exist, be unique in the response, satisfy the shared eligibility predicate, and
-  belong to the group collection;
-- every group total must fit the corresponding eligible catalog population;
-- duplicate hits, inactive or unknown UUIDs, cross-collection hits, missing groups, and impossible
-  totals fail closed.
+## Replacement ordering
 
-Qdrant payloads retain only the bridge `document_id` and `collection_key` needed for this
-correlation. Retrieval does not accept or echo another document-routing field.
+Replacement accepts exactly one candidate that is still `INGESTED` in the same collection.
 
-## Historical import
+1. Persist or regenerate the new document's complete dense and sparse analysis vectors without
+   publishing them.
+2. Delete the old document's active points with a durable outbox entry and verify an exact count of
+   zero.
+3. Purge the old source and analysis artifacts and commit its `DELETED` tombstone.
+4. Publish and verify the new active points, then remove its screening points.
+5. Mark the new document and replacement workflow successful.
 
-Historical import version 2 is an explicitly trusted administrative path. Each document declares a
-source path, optional display filename, required collection attestation, and optional ingestion
-metadata. The bridge validates the source, hashes it, creates the catalog record, and preserves the
-same UUID/collection identity expected downstream. The manifest is strict: obsolete or unknown
-fields are rejected.
+An old-delete failure stops before step 3. A failure after verified old deletion leaves an explicit
+availability gap and a retryable new-document operation; it never restores or overlaps the old
+content automatically.
 
-## Atomic reset and cutover
+## Concurrency and recovery
 
-The coordinated reset is performed in this order:
+Exactly one Uvicorn process owns a two-slot worker. SQL leases and heartbeats recover abandoned
+`RUNNING` operations, while process-local per-collection locks serialize analysis and mutation of a
+collection. Short transactions record each stage; no transaction spans parsing, embedding, LLM, or
+Qdrant I/O.
 
-1. Confirm all source PDFs required for reingestion are available.
-2. Stop bridge traffic and every job or handoff consumer.
-3. Clear the disposable catalog, canonical storage, handoff storage, and Qdrant corpus.
-4. Deploy the bridge, Jenkins client, parser/RAG pipeline, retrieval service, and UI contracts
-   together.
-5. Reingest the source set into configured collections using collection-only handoff paths.
-6. Prove one ingested Qdrant item is searchable within its collection and deletable end to end.
+This design deliberately does not support multiple app processes. Horizontal scaling requires a
+different distributed-lock and collection-epoch design, plus a database appropriate for multiple
+writers.
 
-Do not run old and new version 2 participants concurrently. There is deliberately no compatibility
-shim.
+## Retrieval contract
+
+The external search request and response shape remains stable: mode is `keyword`, `semantic`, or
+`hybrid`, results remain grouped by collection, and hits return Bridge `document_id` and
+`collection_key`. Keyword uses BM25, semantic uses dense vectors, and hybrid fuses the two rankings
+with RRF. Every active query filters `published=true` and the current `schema_version`.
+
+Bridge validates returned UUIDs against the catalog before showing operator search results. Pending,
+screening, tombstoned, unknown, and cross-collection hits fail closed.
+
+## Coordinated reset
+
+The semantic-intake migration is empty-only. Cutover stops traffic, preserves source PDFs outside
+Bridge, wipes the disposable SQLite/catalog storage and all old active/screening Qdrant collections,
+deploys Bridge and retrieval together, and reingests through the normal analysis/review path. There
+is no dual API or compatibility path.

@@ -105,11 +105,37 @@ class Settings(BaseSettings):
     clamd_timeout: float = 30.0
     clamd_stream_max_bytes: int = 64 * 1024 * 1024
 
-    job_token: SecretStr | None = None
     search_api_url: str | None = None
     search_api_token: SecretStr | None = None
     search_api_timeout: float = 10.0
-    claim_lease_minutes: int = 30
+
+    worker_enabled: bool = True
+    worker_poll_seconds: float = 1.0
+    worker_lease_seconds: int = 300
+    worker_heartbeat_seconds: int = 30
+
+    parse_wall_clock_seconds: float = 120.0
+    parse_cpu_seconds: int = 90
+    parse_memory_bytes: int = 1024 * 1024 * 1024
+    analysis_max_pages: int = 2_000
+    analysis_max_characters: int = 5_000_000
+    analysis_max_chunks: int = 10_000
+
+    embedding_api_url: str | None = None
+    embedding_api_token: SecretStr | None = None
+    embedding_model_id: str | None = None
+    embedding_dimension: int | None = None
+    embedding_timeout: float = 30.0
+
+    llm_api_url: str | None = None
+    llm_api_token: SecretStr | None = None
+    llm_classifier_model: str | None = None
+    llm_verifier_model: str | None = None
+    llm_timeout: float = 60.0
+
+    qdrant_url: str | None = None
+    qdrant_api_key: SecretStr | None = None
+    qdrant_timeout: float = 30.0
 
     @field_validator(
         "brand_primary_1",
@@ -179,20 +205,11 @@ class Settings(BaseSettings):
             and self.session_secret.get_secret_value() == DEVELOPMENT_SESSION_SECRET
         ):
             raise ValueError("set a unique session_secret before starting PDF Bridge")
-        if not self.job_token or not self.job_token.get_secret_value().strip():
-            raise ValueError("job_token is required")
         session_secret = self.session_secret.get_secret_value()
-        job_token = self.job_token.get_secret_value()
-        if "CHANGE_ME" in session_secret or "CHANGE_ME" in job_token:
+        if "CHANGE_ME" in session_secret:
             raise ValueError("replace placeholder secrets before starting PDF Bridge")
-        if job_token == session_secret:
-            raise ValueError("job_token and session_secret must be different")
         if len(session_secret) < 32:
             raise ValueError("session_secret must be at least 32 characters")
-        if len(job_token) < 32:
-            raise ValueError("job_token must be at least 32 characters")
-        if any(character.isspace() or ord(character) < 32 for character in job_token):
-            raise ValueError("job_token must not contain whitespace or control characters")
         if self.search_api_url:
             if not self.search_api_token or not self.search_api_token.get_secret_value().strip():
                 raise ValueError("search_api_token is required when search_api_url is configured")
@@ -201,7 +218,7 @@ class Settings(BaseSettings):
                 raise ValueError("replace the retrieval credential placeholder")
             if len(search_token) < 32:
                 raise ValueError("search_api_token must be at least 32 characters")
-            if search_token in {session_secret, job_token}:
+            if search_token == session_secret:
                 raise ValueError("search_api_token must be distinct from bridge secrets")
             if any(character.isspace() or ord(character) < 32 for character in search_token):
                 raise ValueError(
@@ -220,6 +237,20 @@ class Settings(BaseSettings):
             if self.app_env == "enterprise" and parsed_search_url.scheme != "https":
                 raise ValueError("enterprise retrieval access must use HTTPS")
             self.search_api_url = self.search_api_url.rstrip("/")
+
+        if self.qdrant_url:
+            if not self.qdrant_api_key or not self.qdrant_api_key.get_secret_value().strip():
+                raise ValueError("qdrant_api_key is required when qdrant_url is configured")
+            qdrant_key = self.qdrant_api_key.get_secret_value()
+            if "CHANGE_ME" in qdrant_key or len(qdrant_key) < 32:
+                raise ValueError("qdrant_api_key must be a non-placeholder 32+ character secret")
+            if qdrant_key == session_secret or (
+                self.search_api_token
+                and qdrant_key == self.search_api_token.get_secret_value()
+            ):
+                raise ValueError("qdrant_api_key must be distinct from bridge credentials")
+            if any(character.isspace() or ord(character) < 32 for character in qdrant_key):
+                raise ValueError("qdrant_api_key must not contain whitespace or control characters")
 
         if not HTTP_HEADER_NAME.fullmatch(self.trusted_identity_header):
             raise ValueError("trusted_identity_header must be a valid HTTP header name")
@@ -250,8 +281,55 @@ class Settings(BaseSettings):
             raise ValueError("clamd_stream_max_bytes must be positive")
         if self.max_upload_bytes > self.clamd_stream_max_bytes:
             raise ValueError("max_upload_bytes must not exceed clamd_stream_max_bytes")
-        if not 1 <= self.claim_lease_minutes <= 24 * 60:
-            raise ValueError("claim_lease_minutes must be between 1 and 1440")
+
+        if self.worker_poll_seconds <= 0:
+            raise ValueError("worker_poll_seconds must be positive")
+        if not 10 <= self.worker_lease_seconds <= 3600:
+            raise ValueError("worker_lease_seconds must be between 10 and 3600")
+        if not 1 <= self.worker_heartbeat_seconds < self.worker_lease_seconds:
+            raise ValueError("worker_heartbeat_seconds must be shorter than the lease")
+        if self.parse_wall_clock_seconds <= 0 or self.parse_cpu_seconds <= 0:
+            raise ValueError("parser time limits must be positive")
+        if self.parse_memory_bytes < 64 * 1024 * 1024:
+            raise ValueError("parse_memory_bytes must allow at least 64 MiB")
+        if min(
+            self.analysis_max_pages,
+            self.analysis_max_characters,
+            self.analysis_max_chunks,
+        ) <= 0:
+            raise ValueError("analysis safety caps must be positive")
+        if self.embedding_timeout <= 0 or self.llm_timeout <= 0 or self.qdrant_timeout <= 0:
+            raise ValueError("provider timeouts must be positive")
+
+        for url_field, url_value in (
+            ("embedding_api_url", self.embedding_api_url),
+            ("llm_api_url", self.llm_api_url),
+            ("qdrant_url", self.qdrant_url),
+        ):
+            if url_value is None:
+                continue
+            parsed = urlsplit(url_value)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    f"{url_field} must be an absolute HTTP(S) URL without secrets"
+                )
+            setattr(self, url_field, url_value.rstrip("/"))
+        if self.embedding_api_url:
+            if not self.embedding_model_id or not self.embedding_model_id.strip():
+                raise ValueError("embedding_model_id is required with embedding_api_url")
+            if not self.embedding_dimension or not 1 <= self.embedding_dimension <= 65_536:
+                raise ValueError("embedding_dimension is required with embedding_api_url")
+        if self.llm_api_url and not (self.llm_classifier_model and self.llm_verifier_model):
+            raise ValueError(
+                "llm_classifier_model and llm_verifier_model are required with llm_api_url"
+            )
 
         # Do not mutate the filesystem until every configuration check passes.
         root.mkdir(parents=True, exist_ok=True)

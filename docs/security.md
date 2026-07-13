@@ -1,147 +1,166 @@
 # Security model and enterprise gates
 
-Uploading a PDF into a parser and retrieval system crosses a serious trust boundary. This POC
-implements baseline controls from the
-[OWASP File Upload Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html),
-but it is not evidence that arbitrary PDFs are safe. Keep the service on a restricted internal
-network until your security team approves the complete path.
+PDF intake crosses file-upload, malware, parser, model, vector-database, and retrieval trust
+boundaries. These controls make the POC fail closed for known unsafe states; they do not make
+arbitrary PDFs or model output trustworthy.
 
-## POC controls
+## Implemented controls
 
-- Only `.pdf` display names are accepted, and path separators/control characters are rejected.
-- Uploads stream to generated names outside the webroot with byte limits; file bytes are never
-  loaded wholesale into application memory.
-- The leading PDF signature is checked without invoking a parser.
-- A server-calculated SHA-256 identifies exact active duplicates.
-- Every upload and historical import is scanned through ClamAV `INSTREAM`; scanner errors fail
-  closed and unclean files are not promoted.
-- Every upload requires a configured collection; the stable key is validated as lowercase,
-  path-safe ASCII and is immutable after queuing.
-- Canonical bridge paths derive only from UUIDs. User filenames and collection display names are
-  metadata and never shape canonical object paths.
-- Browser mutations require an encrypted and authenticated session, same-origin request, and CSRF
-  token. CORS is absent.
-- Trusted-host checks reject unexpected Host headers.
-- The container disables Uvicorn's forwarded-header rewriting; trusted-header mode checks the
-  direct peer against `TRUSTED_PROXY_CIDRS` before accepting the identity header.
-- Jenkins and retrieval use separate bearer credentials supplied through environment/secrets.
-- Batch downloads require both a valid job credential and an active batch scope.
-- Jenkins validates every version 2 handoff path against its collection and document UUID before
-  creating a file below the batch directory.
-- Grouped retrieval responses must correlate exactly to the requested collection set.
-  Cross-collection, inactive, unknown, duplicate, pagination-inconsistent, or impossible-total
-  responses fail closed without partial results or metadata fallback. API and web search use the
-  same catalog eligibility predicate.
-- Preview is application-controlled and limited to clean, eligible states with defensive headers.
-- Lifecycle events are append-only at the ORM layer and exclude file content and credentials.
-- The official container runs the app as a non-root user, drops Linux capabilities, uses a
-  read-only root filesystem, and mounts only its data volume writable.
+- Display names must end in `.pdf`; separators, control characters, empty files, oversized bodies,
+  and invalid leading signatures are rejected.
+- Uploads stream to generated temporary names with byte limits and server-calculated SHA-256.
+- ClamAV `INSTREAM` runs synchronously. Scanner error, protocol failure, or unclean verdict prevents
+  canonical promotion.
+- Exact bytes are blocked only within the selected configured collection. User filenames never
+  influence canonical paths or collection assignment.
+- Pinned pypdf runs in a child process with wall-clock, Linux CPU/address-space, page, character,
+  and chunk limits. Encryption, malformed input, image-only/insufficient text, and over-budget
+  content reject without override and are purged.
+- Browser mutations require an authenticated/encrypted session, same-origin request, and CSRF token.
+  Trusted-header mode accepts identity only from configured direct-peer proxy CIDRs. CORS is absent.
+- Durable decisions name an exact analysis revision. Keep/Replace/Cancel records are immutable;
+  replacement targets must be current, same-collection, ingested candidates.
+- PDF text is sent to models as untrusted quoted data. Tools are disabled, output uses a strict
+  schema at temperature zero, malformed output is retried once, and every cited reference and quote
+  is checked against retained source.
+- Model findings are explanation-only. They cannot suppress deterministic candidates, publish,
+  delete, or select a replacement.
+- Pending points use a separate screening collection. Active point payloads require publication and
+  schema markers, and Bridge validates external retrieval UUIDs against eligible catalog state.
+- Qdrant requires an API key and enables JWT RBAC. Bridge has the administrative key; retrieval gets
+  collection-scoped read JWTs for active aliases only and no screening permission.
+- Qdrant mutations are durable in a SQL outbox, idempotent by deterministic point ID, applied with
+  wait and strong ordering, and verified by exact count.
+- Full analysis content is compressed in private storage and is purged on cancellation/deletion.
+  Audit records keep a canonical manifest hash and metadata, not excerpts, vectors, prompts, raw
+  model output, or credentials.
+- The reference app container runs as non-root, drops capabilities, disallows privilege escalation,
+  uses a read-only root filesystem, and mounts only explicit data/tmp paths writable. Qdrant is not
+  published to the host and sits on an internal-only network.
 
-These controls reduce common mistakes; they are not a content-disarm system, sandbox, DLP product,
-or end-user retrieval authorization model.
+## Residual risks
 
-## Important residual risks
+### Parser containment is not a sandbox
 
-**Parser compromise.** A clean ClamAV result means only that current signatures did not identify a
-threat. A malformed, novel, encrypted, or resource-exhausting PDF may still exploit or stall the
-downstream parser. The bridge deliberately never parses PDFs.
+A clean malware result is not a safety proof, and pypdf may contain exploitable defects. Linux
+resource limits constrain CPU and address space but do not provide a complete syscall, filesystem,
+or kernel boundary. Production use requires a least-privilege disposable parser sandbox with no
+network, minimal readable files, a patched image, and owned vulnerability response.
 
-**Anonymous access.** `anonymous-poc` distinguishes browser sessions for audit readability but does
-not authenticate a person. Anyone who can reach the service can view and mutate the POC library.
+### Prompt injection classification is out of scope
 
-**Single bearer token.** The Jenkins token is service-wide. If disclosed, it can claim files and
-report lifecycle changes. Scope it at the network and secret-manager layers and rotate it promptly.
+The prompt marks PDF text untrusted and validates citations, but the system does not classify prompt
+injection. A document may still influence explanatory labels or summaries. Deterministic candidate
+retention and human decisions are the mutation boundary; do not reuse model prose as executable
+instructions.
 
-**SQLite and one process.** SQLite provides no per-service tenancy and is not a highly available
-control plane. A stolen data volume contains the catalog and all canonical PDFs.
+### Anonymous POC access is not human authentication
 
-**Filename and document sensitivity.** Logs avoid contents and local paths, but filenames, search
-queries, snippets, error messages, and audit actors may still be confidential.
+`anonymous-poc` creates auditable sessions but does not prove identity. Anyone who can reach the app
+has the trusted-operator capability set, including Keep, Replace, Cancel, and delete. Network-isolate
+the POC or deploy trusted-header SSO before handling sensitive collections.
 
-**Collection labels are not authorization.** `customer` and `internal` audience labels make corpus
-placement visible to the PDF Bridge operator. PDF Bridge does not authenticate chatbot end users or
-enforce their `allowed_collections`. A manager bug, client-supplied allowlist, or direct Qdrant
-access can still expose internal material even when the bridge catalog is correctly partitioned.
+### Collection labels are not end-user authorization
 
-**Misrouting and stale indexes.** A wrong collection key in deployment configuration, an ingestion
-pipeline that ignores the version 2 path, or stale chunks left in the wrong Qdrant collection can
-defeat the intended boundary. Reconcile catalog and index counts and run positive and negative
-collection searches after every rebuild or routing change.
+`customer` and `internal` audience labels help operators place content. PDF Bridge does not decide
+which chatbot user may query a collection. The external application must derive allowed collections
+from authenticated server-side policy and intersect them with every request.
+
+### Administrative Qdrant key is high impact
+
+The Bridge key can read and mutate active and screening collections and manage aliases. Disclosure
+exposes pending documents and can corrupt retrieval. Store it in a secret manager, restrict network
+access, monitor rejected authentication, and rotate it through an approved procedure. Changing the
+admin key invalidates JWTs signed by the previous key.
+
+A global Qdrant read-only key is not sufficient isolation because it can read screening. Retrieval
+must use granular JWT claims scoped to required active collections. Test denial of collection-list
+and screening queries after every token or topology change.
+
+### Private-network HTTP still needs a threat decision
+
+Reference Compose keeps Qdrant on an internal-only single-host network and does not expose its port.
+API keys still cross that network without Qdrant-native TLS. Use TLS or an authenticated private
+ingress whenever traffic crosses hosts, untrusted namespaces, or a network where packet capture is
+credible. Provider and retrieval endpoints should use organization-managed TLS.
+
+### SQLite and one process
+
+The supported topology is one SQLite writer and one Uvicorn process. It is not highly available,
+does not provide per-service database tenancy, and places catalog plus source/analysis data in one
+recovery domain. A second process defeats in-process locks; horizontal scaling requires a redesigned
+distributed coordination model.
+
+### Sensitive metadata remains
+
+Filenames, actors, UUIDs, collection keys, hashes, bounded errors, search queries, and returned
+snippets may be confidential even when PDF content is excluded from logs. Apply classification,
+retention, backup, deletion, and access controls to metadata as well as source bytes.
+
+### Outage override is deliberate
+
+Embedding, LLM, or Qdrant outages are advisory for the semantic decision, but publication still
+requires complete dense and BM25 points. Keep can override analysis incompleteness; it cannot bypass
+durable indexing. Monitor extended retained pending content and avoid treating an outage as an empty
+candidate result.
 
 ## Mandatory enterprise gate
 
-Do not call the deployment enterprise-ready until owners from application security,
-infrastructure, identity, data governance, and the retrieval pipeline approve each item:
+Do not call the deployment enterprise-ready until responsible owners approve and verify:
 
-- [ ] Put the app behind organization-managed TLS; redirect/disable plaintext and validate proxy
-      forwarding behavior.
-- [ ] Configure enterprise SSO at a reverse proxy and use `PDF_BRIDGE_AUTH_MODE=trusted-header`.
-- [ ] Restrict direct app access so only configured proxy CIDRs can reach it or assert identity.
-- [ ] Add authorization policy (library audience, uploaders, deleters, administrators) if all SSO
-      users should not have identical rights.
-- [ ] In the chatbot manager, derive `allowed_collections` only from authenticated server-side
-      policy and intersect it with every requested collection list before retrieval. Never trust a
-      browser/client-supplied allowlist; test that an HR topic returns zero from the customer corpus.
-- [ ] Store session, Jenkins, and retrieval credentials in the approved secret manager; define
-      owners, rotation, revocation, and incident procedures.
-- [ ] Complete threat modeling and security review for browser, bridge, Jenkins, storage,
-      retrieval API, Qdrant, backups, and administrative import paths.
-- [ ] Replace/augment ClamAV according to the organization's malware, content-disarm, encrypted
-      document, and signature freshness policies.
-- [ ] Run parsing in a least-privilege disposable sandbox with CPU, memory, time, process, and
-      network limits. Patch parser and document-processing libraries through an owned vulnerability
-      process; do not add V8 or a second PDF parser to the bridge.
-- [ ] Decide whether encrypted/password-protected PDFs are rejected before parsing and give users a
-      safe failure explanation.
-- [ ] Move metadata to managed PostgreSQL before multiple replicas/HA; test migrations, backups,
-      point-in-time recovery, locking, and least-privilege database roles.
-- [ ] Put PDFs and backups on approved encrypted durable storage with access logging, retention,
-      legal-hold, recovery, and verified deletion controls.
-- [ ] Establish upload/search/audit retention and privacy rules; prevent sensitive snippets or
-      queries from entering broad logs or Jenkins artifacts.
-- [ ] Reconcile PDF Bridge UUID/collection counts with Qdrant payloads, require matching
-      `document_id` and `collection_key`, and alert on unknown IDs or cross-collection responses.
-- [ ] Add rate limits, request-body limits at the proxy, capacity alerts, malware-signature age
-      alerts, dependency monitoring, and operational ownership.
-- [ ] Validate all service egress destinations and certificates. Do not permit a response-provided
-      download URL to redirect Jenkins credentials off origin.
-- [ ] Run SAST, dependency/container scanning, DAST, and a focused penetration test against the
-      approved deployment topology.
+- [ ] Organization-managed TLS, reverse-proxy behavior, allowed hosts, and trusted direct-peer CIDRs.
+- [ ] Enterprise SSO with `PDF_BRIDGE_AUTH_MODE=trusted-header`; direct app access blocked.
+- [ ] Authorization for upload/review/delete if all authenticated operators should not be peers.
+- [ ] Server-side chatbot policy that derives and enforces allowed collections.
+- [ ] Qdrant TLS/private ingress, administrative-key custody, JWT expiry/rotation, active-only scopes,
+      screening denial, audit logging, and network egress restrictions.
+- [ ] Separate secret-manager entries, owners, rotation, and revocation for session, Qdrant,
+      embedding, LLM, and retrieval credentials.
+- [ ] Disposable parser sandbox, no parser network, least privilege, patch SLA, and malicious-PDF
+      testing. A resource-limited subprocess alone does not satisfy this item.
+- [ ] ClamAV signature freshness and the organization's malware/CDR/encrypted-document policy.
+- [ ] Provider data-use, retention, residency, TLS, authentication, logging, and model-change policy.
+- [ ] Prompt-injection and data-exfiltration threat review for quoted PDF text and LLM output.
+- [ ] Approved encrypted storage, backup, legal-hold, restore, retention, and verified deletion.
+- [ ] A database/coordination redesign before multiple replicas or high availability.
+- [ ] Active/screening reconciliation, alias/epoch checks, outbox crash tests, and alerts on unknown
+      IDs or publication/schema violations.
+- [ ] External retrieval conformance for BM25, dense, hybrid RRF, filters, payloads, and screening
+      denial.
+- [ ] Rate limits, proxy body limits, capacity monitoring, SAST, dependency/container scanning,
+      DAST, and focused penetration testing.
+- [ ] A labeled same-collection evaluation corpus with candidate recall at least `0.98`, plus a
+      recorded dataset hash and parser/model/threshold fingerprints.
 
-The application itself refuses `PDF_BRIDGE_APP_ENV=enterprise` when authentication is anonymous,
-the development session secret remains, or no trusted proxy network is configured. That startup
-guard is only a backstop; it does not complete the checklist.
+Application enterprise-mode validation is only a backstop; it does not complete this checklist.
 
 ## ClamAV operations
 
-Compose builds a minimal layer from the official exact `clamav/clamav:1.5.3` image, sets clamd's
-`StreamMaxLength` to 64 MiB so it exceeds the 50 MiB application limit, and persists signatures at
-`/var/lib/clamav`. ClamAV recommends a persistent database volume and notes that signature loading
-can require more than 2 GiB; this topology budgets 4 GiB. See the
-[official ClamAV Docker guide](https://docs.clamav.net/manual/Installing/Docker.html).
+Compose builds the exact `clamav/clamav:1.5.3` patch and persists signatures. The daemon stream limit
+is 64 MiB, above the default 50 MiB upload cap, and its port is not published.
 
-- Review release notes and test before changing the pinned feature/patch tag.
-- Monitor FreshClam logs, update failures, signature timestamps, and clamd readiness.
-- Never publish port 3310 outside the private container/network boundary.
-- The app streams bytes to clamd, so the scanner container does not mount canonical storage.
-- Treat repeated scanner protocol errors as a security-impacting outage, not an invitation to
-  bypass scanning.
+- Monitor FreshClam logs, signature timestamps, update failures, and daemon readiness.
+- Keep ClamAV storage separate from canonical PDFs; the app streams bytes to the daemon.
+- Treat scanner errors as a security outage, never as permission to skip scanning.
+- Review the official image and vulnerability data before changing the pin.
 
-## Logging and incident handling
+## Logging and incident evidence
 
-Central logs may include request ID, route, status, actor pseudonym/identity, document/operation
-UUID, event type, duration, and bounded pipeline error. They must not include PDF bytes, bearer
-tokens, session/CSRF values, full local paths, or retrieval snippets.
+Permitted structured fields include request ID, route/status, bounded actor identity, document,
+analysis, operation, replacement and outbox IDs, event type, duration, provider category, and
+content-free hashes. Exclude PDF text/bytes, snippets, vectors, prompts, raw model output, session or
+CSRF data, bearer/API keys, JWTs, and full local paths.
 
-On suspected malicious upload or credential compromise:
+On suspected malware escape, parser compromise, model/provider compromise, screening disclosure,
+Qdrant credential leak, cross-collection result, or replacement overlap:
 
-1. restrict access and stop new claims/uploads without deleting evidence;
-2. revoke/rotate affected credentials;
-3. record relevant request, document, operation, batch, and pipeline-run IDs;
-4. preserve approved forensic copies of logs/catalog/storage under incident policy;
-5. investigate downstream parser hosts and indexes, not only the bridge;
-6. follow the organization's incident response and disclosure process;
-7. restore service only after the bypass/root cause and signature state are understood.
+1. contain uploads, worker, provider, and retrieval access without deleting evidence;
+2. preserve protected logs, audit rows, IDs, timestamps, fingerprints, and hashes;
+3. revoke/rotate affected credentials and regenerate Qdrant JWTs when needed;
+4. quarantine inconsistent index content and validate the authoritative SQL collection mapping;
+5. rebuild from externally preserved verified sources;
+6. run positive/negative retrieval, replacement-ordering, purge, and access-denial tests before
+   reopening traffic.
 
-Do not manually rewrite audit rows or lifecycle state during response. Use documented transitions
-or a reviewed repair migration that preserves the original evidence.
+Do not manually edit append-only audit/decision records or force lifecycle state. Use supported
+operations or a reviewed repair migration that preserves original evidence.

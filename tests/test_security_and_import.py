@@ -10,12 +10,20 @@ from pydantic import SecretStr, ValidationError
 
 from pdf_bridge.app import create_app
 from pdf_bridge.contracts.schemas import HistoricalImportManifest
-from pdf_bridge.core.config import Settings
+from pdf_bridge.core.config import DEVELOPMENT_SESSION_SECRET, Settings
 from pdf_bridge.http.problems import ProblemError
 from pdf_bridge.http.security import get_actor
 from pdf_bridge.persistence.db import build_engine, create_schema
-from pdf_bridge.persistence.models import Document, DocumentState
-from pdf_bridge.services.lifecycle import LifecycleError, import_historical_manifest
+from pdf_bridge.persistence.models import (
+    Document,
+    DocumentState,
+    OperationPhase,
+    OperationState,
+    OperationType,
+    WorkOperation,
+)
+from pdf_bridge.services.historical_import import import_historical_manifest
+from pdf_bridge.services.intake import LifecycleError
 from pdf_bridge.services.storage import StorageLayout, UnsafePathError, validate_source_path
 from tests.conftest import PDF_A, clean_scanner
 
@@ -27,7 +35,6 @@ def test_enterprise_mode_rejects_anonymous_access(tmp_path: Path) -> None:
             auth_mode="anonymous-poc",
             storage_root=tmp_path / "external-data",
             session_secret=SecretStr("unique-enterprise-session-secret"),
-            job_token=SecretStr("unique-enterprise-job-token"),
         )
 
 
@@ -42,7 +49,6 @@ def test_sqlite_catalog_must_be_an_absolute_path_beneath_storage_root(
     common = {
         "app_env": "test",
         "session_secret": SecretStr("session-secret-value-at-least-32-characters"),
-        "job_token": SecretStr("job-token-value-that-is-at-least-32-characters"),
     }
     relative_root = tmp_path / "relative-database-root"
     with pytest.raises(ValidationError, match="absolute file path"):
@@ -80,7 +86,6 @@ def test_in_memory_sqlite_is_test_only(tmp_path: Path) -> None:
             storage_root=tmp_path / "memory-database-root",
             database_url="sqlite+pysqlite:///:memory:",
             session_secret=SecretStr("session-secret-value-at-least-32-characters"),
-            job_token=SecretStr("job-token-value-that-is-at-least-32-characters"),
         )
 
 
@@ -93,32 +98,32 @@ def test_upload_limit_cannot_exceed_clamd_stream_limit(tmp_path: Path) -> None:
         )
 
 
-def test_runtime_secrets_are_required_and_distinct(tmp_path: Path) -> None:
-    missing_root = tmp_path / "missing-job-token"
-    with pytest.raises(ValidationError, match="job_token is required"):
+def test_runtime_session_secret_rejects_default_and_weak_values(tmp_path: Path) -> None:
+    missing_root = tmp_path / "default-session-secret"
+    with pytest.raises(ValidationError, match="unique session_secret"):
         Settings(
             storage_root=missing_root,
-            session_secret=SecretStr("unique-session-secret"),
-            job_token=None,
+            session_secret=SecretStr(DEVELOPMENT_SESSION_SECRET),
         )
     assert not missing_root.exists()
-    with pytest.raises(ValidationError, match="must be different"):
+
+    shared_secret = "same-secret-value-that-is-at-least-32-characters"
+    with pytest.raises(ValidationError, match="must be distinct"):
         Settings(
             storage_root=tmp_path / "matching-secrets",
-            session_secret=SecretStr("same-secret-value"),
-            job_token=SecretStr("same-secret-value"),
+            session_secret=SecretStr(shared_secret),
+            search_api_url="https://retrieval.example.test",
+            search_api_token=SecretStr(shared_secret),
         )
     with pytest.raises(ValidationError, match="at least 32"):
         Settings(
             storage_root=tmp_path / "weak-secrets",
             session_secret=SecretStr("short-session"),
-            job_token=SecretStr("a-different-but-still-short-job-token"),
         )
     with pytest.raises(ValidationError, match="placeholder"):
         Settings(
             storage_root=tmp_path / "placeholder-secrets",
             session_secret=SecretStr("CHANGE_ME_generate_a_long_random_session_secret"),
-            job_token=SecretStr("separate-job-token-at-least-32-characters"),
         )
 
 
@@ -128,9 +133,54 @@ def test_retrieval_configuration_requires_a_separate_credential(tmp_path: Path) 
             app_env="test",
             storage_root=tmp_path / "missing-search-token",
             session_secret=SecretStr("session-secret-value-at-least-32-characters"),
-            job_token=SecretStr("job-token-value-that-is-at-least-32-characters"),
             search_api_url="https://retrieval.example.test",
             search_api_token=None,
+        )
+
+
+def test_qdrant_configuration_requires_a_separate_strong_credential(
+    tmp_path: Path,
+) -> None:
+    session_secret = "session-secret-value-at-least-32-characters"
+    common = {
+        "app_env": "test",
+        "session_secret": SecretStr(session_secret),
+        "qdrant_url": "https://qdrant.example.test",
+    }
+
+    with pytest.raises(ValidationError) as missing:
+        Settings(**common, storage_root=tmp_path / "missing-qdrant-key")
+    assert "qdrant_api_key" in str(missing.value)
+
+    with pytest.raises(ValidationError, match=r"32\+"):
+        Settings(
+            **common,
+            storage_root=tmp_path / "short-qdrant-key",
+            qdrant_api_key=SecretStr("short-qdrant-key"),
+        )
+
+    with pytest.raises(ValidationError, match="placeholder"):
+        Settings(
+            **common,
+            storage_root=tmp_path / "placeholder-qdrant-key",
+            qdrant_api_key=SecretStr("CHANGE_ME_generate_a_long_random_qdrant_key"),
+        )
+
+    with pytest.raises(ValidationError, match="distinct"):
+        Settings(
+            **common,
+            storage_root=tmp_path / "session-key-reuse",
+            qdrant_api_key=SecretStr(session_secret),
+        )
+
+    search_secret = "search-secret-value-at-least-32-characters"
+    with pytest.raises(ValidationError, match="distinct"):
+        Settings(
+            **common,
+            storage_root=tmp_path / "search-key-reuse",
+            search_api_url="https://retrieval.example.test",
+            search_api_token=SecretStr(search_secret),
+            qdrant_api_key=SecretStr(search_secret),
         )
 
 
@@ -225,7 +275,6 @@ def test_enterprise_mode_disables_all_openapi_routes(tmp_path: Path) -> None:
         storage_root=storage_root,
         database_url=f"sqlite+pysqlite:///{database_path.as_posix()}",
         session_secret=SecretStr("enterprise-docs-session-secret-32-characters"),
-        job_token=SecretStr("enterprise-docs-job-token-32-characters-long"),
         allowed_hosts=["testserver.local"],
         trusted_proxy_cidrs=["127.0.0.0/8"],
         collections=[
@@ -258,7 +307,7 @@ def test_enterprise_mode_disables_all_openapi_routes(tmp_path: Path) -> None:
 
 
 def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
-    tmp_path: Path, session_factory
+    tmp_path: Path, settings: Settings, session_factory
 ) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -268,7 +317,7 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
     manifest.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "documents": [
                     {
                         "path": "one.pdf",
@@ -285,7 +334,6 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
         ),
         encoding="utf-8",
     )
-    layout = StorageLayout.from_root(tmp_path / "bridge-storage")
     with (
         session_factory() as session,
         pytest.raises(LifecycleError, match="duplicate PDF contents"),
@@ -294,17 +342,15 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
             session,
             manifest_path=manifest,
             source_root=source_root,
-            layout=layout,
+            settings=settings,
             scanner=clean_scanner,
-            max_bytes=1024 * 1024,
             dry_run=True,
             actor_id="import-test",
-            configured_collections={"customer", "internal"},
         )
 
 
 def test_historical_import_stages_through_temporary_not_quarantine(
-    tmp_path: Path, session_factory
+    tmp_path: Path, settings: Settings, session_factory
 ) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -313,7 +359,7 @@ def test_historical_import_stages_through_temporary_not_quarantine(
     manifest.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "documents": [
                     {
                         "path": "historic.pdf",
@@ -325,7 +371,7 @@ def test_historical_import_stages_through_temporary_not_quarantine(
         ),
         encoding="utf-8",
     )
-    layout = StorageLayout.from_root(tmp_path / "bridge-storage")
+    layout = StorageLayout.from_root(settings.storage_root)
     observed: dict[str, Path] = {}
 
     def capturing_scanner(path: Path):
@@ -337,12 +383,10 @@ def test_historical_import_stages_through_temporary_not_quarantine(
             session,
             manifest_path=manifest,
             source_root=source_root,
-            layout=layout,
+            settings=settings,
             scanner=capturing_scanner,
-            max_bytes=1024 * 1024,
             dry_run=True,
             actor_id="import-staging-test",
-            configured_collections={"customer", "internal"},
         )
 
     assert observed["parent"] == layout.temporary
@@ -359,8 +403,8 @@ def test_historical_source_path_cannot_escape_root(tmp_path: Path) -> None:
         validate_source_path(source_root, "../outside.pdf")
 
 
-def test_historical_import_applies_scanned_canonical_record(
-    tmp_path: Path, session_factory
+def test_historical_import_queues_scanned_canonical_record_for_analysis(
+    tmp_path: Path, settings: Settings, session_factory
 ) -> None:
     source_root = tmp_path / "sources"
     source_root.mkdir()
@@ -369,13 +413,11 @@ def test_historical_import_applies_scanned_canonical_record(
     manifest.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "documents": [
                     {
                         "path": "existing.pdf",
                         "filename": "Existing handbook.pdf",
-                        "chunk_count": 12,
-                        "pipeline_run_id": "historical-run-1",
                         "collection_key": "internal",
                     }
                 ],
@@ -383,18 +425,16 @@ def test_historical_import_applies_scanned_canonical_record(
         ),
         encoding="utf-8",
     )
-    layout = StorageLayout.from_root(tmp_path / "bridge-storage")
+    layout = StorageLayout.from_root(settings.storage_root)
     with session_factory() as session:
         response = import_historical_manifest(
             session,
             manifest_path=manifest,
             source_root=source_root,
-            layout=layout,
+            settings=settings,
             scanner=clean_scanner,
-            max_bytes=1024 * 1024,
             dry_run=False,
             actor_id="import-test",
-            configured_collections={"customer", "internal"},
         )
         session.commit()
         document_id = response.items[0].document_id
@@ -402,17 +442,21 @@ def test_historical_import_applies_scanned_canonical_record(
         assert document_id is not None
         document = session.get(Document, document_id)
         assert document is not None
-        assert document.state == DocumentState.INGESTED
-        assert document.chunk_count == 12
+        assert document.state == DocumentState.ANALYZING
+        assert document.chunk_count is None
         assert document.storage_key is not None
         assert (layout.root / document.storage_key).read_bytes() == PDF_A
+        operation = session.query(WorkOperation).filter_by(document_id=document_id).one()
+        assert operation.operation_type == OperationType.ANALYZE
+        assert operation.state == OperationState.QUEUED
+        assert operation.phase == OperationPhase.QUEUED
 
 
-def test_historical_manifest_version_two_rejects_legacy_fields() -> None:
+def test_historical_manifest_version_three_rejects_legacy_fields() -> None:
     with pytest.raises(ValidationError, match="language"):
         HistoricalImportManifest.model_validate(
             {
-                "version": 2,
+                "version": 3,
                 "documents": [
                     {
                         "path": "existing.pdf",

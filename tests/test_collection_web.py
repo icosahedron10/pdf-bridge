@@ -219,7 +219,7 @@ def test_cleanup_record_is_not_retrieval_eligible(
     held = _document(
         filename="cleanup-pending.pdf",
         collection_key="customer",
-        state=DocumentState.DELETE_CLEANUP,
+        state=DocumentState.CLEANUP_PENDING,
     )
     with session_factory() as session:
         session.add(held)

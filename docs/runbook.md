@@ -1,236 +1,259 @@
 # Operations runbook
 
-This runbook covers routine operation, recovery, and the coordinated disposable-POC reset. Commands
-assume the service environment and storage paths have been reviewed against
-[`configuration.md`](configuration.md).
+This runbook covers the single-process semantic-intake POC. PDF Bridge owns parsing and indexing;
+there is no scheduler, batch claim, handoff directory, or external ingestion report to recover.
 
-## Daily checks
+## Supported topology
 
-Check the process and dependency endpoints:
+- exactly one Uvicorn application process;
+- one SQLite catalog beneath the writable Bridge storage root;
+- a lifespan-owned worker with two execution slots and per-collection locks;
+- ClamAV reachable only on the private service network;
+- Qdrant server `1.18.1` with authentication and JWT RBAC;
+- configured private embedding and LLM endpoints;
+- an external retrieval service holding only active-collection read JWTs.
+
+Do not increase `--workers`, start a second app replica, or run a second worker against the same
+catalog. That breaks process-local collection serialization and the supported epoch model.
+
+## Startup and health
+
+Container startup validates required secrets and storage, applies `alembic upgrade head`, and then
+executes one Uvicorn process. Check:
 
 ```bash
-curl --fail https://pdf-bridge.internal/api/v1/health/live
-curl --fail https://pdf-bridge.internal/api/v1/health/ready
+docker compose ps
+curl --fail http://127.0.0.1:8000/api/v1/health/live
+curl --fail http://127.0.0.1:8000/api/v1/health/ready
 ```
 
-Readiness verifies catalog access, every required storage directory (the storage root plus
-`objects/`, `temporary/`, and `quarantine/`), and ClamAV. Configured collections and catalog
-invariants are validated at startup against the same database the application serves. Treat a
-readiness failure as an operational fault; do not route new uploads or job traffic until the failed
-dependency is understood.
+Readiness covers dependencies that must serve request traffic. Semantic provider outages are also
+visible on analysis resources as explicit incomplete reasons; do not interpret a reachable process
+as proof that publication can finish.
 
-Monitor at least:
+At startup, verify:
 
-- upload rejection, malware scan errors, and canonical promotion failures;
-- queued age, claim lease expiry, staging failures, and report rejection;
-- ingestion and deletion failure counts by collection;
-- retrieval correlation failures and downstream latency;
-- canonical, handoff, database, and Qdrant capacity.
+- exactly one app container/process is running;
+- the database revision is `0001_semantic_intake` on the reset catalog;
+- storage directories are writable by the non-root app user;
+- ClamAV is healthy and signatures are current;
+- the Qdrant version is exactly `1.18.1`, API-key requests work, and anonymous requests fail;
+- JWT RBAC is enabled and retrieval cannot list or query `pdf-bridge-screening-v1`;
+- embedding model ID/dimension and both LLM model IDs match the approved pipeline fingerprint.
 
-The library collection cards show available and processing counts. The queue is the single operator
-workspace for pending and failed work.
+## Routine monitoring
+
+Alert on:
+
+- oldest `QUEUED` operation age and expired `RUNNING` leases;
+- repeated worker lease recovery or heartbeat failures;
+- counts and age of `INGEST_FAILED`, `REPLACE_FAILED`, `DELETE_FAILED`, and `CLEANUP_FAILED` rows;
+- pending index-outbox age, attempts, and exact point-count mismatches;
+- analysis incompleteness by provider and collection;
+- parser rejection/timeout/resource-limit rates;
+- ClamAV signature age and protocol failures;
+- Qdrant disk capacity, rejected authentication, collection/alias drift, and active/screening counts;
+- embedding/LLM latency, invalid structured output, and quote-validation failure;
+- retrieval responses rejected for unknown, inactive, or cross-collection UUIDs;
+- SQLite, canonical-object, private-analysis, and Qdrant backup capacity.
+
+Use document, operation, analysis, replacement, and request UUIDs for correlation. Logs and alerts
+must not contain PDF excerpts, prompts, vectors, raw model output, credentials, or full local paths.
 
 ## Upload investigation
 
-### Upload is rejected
+### Synchronous rejection
 
-Use the problem response code and request ID to correlate logs.
-
-| Symptom | Check |
+| Problem | Check |
 |---|---|
-| Request too large | Reverse-proxy and bridge upload limits |
-| Invalid PDF | Signature, extension, MIME shape, and parser-independent structural checks |
-| Malware or scanner error | ClamAV daemon health, signature age, socket permissions, and scan limits |
-| Duplicate response | Existing active document UUID and collection returned by the API |
-| Promotion failure | Quarantine and canonical filesystem ownership, free space, and atomic rename support |
+| Request too large | Proxy body limit, `MAX_UPLOAD_BYTES`, and clamd stream maximum |
+| Invalid file | `.pdf` name, MIME shape, leading signature, nonempty bytes |
+| Exact duplicate | Existing UUID in the same collection; cross-collection copies are allowed |
+| Scanner unavailable/unclean | Daemon health, signatures, timeout, and INSTREAM limit |
+| Promotion failure | Storage ownership, free space, and atomic rename support |
 
-Do not copy quarantined bytes into canonical storage manually. Correct the dependency and upload the
-source again through the bridge.
+Never bypass the scanner or place a file directly in canonical storage. Correct the cause and submit
+through the normal upload or import path.
 
-### Collection is rejected
+### Parser rejection
 
-The upload must name a configured collection key. Compare the submitted key with
-`PDF_BRIDGE_COLLECTIONS`. Collection assignment is immutable, so moving a document means deleting
-and reingesting it under the intended collection.
+Encrypted, malformed, image-only, insufficient-text, and over-budget PDFs are non-overridable.
+Confirm the analysis moves through cleanup to `REJECTED`, canonical bytes are absent, screening
+points count zero, and only content-free audit metadata remains. OCR is out of scope; obtain a clean
+text-bearing source rather than changing state manually.
 
-## Queue and batch recovery
+Parser CPU/address-space limits apply on Linux. A parser child killed by a resource limit is treated
+as a hostile/malformed input. The subprocess is containment, not a complete sandbox; investigate
+unexpected crashes as security-relevant events.
 
-### Work remains queued
+## Worker recovery
 
-1. Confirm a Jenkins schedule is running and can reach `/api/v1/jobs/*`.
-2. Check the job-token credential and exact allowed host.
-3. Inspect the archived `pull-result.json` for zero work, batch ID, and request ID.
-4. Check for a prior active lease. Let the configured lease expire or recover it through normal job
-   execution; do not edit queue rows.
+Operations are `ANALYZE`, `INGEST`, `DELETE`, or `CLEANUP` and move through `QUEUED`, `RUNNING`,
+`SUCCEEDED`, `FAILED`, or `CANCELLED`. The worker heartbeats its leases. After an unclean process
+exit, restart the same single process and allow expired `RUNNING` operations to return to the queue.
 
-### Claim or staging fails
+Do not edit lease timestamps. Before retrying manually:
 
-Re-run the same Jenkins build with the same request ID after fixing the cause. The client creates an
-immutable batch directory and verifies every ingest PDF against manifest size and SHA-256 before
-acknowledging staging. A partially downloaded directory is not valid input to the parser.
+1. confirm the previous process/thread is gone;
+2. identify the last durable phase and pending outbox entry;
+3. repair the dependency or storage fault;
+4. use `POST /api/v1/uploads/{id}/retry` for an exposed retryable failure;
+5. verify idempotent point counts and final catalog state.
 
-Common causes are canonical storage unavailability, expired lease, insufficient handoff capacity,
-permission errors, or an old client that does not implement the current version 2 shape.
+A Qdrant call may have succeeded before Bridge recorded the outbox entry done. Repeating a mutation
+is expected: point IDs are deterministic, deletes are filter-based, and exact counts decide success.
 
-### Report is rejected
+## Analysis and review failures
 
-Validate the archived file against the current report contract:
+An embedding, Qdrant, or classifier outage must produce `REVIEW_REQUIRED` with an explicit
+incomplete reason; it must not be reported as a clear analysis. Reviewers may Keep advisory findings.
+That immutable decision remains valid while publication waits and retries, so do not ask for a
+second semantic decision solely because a provider was down.
 
-- version is 2 and `batch_id` matches the pull summary;
-- there is exactly one unique result per staged operation;
-- each result uses `success`, the four component values, optional `chunk_count`, and optional
-  `error` only;
-- successful results have all components succeeded and no error;
-- failed results contain a nonblank error.
+If the decision endpoint rejects a stale revision or collection epoch, reload the analysis and
+review the current evidence. Never replay a target from an obsolete page.
 
-Unknown or obsolete fields make the strict report invalid. Fix and redeploy the producer, then run a
-fresh operation or replay a byte-for-byte valid report as appropriate.
+For repeated invalid LLM output, inspect only approved protected artifacts. Confirm the schema,
+model ID, temperature zero, absent tools, and quote references. Invalid or inconclusive output is
+advisory; deterministic candidates remain visible.
 
-### Lease expires
+## Ingestion failure
 
-Expired claimed or staged work is recovered by the bridge lifecycle rules. Confirm the original job
-is no longer running before allowing a new claim. Repeated expiry usually means the lease is shorter
-than worst-case verified staging and pipeline execution, or the consumer is abandoning batches.
+`INGEST_FAILED` means source and analysis are retained but active publication did not complete.
 
-Adjust the lease only after measuring actual duration; extending it also delays recovery from a dead
-consumer.
+1. Check the operation error and pending outbox attempts.
+2. Verify the configured embedding dimension matches Qdrant collection vectors.
+3. Repair provider authentication, connectivity, model availability, alias, or capacity.
+4. Retry the upload.
+5. Confirm both named vectors exist for every point, exact active count equals chunk count,
+   `published=true`, schema version matches, and screening count is zero.
 
-## Ingestion failures
+Do not mark a document `INGESTED` based on a partial dense-only or sparse-only write.
 
-Any condition that prevents all four components from succeeding enters `INGEST_FAILED`. This
-includes encrypted content, required OCR that the pipeline cannot provide, no extractable text,
-parser crashes, downstream timeouts, and index write failures.
+## Replacement failure
 
-From the queue:
+Use the replacement state and operation phase to determine whether the old document was deleted.
 
-1. Open the document ledger and read the operation error and component rows.
-2. Fix the parser, source, storage, or index dependency.
-3. Retry through the normal ingest action.
-4. Confirm the new operation reaches `INGESTED` and search correlation succeeds.
+- `PREPARING`: the old document must still be active; repair new-vector generation.
+- `DELETING_OLD`: no new active write is permitted. Repair old-point deletion or verification.
+- `INGESTING_NEW`: the old document is intentionally deleted and availability is reduced. Repair
+  new publication and retry; do not restore the old document ad hoc.
 
-Do not write catalog state directly or report success for a partial pipeline. If one component
-failed, the pipeline should compensate partial downstream writes or safely overwrite them on retry.
+For every replacement incident, prove call ordering from audit/outbox records: new artifacts ready,
+old active delete applied and counted zero, old artifacts purged, then new active upsert. Any
+old/new overlap is a retrieval integrity incident.
 
-## Deletion failures
+## Cancellation and deletion
 
-Deletion starts only from an ingested document. A downstream failure enters `DELETE_FAILED` and is
-retryable through the normal lifecycle.
+Cancel removes unpublished source bytes, analysis artifacts, and screening points. Deletion first
+removes and verifies active points, then purges source and analysis content and leaves a `DELETED`
+tombstone. A cleanup failure retains an explicit retryable state rather than silently abandoning
+content.
 
-Verify deletion by UUID and collection across:
+After retry, verify by UUID across:
 
-- downstream PDF source at `pdfs/{collection_key}/{document_id}.pdf`;
-- Markdown storage;
-- BM25 content;
-- dense/Qdrant points;
-- bridge canonical storage after downstream success;
-- subsequent collection-scoped search.
+- the active physical collection and stable alias;
+- `pdf-bridge-screening-v1`;
+- canonical object storage;
+- private compressed analysis storage;
+- SQL analysis/chunk/finding rows;
+- external keyword, semantic, and hybrid search.
 
-Targets already absent should be treated as successful downstream deletion so replay is idempotent.
-If downstream deletion succeeded but canonical cleanup failed, restore bridge storage access and
-replay the same report. The catalog intentionally stays in cleanup until canonical removal commits.
+Audit history should retain the canonical manifest hash and metadata but no excerpts, prompts,
+vectors, or raw outputs.
 
-## Retrieval correlation failures
+## Retrieval integrity
 
-PDF Bridge validates the complete grouped response before returning any hit. A single invalid hit
-rejects the response.
+The external service must implement:
 
-Check that:
+- keyword mode with `content_bm25`;
+- semantic mode with `content_dense`;
+- hybrid mode with reciprocal rank fusion;
+- filters for `published=true` and the current `schema_version`;
+- Bridge `document_id` and `collection_key` in every hit.
 
-- query, mode, requested collection set, and page boundaries match the request;
-- every hit has a unique bridge UUID;
-- each Qdrant payload contains the matching `document_id` and `collection_key`;
-- the UUID exists in the bridge, belongs to the group collection, and is in a shared eligible state;
-- a reported group total does not exceed the eligible bridge population.
-
-Unknown, inactive, duplicate, cross-collection, missing-group, pagination, or impossible-total data
-is a downstream integrity incident. Do not relax bridge validation to make a response pass. Correct
-the index or retrieval adapter and replay the request.
-
-## Startup catalog validation
-
-Startup fails if any document, including a tombstone, lacks a collection. It also fails if an active
-document references a collection that is no longer configured.
-
-Do not rename configuration to bypass the guard. For an accidental configuration omission, restore
-the key. For a deliberate collection retirement, drain and delete its active documents first, then
-deploy the configuration change. Historical tombstones retain their original collection key.
+Bridge rejects a response containing unknown, duplicate, inactive, pending, tombstoned, or
+cross-collection UUIDs, or an impossible group total. Treat that as catalog/index drift. Do not
+relax validation. Remove or rebuild the inconsistent points, verify aliases and epochs, and rerun
+positive and negative collection searches.
 
 ## Backups and restore
 
-Back up the catalog and canonical storage as one recovery unit. Record the database revision and
-application version with each backup. The downstream corpus can be rebuilt, but retain source PDFs
-until rebuild is proven.
+Back up SQLite, canonical PDFs, and compressed analysis storage as one recovery unit. Record the
+application version, migration revision, and pipeline fingerprint. Back up Qdrant with its supported
+snapshot procedure and store the active alias/epoch map. Preserve source PDFs outside Bridge until
+restore and reindex are proven.
 
-A restore drill should verify:
+A restore drill must verify:
 
-1. catalog revision and startup invariants;
-2. canonical object existence and checksum for a sample of active documents;
-3. queue and batch leases are not mistakenly resumed from a stale environment;
-4. downstream rebuild preserves bridge UUID and collection;
-5. collection-scoped search and normal delete succeed for a sample item.
+1. storage hashes and catalog rows agree;
+2. no stale `RUNNING` operation is concurrently owned by another process;
+3. pending outbox work reconciles idempotently;
+4. active/screening point counts and payload schemas agree with SQL;
+5. retrieval credentials cannot access screening;
+6. upload, review, replacement, search, cancellation, and deletion smoke tests pass.
 
-Never merge independently timed database and canonical-storage snapshots without a reconciliation
-plan.
+## Routine upgrade
 
-## Routine upgrades
+1. Back up the complete recovery unit and Qdrant.
+2. Stop operator and retrieval traffic.
+3. Stop the single Bridge process and confirm no parser child remains.
+4. Update the Qdrant client before or with a compatible server change; never float image tags.
+5. Apply reviewed migrations once.
+6. Deploy Bridge and external retrieval together when index schema or pipeline fingerprints change.
+7. Start dependencies, then the single Bridge process.
+8. Verify authentication, aliases, worker recovery, and the smoke test before reopening traffic.
 
-For ordinary releases:
+## Coordinated semantic-intake reset
 
-1. Back up catalog and canonical storage.
-2. Stop bridge and job writers.
-3. Apply migrations once.
-4. Deploy all coordinated contract participants.
-5. Start PDF Bridge and confirm readiness.
-6. Start Jenkins consumers and run a small ingest/search/delete smoke test.
-7. Resume operator traffic.
+This release is an empty-only POC reset, not an in-place migration.
 
-Migration `0002_collection_partitioning` is exceptional: it only upgrades an empty version-1
-catalog. Its reset-required failure is deliberate and must not be bypassed or edited in place.
+1. Inventory, checksum, and externally preserve every source PDF and its intended collection.
+2. Stop operator traffic, Bridge, retrieval, imports, and every index writer.
+3. Confirm no parser, worker, or retrieval process remains active.
+4. Archive only approved evidence needed for audit; old live catalog/index artifacts are not inputs.
+5. Wipe the disposable SQLite catalog and migration state, Bridge canonical/private-analysis
+   storage, historical handoff storage, and every old active and screening Qdrant collection.
+6. Deploy the new empty-only migration, Bridge, Qdrant `1.18.1`, and external retrieval together.
+7. Configure the Bridge admin key and issue retrieval collection-scoped read JWTs that exclude
+   screening.
+8. Start dependencies and one Bridge process; verify readiness and security gates.
+9. Reingest preserved PDFs through manifest version 3 or normal upload, including ordinary review.
+10. Record the evaluation dataset hash and parser/model/threshold fingerprints; require candidate
+    recall of at least `0.98` before leaving POC mode.
+11. Reconcile SQL, storage, active/screening Qdrant counts, aliases, and retrieval results.
 
-## Atomic POC reset
+There is no dual API, Jenkins compatibility mode, synthesized ingested row, or safe way to preserve
+old live state across this cutover.
 
-Use this sequence for the collection-only version 2 cutover:
+## Required smoke test
 
-1. Inventory and checksum every source PDF that must be reingested. Confirm the source set is
-   readable and mapped to configured collections.
-2. Stop operator traffic, bridge writers, scheduled Jenkins jobs, running pipeline jobs, handoff
-   consumers, and retrieval/index writers.
-3. Confirm no job consumer remains active and archive any evidence needed for incident history.
-4. Clear the disposable catalog and its migration state, bridge canonical storage, downstream
-   handoff/source/Markdown/BM25 data, and the entire Qdrant corpus.
-5. Deploy the rewritten migration and bridge, current `pdf-bridge-job` client, parser/RAG report
-   producer, retrieval adapter, UI, and documentation as one release.
-6. Initialize the empty catalog, start dependencies, and confirm readiness before enabling traffic.
-7. Reingest the source set under `pdfs/{collection_key}/{document_id}.pdf` paths.
-8. Reconcile available catalog UUIDs and collections with downstream storage, BM25, and Qdrant.
-9. Run the downstream smoke test below, then resume normal scheduling and operator traffic.
+Use disposable searchable PDFs in at least two configured collections.
 
-Do not preserve old catalog rows or old version 2 artifacts as live inputs. There is no compatibility
-shim, and mixed participants can corrupt placement or leave partial indexes.
+1. Upload a clear PDF and confirm automatic publication.
+2. Upload related content and inspect paginated deterministic and LLM evidence.
+3. Exercise Keep and confirm publication without another decision after a simulated provider retry.
+4. Exercise Cancel and prove complete purge.
+5. Exercise Replace and prove zero old/new overlap plus the documented availability gap.
+6. Search keyword, semantic, and hybrid modes; verify positive same-collection and negative
+   cross-collection behavior.
+7. Delete the active test document and prove both Qdrant index families and private artifacts are
+   empty for its UUID.
+8. Attempt anonymous Qdrant access and a retrieval-token screening query; both must fail.
 
-## Required downstream smoke test
-
-Choose a disposable source PDF with searchable text and a configured collection.
-
-1. Upload it and record its bridge UUID and collection.
-2. Claim and stage the ingest operation; assert the exact collection-only handoff path.
-3. Report a complete successful ingest and inspect Qdrant to confirm its points contain only the
-   bridge identity fields required for correlation: `document_id` and `collection_key`.
-4. Search through PDF Bridge and confirm the UUID appears in the correct collection.
-5. Delete through PDF Bridge, process the delete batch, and report complete success.
-6. Confirm source/Markdown/BM25/Qdrant data are absent and the UUID no longer appears in search.
-
-Archive the manifest, report, search response, and deletion evidence with the release record.
+Archive content-free results, hashes, UUIDs, versions, and fingerprints under the release record.
 
 ## Incident handling
 
-For possible malware escape, cross-collection exposure, unknown retrieval UUIDs, forged job
-traffic, or unexplained catalog/index drift:
+For malware escape, parser compromise, screening exposure, old/new overlap, forged provider output,
+credential disclosure, or unexplained catalog/index drift:
 
-1. Stop uploads, job consumers, and retrieval traffic as needed to contain impact.
-2. Preserve request IDs, batch artifacts, audit events, logs, and relevant hashes.
-3. Revoke or rotate affected credentials.
-4. Identify the authoritative bridge UUID/collection set and quarantine inconsistent downstream
-   data.
-5. Correct the root cause and rebuild the affected corpus from verified source PDFs.
-6. Complete the ingest/search/delete smoke test before reopening traffic.
+1. contain uploads, worker, provider, and retrieval traffic without destroying evidence;
+2. preserve request/document/analysis/operation/outbox IDs, timestamps, hashes, and protected logs;
+3. rotate affected provider or Qdrant credentials (and regenerate JWTs after an admin-key change);
+4. identify the authoritative SQL UUID/collection set and quarantine inconsistent points;
+5. correct the root cause and rebuild from verified external source PDFs;
+6. complete the full smoke test before reopening traffic.
+
+Do not manually rewrite lifecycle or audit rows. Use documented operations or a reviewed repair
+migration that preserves the original evidence.

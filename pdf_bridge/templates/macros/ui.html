@@ -1,13 +1,7 @@
 {% macro status_label(value) -%}
   {% set raw = value|default('UNKNOWN', true)|string|upper %}
   {% set css_value = raw|lower|replace('_', '-')|replace(' ', '-') %}
-  {% if raw == 'DELETE_CLEANUP' %}
-    {% set label = 'Deletion cleanup' %}
-  {% elif raw == 'CANCEL_CLEANUP' %}
-    {% set label = 'Cancellation cleanup' %}
-  {% else %}
-    {% set label = raw|replace('_', ' ')|title %}
-  {% endif %}
+  {% set label = raw|replace('_', ' ')|title %}
   <span class="status status--{{ css_value }}">{{ label }}</span>
 {%- endmacro %}
 

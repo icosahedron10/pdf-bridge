@@ -1,1 +1,1 @@
-"""Public API and job-client data contracts."""
+"""Public PDF Bridge API contracts."""

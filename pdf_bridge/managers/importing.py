@@ -72,9 +72,9 @@ def run_manifest_import(
                 actor_id=actor_id,
             )
     except Exception as transaction_error:
-        # The import itself compensates promoted files before raising, so a
-        # populated response means the session-scope commit failed after the
-        # canonical objects were already promoted.
+        # The import service compensates failures raised while processing the
+        # manifest. A populated response means only the surrounding commit
+        # failed after every canonical object had already been promoted.
         if response is not None:
             failed_keys = _compensate_promoted_objects(settings, response)
             if failed_keys:

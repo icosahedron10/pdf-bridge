@@ -38,44 +38,6 @@ def _catalog_document(
     )
 
 
-def _claim_manifest(
-    client: TestClient,
-    job_headers: dict[str, str],
-    *,
-    request_id: str,
-) -> tuple[dict, dict]:
-    claimed = client.post(
-        "/api/v1/jobs/batches/claim",
-        headers=job_headers,
-        json={"request_id": request_id, "limit": 100},
-    )
-    assert claimed.status_code == 200, claimed.text
-    batch = claimed.json()
-    response = client.get(
-        f"/api/v1/jobs/batches/{batch['batch_id']}/manifest",
-        headers=job_headers,
-    )
-    assert response.status_code == 200, response.text
-    return batch, response.json()
-
-
-def _stage_manifest(
-    client: TestClient,
-    job_headers: dict[str, str],
-    *,
-    batch: dict,
-    manifest: dict,
-) -> None:
-    response = client.post(
-        f"/api/v1/jobs/batches/{batch['batch_id']}/staged",
-        headers=job_headers,
-        json={
-            "operation_ids": [operation["operation_id"] for operation in manifest["operations"]]
-        },
-    )
-    assert response.status_code == 200, response.text
-
-
 def test_collections_endpoint_reports_only_available_and_processing_counts(
     client: TestClient,
     session_factory: sessionmaker[Session],
@@ -94,12 +56,12 @@ def test_collections_endpoint_reports_only_available_and_processing_counts(
         _catalog_document(
             filename="customer-processing.pdf",
             collection_key="customer",
-            state=DocumentState.QUEUED,
+            state=DocumentState.ANALYZING,
         ),
         _catalog_document(
             filename="customer-cleanup.pdf",
             collection_key="customer",
-            state=DocumentState.DELETE_CLEANUP,
+            state=DocumentState.CLEANUP_PENDING,
         ),
         _catalog_document(
             filename="internal.pdf",
@@ -130,7 +92,7 @@ def test_collections_endpoint_reports_only_available_and_processing_counts(
     assert collections["internal"]["processing_documents"] == 0
 
 
-def test_upload_requires_configured_collection_and_locks_idempotency_scope(
+def test_upload_requires_configured_collection_and_scopes_duplicates(
     client: TestClient,
     csrf_headers: dict[str, str],
     upload_pdf,
@@ -167,8 +129,8 @@ def test_upload_requires_configured_collection_and_locks_idempotency_scope(
     assert unknown_upload.json()["code"] == "collection-not-configured"
 
     first = upload_pdf(key="cross-collection-idempotency", collection="customer")
-    assert first.status_code == 201, first.text
-    document_id = first.json()["document"]["id"]
+    assert first.status_code == 202, first.text
+    document_id = first.json()["upload"]["upload_id"]
 
     conflicting_replay = upload_pdf(
         key="cross-collection-idempotency",
@@ -177,132 +139,110 @@ def test_upload_requires_configured_collection_and_locks_idempotency_scope(
     assert conflicting_replay.status_code == 409
     assert conflicting_replay.json()["code"] == "idempotency-key-conflict"
 
-    exact_duplicate = upload_pdf(key="cross-collection-checksum", collection="internal")
+    exact_duplicate = upload_pdf(key="same-collection-checksum", collection="customer")
     assert exact_duplicate.status_code == 409
+    assert exact_duplicate.json()["code"] == "exact-duplicate"
     assert exact_duplicate.json()["duplicate"] == {
         "document_id": document_id,
         "filename": "example.pdf",
         "size_bytes": len(PDF_A),
-        "state": "QUEUED",
+        "state": "ANALYZING",
         "collection_key": "customer",
         "detail_url": f"/documents/{document_id}",
     }
 
+    cross_collection_copy = upload_pdf(
+        key="cross-collection-checksum",
+        collection="internal",
+    )
+    assert cross_collection_copy.status_code == 202, cross_collection_copy.text
+    assert cross_collection_copy.json()["upload"]["document"]["collection_key"] == "internal"
 
-def test_version_two_manifest_and_result_are_collection_only(
+
+def test_preflight_filename_warnings_are_collection_scoped(
     client: TestClient,
-    upload_pdf,
-    job_headers: dict[str, str],
+    csrf_headers: dict[str, str],
+    session_factory: sessionmaker[Session],
 ) -> None:
-    uploaded = upload_pdf(key="collection-only-contract", collection="customer")
-    assert uploaded.status_code == 201, uploaded.text
-    document_id = uploaded.json()["document"]["id"]
-    batch, manifest = _claim_manifest(
-        client,
-        job_headers,
-        request_id="collection-only-contract-claim",
+    existing = _catalog_document(
+        filename="Customer Monthly Report May 2026.pdf",
+        collection_key="customer",
+        state=DocumentState.INGESTED,
+    )
+    with session_factory() as session:
+        session.add(existing)
+        session.commit()
+
+    request = {
+        "filename": "Customer Monthly Report June 2026.pdf",
+        "size_bytes": len(PDF_A),
+    }
+    customer = client.post(
+        "/api/v1/uploads/preflight",
+        headers=csrf_headers,
+        json={**request, "collection_key": "customer"},
+    )
+    internal = client.post(
+        "/api/v1/uploads/preflight",
+        headers=csrf_headers,
+        json={**request, "collection_key": "internal"},
     )
 
-    assert manifest["version"] == 2
-    operation = manifest["operations"][0]
-    assert set(operation) == {
-        "operation_id",
-        "document_id",
-        "operation_type",
-        "filename",
-        "size_bytes",
-        "sha256",
-        "collection_key",
-        "relative_path",
-        "download_url",
-    }
-    assert operation["collection_key"] == "customer"
-    assert operation["relative_path"] == f"pdfs/customer/{document_id}.pdf"
+    assert customer.status_code == 200, customer.text
+    assert customer.json()["warnings"]
+    assert customer.json()["warnings"][0]["matched"]["document_id"] == str(existing.id)
+    assert customer.json()["warnings"][0]["matched"]["collection_key"] == "customer"
+    assert internal.status_code == 200, internal.text
+    assert internal.json()["warnings"] == []
 
-    _stage_manifest(client, job_headers, batch=batch, manifest=manifest)
-    reported = client.post(
-        f"/api/v1/jobs/batches/{batch['batch_id']}/results",
-        headers=job_headers,
+
+def test_preflight_checks_the_full_collection_for_filename_families(
+    client: TestClient,
+    csrf_headers: dict[str, str],
+    session_factory: sessionmaker[Session],
+) -> None:
+    older_match = _catalog_document(
+        filename="Customer Monthly Report May 2026.pdf",
+        collection_key="customer",
+        state=DocumentState.INGESTED,
+    )
+    newer_nonmatches = [
+        _catalog_document(
+            filename=f"Unrelated Archive Item {index:04d}.pdf",
+            collection_key="customer",
+            state=DocumentState.INGESTED,
+        )
+        for index in range(2_000)
+    ]
+    with session_factory() as session:
+        session.add_all([older_match, *newer_nonmatches])
+        session.commit()
+
+    response = client.post(
+        "/api/v1/uploads/preflight",
+        headers=csrf_headers,
         json={
-            "pipeline_run_id": "collection-only-run",
-            "results": [
-                {
-                    "operation_id": operation["operation_id"],
-                    "success": True,
-                    "chunk_count": 3,
-                    "components": {
-                        "pdf_source": "succeeded",
-                        "markdown": "succeeded",
-                        "bm25": "succeeded",
-                        "dense": "succeeded",
-                    },
-                }
-            ],
+            "filename": "Customer Monthly Report June 2026.pdf",
+            "size_bytes": len(PDF_A),
+            "collection_key": "customer",
         },
     )
-    assert reported.status_code == 200, reported.text
-    assert set(reported.json()) == {
-        "batch_id",
-        "state",
-        "completed_at",
-        "succeeded",
-        "failed",
-        "idempotent_replay",
+
+    assert response.status_code == 200, response.text
+    matched_ids = {
+        warning["matched"]["document_id"] for warning in response.json()["warnings"]
     }
-    assert reported.json()["succeeded"] == 1
-    document = client.get(f"/api/v1/documents/{document_id}").json()
-    assert document["state"] == "INGESTED"
-    assert document["collection_key"] == "customer"
-    assert document["pipeline_metadata"] == {
-        "components": [
-            {"name": "pdf_source", "status": "succeeded"},
-            {"name": "markdown", "status": "succeeded"},
-            {"name": "bm25", "status": "succeeded"},
-            {"name": "dense", "status": "succeeded"},
-        ],
-        "collection_key": "customer",
-    }
+    assert str(older_match.id) in matched_ids
 
 
-def test_legacy_result_and_search_fields_are_rejected(
+def test_legacy_search_and_classification_fields_are_rejected(
     client: TestClient,
     csrf_headers: dict[str, str],
     upload_pdf,
-    job_headers: dict[str, str],
 ) -> None:
-    uploaded = upload_pdf(key="reject-legacy-result", collection="customer")
-    assert uploaded.status_code == 201
-    batch, manifest = _claim_manifest(
-        client,
-        job_headers,
-        request_id="reject-legacy-result-claim",
-    )
-    _stage_manifest(client, job_headers, batch=batch, manifest=manifest)
-    operation_id = manifest["operations"][0]["operation_id"]
-
-    rejected_result = client.post(
-        f"/api/v1/jobs/batches/{batch['batch_id']}/results",
-        headers=job_headers,
-        json={
-            "pipeline_run_id": "legacy-result-run",
-            "results": [
-                {
-                    "operation_id": operation_id,
-                    "success": False,
-                    "outcome": "failed",
-                    "classification": {"language": "en"},
-                    "components": {
-                        "pdf_source": "failed",
-                        "markdown": "not_applicable",
-                        "bm25": "not_applicable",
-                        "dense": "not_applicable",
-                    },
-                    "error": "parser failed",
-                }
-            ],
-        },
-    )
-    assert rejected_result.status_code == 400
+    uploaded = upload_pdf(key="reject-legacy-fields", collection="customer")
+    assert uploaded.status_code == 202
+    document_id = uploaded.json()["upload"]["upload_id"]
 
     rejected_search = client.post(
         "/api/v1/search",
@@ -316,7 +256,7 @@ def test_legacy_result_and_search_fields_are_rejected(
     )
     assert rejected_search.status_code == 400
     assert client.post(
-        f"/api/v1/documents/{uploaded.json()['document']['id']}/classification",
+        f"/api/v1/documents/{document_id}/classification",
         headers=csrf_headers,
         json={"language": "en"},
     ).status_code == 404

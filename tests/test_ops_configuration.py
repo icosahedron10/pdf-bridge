@@ -5,19 +5,18 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_jenkins_example_uses_clean_workspace_and_released_wheel() -> None:
-    pipeline = (REPOSITORY_ROOT / "Jenkinsfile.example").read_text(encoding="utf-8")
+def test_jenkins_artifacts_are_removed() -> None:
+    for relative_path in ("Jenkinsfile.example", "docs/jenkins.md"):
+        assert not (REPOSITORY_ROOT / relative_path).exists(), relative_path
 
-    assert "parameters {" not in pipeline
-    assert "skipDefaultCheckout(true)" in pipeline
-    assert pipeline.count("deleteDir()") >= 2
-    assert 'rm -f "$PULL_RESULT" "$PIPELINE_REPORT"' in pipeline
-    assert "--only-binary=:all:" in pipeline
-    assert '"pdf-bridge==$PDF_BRIDGE_CLIENT_VERSION"' in pipeline
-    assert "pip install --disable-pip-version-check ." not in pipeline
-    assert "PDF_BRIDGE_JOB_ALLOWED_HOST = 'pdf-bridge.internal'" in pipeline
-    assert '--allowed-host "$PDF_BRIDGE_JOB_ALLOWED_HOST"' in pipeline
-    assert '--pull-result "$PULL_RESULT"' in pipeline
+
+def test_container_runs_exactly_one_uvicorn_process() -> None:
+    dockerfile = (REPOSITORY_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    entrypoint = (REPOSITORY_ROOT / "docker-entrypoint.sh").read_text(encoding="utf-8")
+
+    assert '"--workers", "1"' in dockerfile
+    assert "PDF_BRIDGE_JOB_TOKEN" not in entrypoint
+    assert "Jenkins" not in entrypoint
 
 
 def test_compose_health_uses_readiness_and_larger_ephemeral_tmp() -> None:
@@ -26,6 +25,19 @@ def test_compose_health_uses_readiness_and_larger_ephemeral_tmp() -> None:
     assert "/api/v1/health/ready" in compose
     assert "/api/v1/health/live" not in compose
     assert "/tmp:size=256m,mode=1777" in compose
+
+
+def test_compose_pins_and_isolates_authenticated_qdrant() -> None:
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "qdrant/qdrant:v1.18.1" in compose
+    assert 'QDRANT__SERVICE__JWT_RBAC: "true"' in compose
+    assert "QDRANT__SERVICE__API_KEY:" in compose
+    assert "PDF_BRIDGE_QDRANT_API_KEY:" in compose
+    assert "PDF_BRIDGE_QDRANT_URL: http://qdrant:6333" in compose
+    assert "qdrant_private:" in compose
+    assert "internal: true" in compose
+    assert "6333:6333" not in compose
 
 
 def test_compose_forwards_every_documented_operator_tunable() -> None:
@@ -38,7 +50,28 @@ def test_compose_forwards_every_documented_operator_tunable() -> None:
         "PDF_BRIDGE_UPLOAD_CHUNK_BYTES",
         "PDF_BRIDGE_CLAMD_TIMEOUT",
         "PDF_BRIDGE_CLAMD_STREAM_MAX_BYTES",
-        "PDF_BRIDGE_CLAIM_LEASE_MINUTES",
+        "PDF_BRIDGE_WORKER_ENABLED",
+        "PDF_BRIDGE_WORKER_POLL_SECONDS",
+        "PDF_BRIDGE_WORKER_LEASE_SECONDS",
+        "PDF_BRIDGE_WORKER_HEARTBEAT_SECONDS",
+        "PDF_BRIDGE_PARSE_WALL_CLOCK_SECONDS",
+        "PDF_BRIDGE_PARSE_CPU_SECONDS",
+        "PDF_BRIDGE_PARSE_MEMORY_BYTES",
+        "PDF_BRIDGE_ANALYSIS_MAX_PAGES",
+        "PDF_BRIDGE_ANALYSIS_MAX_CHARACTERS",
+        "PDF_BRIDGE_ANALYSIS_MAX_CHUNKS",
+        "PDF_BRIDGE_EMBEDDING_API_URL",
+        "PDF_BRIDGE_EMBEDDING_API_TOKEN",
+        "PDF_BRIDGE_EMBEDDING_MODEL_ID",
+        "PDF_BRIDGE_EMBEDDING_DIMENSION",
+        "PDF_BRIDGE_EMBEDDING_TIMEOUT",
+        "PDF_BRIDGE_LLM_API_URL",
+        "PDF_BRIDGE_LLM_API_TOKEN",
+        "PDF_BRIDGE_LLM_CLASSIFIER_MODEL",
+        "PDF_BRIDGE_LLM_VERIFIER_MODEL",
+        "PDF_BRIDGE_LLM_TIMEOUT",
+        "PDF_BRIDGE_QDRANT_API_KEY",
+        "PDF_BRIDGE_QDRANT_TIMEOUT",
         "PDF_BRIDGE_SEARCH_API_URL",
         "PDF_BRIDGE_SEARCH_API_TOKEN",
         "PDF_BRIDGE_SEARCH_API_TIMEOUT",
@@ -46,6 +79,11 @@ def test_compose_forwards_every_documented_operator_tunable() -> None:
         assert f"{variable}:" in compose, variable
         assert f"${{{variable}" in compose, variable
         assert f"{variable}=" in env_example, variable
+
+    assert "PDF_BRIDGE_JOB_TOKEN" not in compose
+    assert "PDF_BRIDGE_CLAIM_LEASE_MINUTES" not in compose
+    assert "PDF_BRIDGE_JOB_TOKEN" not in env_example
+    assert "PDF_BRIDGE_CLAIM_LEASE_MINUTES" not in env_example
 
 
 def test_compose_forwards_deployment_theme_settings() -> None:

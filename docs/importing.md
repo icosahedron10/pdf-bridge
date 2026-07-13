@@ -1,136 +1,89 @@
-# Historical import and backup handoff
+# Historical import
 
-`pdf-bridge import-manifest` is a local administrative command for registering PDFs that were
-already ingested before the bridge existed. It uses the same filename, PDF signature, size,
-checksum, exact-duplicate, and ClamAV controls as a new upload. Version 2 requires the operator to
-attest the configured collection. It creates each document directly in the `INGESTED` state plus a
-synthetic successful ingestion operation for lifecycle transparency; it does not enqueue work for
-Jenkins or move an existing Qdrant payload.
+Historical import is a controlled way to submit externally preserved PDFs through the normal
+semantic-intake lifecycle. Manifest version 3 does not mark documents ingested and does not move an
+old Qdrant corpus. Every applied item is copied, hashed, PDF-validated, ClamAV-scanned, promoted,
+registered as `ANALYZING`, and given a normal durable `ANALYZE` operation.
 
-Run it only on the Linux bridge host/container with access to the catalog and canonical storage.
-This is not a browser feature and does not accept a remote URL.
-
-## Prepare a source root
-
-Place or mount the approved historical PDFs under one explicit read-only source root, outside the
-bridge storage root and outside the Git checkout. The command never modifies or moves source files;
-it copies clean bytes into UUID-derived canonical storage.
-
-The source root is a security boundary. Each manifest entry is resolved, including symlinks, and
-must remain beneath the resolved root. Relative paths are strongly preferred because they make the
-manifest reviewable and portable. A symlink pointing outside the root is rejected.
-
-## Version 2 manifest
+## Manifest version 3
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "documents": [
     {
-      "path": "policies/remote-work.pdf",
-      "filename": "Remote work policy.pdf",
-      "collection_key": "internal",
-      "ingested_at": "2026-06-18T13:05:00Z",
-      "chunk_count": 47,
-      "pipeline_run_id": "legacy-import-2026-06"
+      "path": "customer/product-guide.pdf",
+      "filename": "Product guide.pdf",
+      "collection_key": "customer"
     },
     {
-      "path": "handbooks/safety.pdf",
-      "filename": null,
-      "collection_key": "customer",
-      "ingested_at": null,
-      "chunk_count": null,
-      "pipeline_run_id": null
+      "path": "internal/benefits.pdf",
+      "collection_key": "internal"
     }
   ]
 }
 ```
 
-Fields:
+The root object and every document object are strict; unknown fields fail validation. `filename` is
+optional and defaults to the source basename. `collection_key` must exist in the deployed
+`PDF_BRIDGE_COLLECTIONS` configuration.
 
-| Field | Required | Meaning |
-|---|---|---|
-| `version` | yes | must be `2` |
-| `documents` | yes | 1–10,000 entries; duplicate source paths are rejected |
-| `path` | yes | source path resolved under `--source-root` |
-| `filename` | no | display filename; defaults to the source basename and must end in `.pdf` |
-| `collection_key` | yes | stable key from `PDF_BRIDGE_COLLECTIONS`; must match the existing downstream corpus |
-| `ingested_at` | no | known UTC-aware historical ingestion time; otherwise import time |
-| `chunk_count` | no | known nonnegative downstream chunk count |
-| `pipeline_run_id` | no | bounded identifier that can be correlated with pipeline records |
+The source root is a security boundary. Each relative path is resolved, including symlinks, and
+must remain beneath that root. The source root and Bridge storage root may not contain one another.
+Duplicate source paths and duplicate bytes within the same manifest collection are rejected.
 
-Use JSON `null` or omit an unknown optional field. Do not invent metadata merely to avoid an
-“information unavailable” label in the document ledger.
+## Dry run, then apply
 
-Collection is not an optional historical hint. Before approval, verify that every document and all
-of its chunks already exist only in the named downstream collection. If that evidence is
-unavailable, do not import the record as ingested; rebuild it through the normal ingestion flow.
+Run the exact released application and configuration intended for apply mode:
 
-## Validate first
-
-Set normal bridge environment variables, including the external storage root and clamd address,
-then run:
-
-```text
-pdf-bridge import-manifest historical.json \
-  --source-root /mnt/approved-historical-pdfs \
-  --dry-run
+```bash
+pdf-bridge import-manifest historical-v3.json \
+  --source-root /approved/source-pdfs \
+  --dry-run \
+  --actor-id change-1234
 ```
 
-Dry-run is the default. It validates the strict manifest and resolved paths, streams each PDF
-through size/signature/hash checks, scans it with ClamAV, and checks active exact duplicates. It
-does not create document/audit rows or retain canonical copies. Scanner failure fails the run.
+Dry run still reads, bounds, hashes, validates, and scans every PDF. It does not create catalog rows
+or canonical objects. Review the JSON result, source-set checksum, manifest checksum, collection
+mapping, ClamAV signature age, and operator/change identifier.
 
-Review the JSON result: each item contains the effective filename, SHA-256, byte count, collection,
-and a null `document_id`. Record the manifest checksum and dry-run output with the approved change
-ticket.
+Apply only the reviewed bytes and manifest:
 
-## Apply once
-
-After review, run the same package/configuration/manifest with explicit `--apply`:
-
-```text
-pdf-bridge import-manifest historical.json \
-  --source-root /mnt/approved-historical-pdfs \
+```bash
+pdf-bridge import-manifest historical-v3.json \
+  --source-root /approved/source-pdfs \
   --apply \
-  --actor-id change-CHG001234
+  --actor-id change-1234
 ```
 
-`--actor-id` identifies the controlled import in append-only audit events; it is not an identity
-override for browser activity. Avoid personal data or secrets in it.
+Apply is one catalog transaction. Canonical promotion is compensated if processing or commit fails.
+After success, start or wake the application worker and follow the imported rows through analysis,
+review, and publication. An import count is not proof that documents are retrieval-active.
 
-For each entry, apply mode:
+## Idempotency and reruns
 
-1. resolves the path beneath the source root;
-2. copies it to bridge temporary storage while enforcing the configured maximum and PDF signature;
-3. calculates SHA-256 and rejects an active duplicate;
-4. streams the copy to ClamAV and requires a clean result;
-5. atomically promotes the clean copy to canonical storage;
-6. creates an ingested document with a synthetic `SUCCEEDED` ingestion operation and an audit event
-   in one controlled transaction.
+The manifest is not a reusable idempotency envelope. A successful apply creates ordinary upload
+identities. Rerunning unchanged content in the same collection is rejected by the exact-byte gate;
+the same bytes in another collection remain allowed by design.
 
-The command fails hard on the first invalid item and rolls back its catalog transaction. Because a
-database transaction and filesystem promotion cannot form one distributed transaction, an abrupt
-process/host failure still requires inspection of the catalog, temporary directory, and canonical
-objects. Do not modify the manifest and blindly rerun: use a reviewed manifest containing only
-confirmed missing documents.
+If a partial operational failure is reported, inspect the catalog and canonical storage before
+creating a smaller reviewed manifest containing only items that were not committed. Do not edit
+SQLite state, synthesize ingested rows, or copy files directly into canonical object paths.
 
-## Import acceptance checks
+## After import
 
-- The reported `imported` count equals the approved manifest count.
-- Every returned document UUID opens the expected ledger and clean preview.
-- SHA-256 and size agree with the source inventory.
-- Historical times/counts/run IDs appear when supplied; unknown values are labeled unavailable.
-- The catalog shows the attested collection for every imported UUID.
-- Retrieval search returns each bridge UUID only from its attested collection. If existing Qdrant
-  payloads lack `document_id` or `collection_key`, update or reingest those chunks before declaring
-  search integration complete.
-- A known internal topic produces an explicit zero in the customer collection.
-- Source files remain unchanged.
+1. Poll `GET /api/v1/uploads?open=true` until every imported analysis reaches review, publication,
+   rejection, or an explicit retryable failure.
+2. Review every candidate and incomplete analysis through the same Keep/Replace/Cancel interface as
+   browser uploads.
+3. Verify active Qdrant point counts and payload schema for each published UUID.
+4. Search each collection positively and verify a negative cross-collection query.
+5. Archive the manifest hash, source-set hash, result JSON, application version, pipeline
+   fingerprint, and change identifier under the approved retention policy.
 
-## Backups versus imports
+## Backup distinction
 
-An import manifest is **not** a bridge backup. It cannot reconstruct queue/batch/audit history and
-does not preserve canonical UUIDs unless the retrieval corpus has already been coordinated.
-Back up/restore the whole bridge data volume as described in [the runbook](runbook.md). Use import
-only for the one-time transition of a pre-bridge corpus or a separately approved catalog repair.
+A version-3 import manifest is not a Bridge backup. It cannot reconstruct decisions, analysis
+evidence, audit history, replacement workflows, leases, outbox state, or tombstones. Back up SQLite,
+canonical storage, and private analysis storage as one consistent unit, and manage Qdrant snapshots
+according to the recovery plan.

@@ -9,10 +9,12 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
+    AnalysisDetailResponse,
     CollectionListResponse,
     DocumentDetail,
     DocumentListResponse,
-    QueueListResponse,
+    UploadListResponse,
+    UploadResource,
 )
 from pdf_bridge.core.config import CollectionDefinition
 from pdf_bridge.persistence.models import DocumentState
@@ -56,20 +58,42 @@ def get_document(session: Session, document_id: UUID) -> DocumentDetail:
     return catalog.document_detail(session, document_id)
 
 
-def list_queue(
+def list_uploads(
     session: Session,
     *,
     definitions: Sequence[CollectionDefinition],
+    open_only: bool,
     collection_key: str | None,
     page: int,
     page_size: int,
-) -> QueueListResponse:
-    """Return a filtered page of the current operation queue."""
+) -> UploadListResponse:
+    """Return a filtered page of durable upload workspace rows."""
 
-    return catalog.queue_list(
+    return catalog.upload_list(
         session,
         definitions=definitions,
+        open_only=open_only,
         collection_key=collection_key,
         page=page,
         page_size=page_size,
+    )
+
+
+def get_upload(session: Session, upload_id: UUID) -> UploadResource:
+    """Return one durable upload workspace row."""
+
+    return catalog.upload_detail(session, upload_id)
+
+
+def get_upload_analysis(
+    session: Session,
+    *,
+    upload_id: UUID,
+    page: int,
+    page_size: int,
+) -> AnalysisDetailResponse:
+    """Return the current analysis with paginated candidate evidence."""
+
+    return catalog.analysis_detail(
+        session, upload_id=upload_id, page=page, page_size=page_size
     )

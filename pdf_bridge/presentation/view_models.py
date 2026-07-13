@@ -5,20 +5,26 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from pdf_bridge.persistence.models import AuditEvent, Document, DocumentState, QueueOperation
+from pdf_bridge.persistence.models import (
+    AuditEvent,
+    Document,
+    DocumentAnalysis,
+    DocumentState,
+    IntakeDecision,
+    WorkOperation,
+)
 
 PREVIEW_BLOCKED_STATES = frozenset(
     {
-        DocumentState.INGEST_FAILED,
-        DocumentState.DELETE_FAILED,
-        DocumentState.DELETE_CLEANUP,
+        DocumentState.CLEANUP_PENDING,
+        DocumentState.CLEANUP_FAILED,
+        DocumentState.REJECTED,
         DocumentState.DELETED,
-        DocumentState.CANCEL_CLEANUP,
         DocumentState.CANCELLED,
     }
 )
 CLEANUP_PENDING_STATES = frozenset(
-    {DocumentState.DELETE_CLEANUP, DocumentState.CANCEL_CLEANUP}
+    {DocumentState.CLEANUP_PENDING, DocumentState.CLEANUP_FAILED}
 )
 
 
@@ -47,10 +53,8 @@ def format_time(value: datetime | None) -> str | None:
 
 
 def document_view(document: Document) -> dict[str, Any]:
-    """Convert a document model into the compatibility-rich template mapping."""
+    """Convert a document model into template-ready lifecycle data."""
 
-    # Templates intentionally consume both domain-oriented and legacy display
-    # aliases; centralizing them keeps Jinja pages free of lifecycle logic.
     can_preview = (
         document.scan_state.value == "CLEAN"
         and document.storage_key is not None
@@ -84,11 +88,23 @@ def document_view(document: Document) -> dict[str, Any]:
         "uploader_identity": document.uploader_identity,
         "ingested_at": document.ingested_at,
         "ingested_at_display": format_time(document.ingested_at),
+        "rejected_at": document.rejected_at,
+        "rejected_at_display": format_time(document.rejected_at),
+        "cancelled_at": document.cancelled_at,
+        "cancelled_at_display": format_time(document.cancelled_at),
         "deleted_at": document.deleted_at,
         "deleted_at_display": format_time(document.deleted_at),
+        "page_count": document.page_count,
         "chunk_count": document.chunk_count,
-        "pipeline_run_id": document.pipeline_run_id,
-        "pipeline_metadata": document.pipeline_metadata,
+        "text_sha256": document.text_sha256,
+        "analysis_revision": document.analysis_revision,
+        "analysis_manifest_hash": document.analysis_manifest_hash,
+        "rejection_reason": document.rejection_reason,
+        "replaced_by_document_id": (
+            str(document.replaced_by_document_id)
+            if document.replaced_by_document_id
+            else None
+        ),
         "error_message": document.last_error,
         "collection_key": document.collection_key,
         "can_preview": can_preview,
@@ -96,8 +112,8 @@ def document_view(document: Document) -> dict[str, Any]:
     }
 
 
-def operation_view(operation: QueueOperation) -> dict[str, Any]:
-    """Convert a queue operation and its document into template-ready data."""
+def operation_view(operation: WorkOperation) -> dict[str, Any]:
+    """Convert a durable worker operation into template-ready data."""
 
     return {
         "id": str(operation.id),
@@ -107,23 +123,66 @@ def operation_view(operation: QueueOperation) -> dict[str, Any]:
         "operation_type": operation.operation_type.value,
         "type": operation.operation_type.value,
         "status": operation.document.state.value,
+        "phase": operation.phase.value,
         "operation_status": operation.state.value,
         "state": operation.state.value,
         "attempt": operation.attempt,
+        "retryable": operation.retryable,
         "created_at": operation.created_at,
         "created_at_display": format_time(operation.created_at),
-        "claimed_at": operation.claimed_at,
-        "claimed_at_display": format_time(operation.claimed_at),
-        "staged_at": operation.staged_at,
-        "staged_at_display": format_time(operation.staged_at),
+        "started_at": operation.started_at,
+        "started_at_display": format_time(operation.started_at),
+        "heartbeat_at": operation.heartbeat_at,
+        "heartbeat_at_display": format_time(operation.heartbeat_at),
+        "updated_at": operation.updated_at,
+        "updated_at_display": format_time(operation.updated_at),
         "completed_at": operation.completed_at,
         "completed_at_display": format_time(operation.completed_at),
         "lease_expires_at": operation.lease_expires_at,
         "lease_expires_at_display": format_time(operation.lease_expires_at),
-        "batch_id": str(operation.batch_id) if operation.batch_id else None,
+        "worker_id": operation.worker_id,
         "error": operation.error,
         "error_message": operation.error,
-        "component_results": operation.component_results,
+    }
+
+
+def analysis_view(analysis: DocumentAnalysis | None) -> dict[str, Any] | None:
+    """Convert the latest persisted analysis into a concise page summary."""
+
+    if analysis is None:
+        return None
+    return {
+        "id": str(analysis.id),
+        "revision": analysis.revision,
+        "status": analysis.status.value,
+        "pipeline_fingerprint": analysis.pipeline_fingerprint,
+        "page_count": analysis.page_count,
+        "chunk_count": analysis.chunk_count,
+        "semantic_complete": analysis.semantic_complete,
+        "classification_complete": analysis.classification_complete,
+        "incomplete_reasons": list(analysis.incomplete_reasons),
+        "auto_ingest_eligible": analysis.auto_ingest_eligible,
+        "candidate_count": analysis.candidate_count,
+        "classified_count": analysis.classified_count,
+        "overflow_count": analysis.overflow_count,
+        "created_at_display": format_time(analysis.created_at),
+        "completed_at_display": format_time(analysis.completed_at),
+    }
+
+
+def decision_view(decision: IntakeDecision) -> dict[str, Any]:
+    """Convert one immutable operator decision for the document ledger."""
+
+    return {
+        "id": str(decision.id),
+        "action": decision.action.value,
+        "analysis_revision": decision.analysis_revision,
+        "target_document_id": (
+            str(decision.target_document_id) if decision.target_document_id else None
+        ),
+        "advisory_override": decision.advisory_override,
+        "actor_id": decision.actor_id,
+        "created_at_display": format_time(decision.created_at),
     }
 
 
@@ -141,24 +200,8 @@ def audit_event_view(event: AuditEvent) -> dict[str, Any]:
         "actor": event.actor_id,
         "actor_display": event.actor_id,
         "actor_type": event.actor_type,
-        "batch_id": str(event.batch_id) if event.batch_id else None,
-        "pipeline_run_id": details.get("pipeline_run_id"),
+        "operation_id": str(event.operation_id) if event.operation_id else None,
         "detail": details.get("detail"),
+        "analysis_revision": details.get("analysis_revision"),
+        "target_document_id": details.get("target_document_id"),
     }
-
-
-def components_view(operation: QueueOperation | None) -> list[dict[str, Any]]:
-    """Return pipeline component rows for an operation when reported."""
-
-    if not operation or not operation.component_results:
-        return []
-    return [
-        {
-            "name": component.get("name", "unknown"),
-            "status": component.get("status", "not_reported"),
-            "detail": component.get("detail"),
-            "item_count": component.get("item_count"),
-            "completed_at_display": format_time(operation.completed_at),
-        }
-        for component in operation.component_results
-    ]

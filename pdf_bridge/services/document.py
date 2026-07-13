@@ -1,9 +1,7 @@
-"""Document upload, content, and lifecycle use-case implementation."""
+"""Document upload, content, and decision use-case implementation."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -13,28 +11,25 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
-    DocumentMutationResponse,
     IdempotencyKey,
+    UploadAcceptedResponse,
     UploadPreflightResponse,
-    UploadResponse,
 )
 from pdf_bridge.core.config import CollectionDefinition, Settings
-from pdf_bridge.persistence.models import Document, OperationType, QueueOperation
-from pdf_bridge.presentation.api_serializers import document_summary, duplicate_match
+from pdf_bridge.persistence.models import Document, OperationType
+from pdf_bridge.presentation.api_serializers import (
+    duplicate_match,
+    filename_warning,
+    upload_resource,
+)
 from pdf_bridge.services.catalog import configured_collection
 from pdf_bridge.services.errors import ServiceError
-from pdf_bridge.services.lifecycle import (
+from pdf_bridge.services.intake import (
     DuplicateDocumentError,
     LifecycleError,
-    PossibleDuplicateError,
     UploadRegistration,
-    can_serve_content,
-    cancel_queued_document,
-    finalize_cancelled_storage,
-    find_preflight_duplicates,
-    queue_document_deletion,
+    find_filename_warnings,
     register_staged_upload,
-    retry_failed_document,
 )
 from pdf_bridge.services.scanner import Scanner, ScanResult
 from pdf_bridge.services.storage import (
@@ -48,13 +43,12 @@ from pdf_bridge.services.storage import (
     validate_pdf_filename,
 )
 
-logger = logging.getLogger(__name__)
 _idempotency_adapter = TypeAdapter(IdempotencyKey)
 
 
 @dataclass(frozen=True, slots=True)
 class DocumentContent:
-    """Canonical content metadata needed by an HTTP or job controller."""
+    """Canonical content metadata needed by an HTTP controller."""
 
     path: Path
     filename: str
@@ -95,12 +89,12 @@ def validate_idempotency_key(*, header_value: str | None, form_value: str | None
 def preflight_upload(
     session: Session,
     *,
-    definitions: Sequence[CollectionDefinition],
+    definitions: list[CollectionDefinition],
     filename: str,
-    size_bytes: int,
+    size_bytes: int,  # part of the stable request contract; warnings are name-based
     collection_key: str,
 ) -> UploadPreflightResponse:
-    """Validate upload metadata and return possible catalog duplicates."""
+    """Validate upload metadata and return typed advisory filename warnings."""
 
     configured_collection(definitions, collection_key)
     try:
@@ -112,15 +106,12 @@ def preflight_upload(
             code="invalid-filename",
             title="Filename was rejected",
         ) from exc
-    matches = find_preflight_duplicates(
-        session,
-        normalized_filename=normalized,
-        size_bytes=size_bytes,
+    warnings = find_filename_warnings(
+        session, collection_key=collection_key, filename=filename
     )
     return UploadPreflightResponse(
         normalized_filename=normalized,
-        requires_confirmation=bool(matches),
-        possible_duplicates=[duplicate_match(document) for document in matches],
+        warnings=[filename_warning(document, match) for document, match in warnings],
     )
 
 
@@ -181,7 +172,6 @@ def register_upload(
     session: Session,
     *,
     prepared: PreparedUpload,
-    possible_duplicate_confirmed: bool,
     idempotency_key: str,
     actor_type: str,
     actor_id: str,
@@ -198,16 +188,11 @@ def register_upload(
         actor_type=actor_type,
         actor_id=actor_id,
         scan_result=prepared.scan_result,
-        allow_possible_duplicate=possible_duplicate_confirmed,
     )
 
 
 def discard_promoted_upload(registration: UploadRegistration | None) -> None:
-    """Remove canonical bytes promoted by an upload whose transaction failed.
-
-    Removal failures propagate so an orphaned canonical object is never
-    silently left behind; the transaction failure remains chained as context.
-    """
+    """Remove canonical bytes promoted by an upload whose transaction failed."""
 
     if registration is None or registration.promoted is None:
         return
@@ -220,7 +205,7 @@ def resolve_idempotency_conflict(
     prepared: PreparedUpload,
     idempotency_key: str,
     cause: Exception,
-) -> UploadResponse:
+) -> UploadAcceptedResponse:
     """Resolve a commit race as an idempotent replay or a stable conflict."""
 
     existing = session.scalar(select(Document).where(Document.idempotency_key == idempotency_key))
@@ -236,36 +221,49 @@ def resolve_idempotency_conflict(
             "The idempotency key was already used for a different file.",
             code="idempotency-key-conflict",
         ) from cause
-    operation = session.scalar(
-        select(QueueOperation)
-        .where(
-            QueueOperation.document_id == existing.id,
-            QueueOperation.operation_type == OperationType.INGEST,
-        )
-        .order_by(QueueOperation.attempt.desc(), QueueOperation.created_at.desc())
-        .limit(1)
+    operation = next(
+        (
+            item
+            for item in sorted(
+                existing.operations, key=lambda op: (op.attempt, op.created_at), reverse=True
+            )
+            if item.operation_type == OperationType.ANALYZE
+        ),
+        None,
     )
     if operation is None:
         raise cause
-    return UploadResponse(
-        document=document_summary(existing),
-        operation_id=operation.id,
+    return UploadAcceptedResponse(
+        upload=upload_resource(
+            existing,
+            operation=operation,
+            analysis=None,
+            replacement=None,
+            decision=None,
+        ),
         idempotent_replay=True,
     )
 
 
-def upload_response(registration: UploadRegistration) -> UploadResponse:
-    """Serialize a completed upload registration for the public API."""
+def upload_accepted_response(registration: UploadRegistration) -> UploadAcceptedResponse:
+    """Serialize a completed upload registration for the 202 response."""
 
-    return UploadResponse(
-        document=document_summary(registration.document),
-        operation_id=registration.operation.id,
+    return UploadAcceptedResponse(
+        upload=upload_resource(
+            registration.document,
+            operation=registration.operation,
+            analysis=None,
+            replacement=None,
+            decision=None,
+        ),
         idempotent_replay=registration.idempotent_replay,
     )
 
 
 def content(session: Session, *, document_id: UUID, storage_root: Path) -> DocumentContent:
     """Resolve clean, retained document content from canonical storage."""
+
+    from pdf_bridge.services.intake import can_serve_content
 
     document = session.get(Document, document_id)
     if document is None:
@@ -294,126 +292,9 @@ def content(session: Session, *, document_id: UUID, storage_root: Path) -> Docum
     return DocumentContent(path=path, filename=document.original_filename)
 
 
-def begin_queue_cancellation(
-    session: Session,
-    *,
-    operation_id: UUID,
-    actor_type: str,
-    actor_id: str,
-) -> tuple[Document, str | None]:
-    """Record the durable cleanup-pending phase of a queue cancellation."""
-
-    return cancel_queued_document(
-        session,
-        operation_id=operation_id,
-        actor_type=actor_type,
-        actor_id=actor_id,
-    )
-
-
-def remove_cancelled_storage(
-    *,
-    storage_root: Path,
-    document_id: UUID,
-    operation_id: UUID,
-    storage_key: str,
-    remove_file: Callable[..., None],
-) -> None:
-    """Remove canonical bytes for a cancellation already marked cleanup-pending."""
-
-    layout = StorageLayout.from_root(storage_root)
-    try:
-        remove_file(layout, storage_key, missing_ok=True)
-    except OSError as exc:
-        logger.exception(
-            "canonical cleanup failed",
-            extra={"document_id": str(document_id), "operation_id": str(operation_id)},
-        )
-        raise ServiceError(
-            "The cleanup remains pending and this cancellation can be retried.",
-            status=500,
-            code="storage-cleanup-failed",
-            title="Queue cancellation cleanup failed",
-        ) from exc
-
-
-def finish_queue_cancellation(
-    session: Session,
-    *,
-    document_id: UUID,
-    storage_key: str,
-    actor_type: str,
-    actor_id: str,
-) -> Document:
-    """Apply the catalog mutation after canonical cancellation bytes are gone."""
-
-    return finalize_cancelled_storage(
-        session,
-        document_id=document_id,
-        storage_key=storage_key,
-        actor_type=actor_type,
-        actor_id=actor_id,
-    )
-
-
-def mutation_response(
-    document: Document, *, operation_id: UUID | None = None
-) -> DocumentMutationResponse:
-    """Serialize a document and optional operation after a lifecycle mutation."""
-
-    return DocumentMutationResponse(
-        document=document_summary(document),
-        operation_id=operation_id,
-    )
-
-
-def retry_queue_item(
-    session: Session,
-    *,
-    operation_id: UUID,
-    actor_type: str,
-    actor_id: str,
-) -> DocumentMutationResponse:
-    """Create and serialize a retry attempt for a failed queue operation."""
-
-    operation = retry_failed_document(
-        session,
-        operation_id=operation_id,
-        actor_type=actor_type,
-        actor_id=actor_id,
-    )
-    return mutation_response(operation.document, operation_id=operation.id)
-
-
-def request_deletion(
-    session: Session,
-    *,
-    document_id: UUID,
-    actor_type: str,
-    actor_id: str,
-    reason: str | None,
-) -> DocumentMutationResponse:
-    """Queue and serialize deletion of an eligible document."""
-
-    operation = queue_document_deletion(
-        session,
-        document_id=document_id,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        reason=reason,
-    )
-    return mutation_response(operation.document, operation_id=operation.id)
-
-
 def duplicate_error_extra(exc: LifecycleError) -> dict | None:
     """Serialize duplicate-specific lifecycle details for the HTTP error contract."""
 
     if isinstance(exc, DuplicateDocumentError):
         return {"duplicate": duplicate_match(exc.document).model_dump(mode="json")}
-    if isinstance(exc, PossibleDuplicateError):
-        return {
-            "possible_duplicates": [
-                duplicate_match(document).model_dump(mode="json") for document in exc.documents
-            ]
-        }
     return None

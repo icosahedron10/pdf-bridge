@@ -16,17 +16,17 @@ const libraryOperator: GuidePage = {
   category: "Role guide",
   title: "Library operator",
   summary:
-    "Use the browser workspace to place documents in the right collection, follow processing, search available content, and request lifecycle changes.",
+    "Use the browser workspace to upload and analyze PDFs, inspect advisory evidence, make document decisions, and follow durable work to completion.",
   facts: [
     { term: "Primary surface", detail: "Browser UI" },
-    { term: "Owns", detail: "Collection choice and document-level decisions" },
-    { term: "Does not own", detail: "Parsing, indexes, Jenkins, or chatbot authorization" },
+    { term: "Owns", detail: "Collection choice and Keep, Replace, Cancel, or delete decisions" },
+    { term: "Does not own", detail: "Worker internals, Qdrant administration, or chatbot authorization" },
   ],
   toc: [
     { id: "before", label: "Before you begin" },
     { id: "normal-path", label: "Normal path" },
     { id: "what-you-see", label: "What you see" },
-    { id: "guardrails", label: "Actions and guardrails" },
+    { id: "decisions", label: "Decision rules" },
     { id: "failure", label: "When something goes wrong" },
     { id: "ownership", label: "Where ownership ends" },
     { id: "implementation", label: "Implementation map" },
@@ -36,24 +36,27 @@ const libraryOperator: GuidePage = {
       <section id="before">
         <h2>Before you begin</h2>
         <p>
-          The root URL redirects to <code>/library</code>. The persistent application navigation
-          links to Collections, Queue, and Upload. These are responsibility views, not permission
-          roles: the POC gives every browser user the same capabilities.
+          The root URL redirects to <code>/library</code>. Collections, Queue, and Upload are
+          responsibility views, not permission roles: every trusted browser operator currently has
+          the same capability set. Collection audience labels help place content but do not
+          authorize chatbot users.
         </p>
         <p>
-          Collection definitions come from deployment configuration. Their audience labels help
-          you place content, but they do not authorize chatbot users.
+          Choose the collection deliberately. Exact bytes are blocked only when that selected
+          collection already retains them; the same PDF may exist in a different collection by
+          design.
         </p>
       </section>
 
       <section id="normal-path">
         <h2>Normal path</h2>
         <div className="journey">
-          <div><span>1. Your action</span><strong>Open Collections and choose the destination corpus.</strong><p>Review the audience label, description, and available and processing counts.</p></div>
-          <div><span>2. Your action</span><strong>Open Upload, keep that collection selected, and choose PDFs.</strong><p>Preflight checks name and size. A possible duplicate requires your explicit confirmation.</p></div>
-          <div><span>3. System response</span><strong>The bridge copies the spooled part into private quarantine, validates, hashes, scans, and promotes it atomically.</strong><p>A clean PDF enters Queue as <code>QUEUED</code> with its immutable collection. Rejected bytes never become available content.</p></div>
-          <div><span>4. Waiting</span><strong>Jenkins claims and stages work for the downstream pipeline.</strong><p>Queue shows the latest attempt as queued, claimed, staged, failed, or in cleanup.</p></div>
-          <div><span>5. Result</span><strong>The document becomes available or remains retryable.</strong><p>Use the document ledger for operation, batch, component, and audit evidence.</p></div>
+          <div><span>1. Select</span><strong>Choose the destination collection, then choose one or more PDFs.</strong><p>The page checks up to three requests at once and keeps each file independent.</p></div>
+          <div><span>2. Preflight</span><strong>Review typed filename-family warnings.</strong><p>These collection-scoped warnings are advisory. They do not block upload or ask for a duplicate confirmation.</p></div>
+          <div><span>3. Upload</span><strong>Start “Upload and analyze.”</strong><p>The bridge streams, hashes, validates, and ClamAV-scans each file. Clean bytes are promoted atomically and accepted as durable analysis work.</p></div>
+          <div><span>4. Follow</span><strong>Leave the workspace open or return later.</strong><p>All active rows poll together. Open work is restored from the server after a refresh or process restart.</p></div>
+          <div><span>5. Review</span><strong>Inspect every qualifying candidate and its paginated evidence.</strong><p>A clear analysis ingests automatically. Filename, semantic, contradiction, overflow, or provider-outage findings wait for a decision.</p></div>
+          <div><span>6. Decide</span><strong>Choose Keep, Replace, or Cancel.</strong><p>Keep accepts advisory evidence, Replace removes one eligible current document first, and Cancel purges retained unpublished content.</p></div>
         </div>
       </section>
 
@@ -62,27 +65,25 @@ const libraryOperator: GuidePage = {
         <DocumentationTable
           headings={["Page", "Experience"]}
           rows={[
-            [<code key="a">/library</code>, "Every configured collection plus authoritative catalog counts; root search adds one retrieval total per collection"],
-            [<code key="b">/library/&lt;collection&gt;</code>, "Browse available documents or view collection-scoped search hits, snippets, and scores"],
-            [<code key="c">/upload</code>, "Upload limits, scanner readiness, collection choice, per-file preflight, progress, and result"],
-            [<code key="d">/queue</code>, "Latest active attempt per document, filters, batch context, bounded error, and last Jenkins claim"],
-            [<code key="e">/documents/&lt;uuid&gt;</code>, "Collection, scan result, hash, uploader, operation history, components, and audit events"],
+            [<code key="a">/library</code>, "Configured collections, authoritative catalog counts, and optional retrieval totals"],
+            [<code key="b">/library/&lt;collection&gt;</code>, "Available documents or collection-scoped keyword, semantic, and hybrid results"],
+            [<code key="c">/upload</code>, "Preflight warnings, scan/upload progress, extraction and comparison phases, evidence, decisions, retries, and restored open work"],
+            [<code key="d">/queue</code>, "Current processing and failure states with the latest operation phase and bounded error"],
+            [<code key="e">/documents/&lt;uuid&gt;</code>, "Collection, state, analysis summary, immutable decisions, operation attempts, and content-free audit evidence"],
           ]}
         />
       </section>
 
-      <section id="guardrails">
-        <h2>Actions and guardrails</h2>
+      <section id="decisions">
+        <h2>Decision rules</h2>
         <ul>
-          <li>Choose a collection before upload; there is intentionally no default.</li>
-          <li>Exact active-content duplicates are blocked; name-and-size matches require confirmation.</li>
-          <li>Collection placement becomes immutable when the document is queued.</li>
-          <li>Cancel only an unclaimed queued ingest.</li>
-          <li>Retry only the current failed ingest or deletion attempt.</li>
-          <li>For cancellation cleanup, use the browser Retry cleanup action after storage recovers.</li>
-          <li>For deletion cleanup, have the Jenkins/platform side replay the identical result report.</li>
-          <li>Preview only clean, retained PDFs in eligible lifecycle states.</li>
-          <li>Deletion remains visible until all downstream components and canonical cleanup finish.</li>
+          <li>Filename, normalized-text, dense, BM25, LLM, contradiction, and outage findings are advisory.</li>
+          <li>Encrypted, malformed, image-only, insufficient-text, and over-budget PDFs are rejected without override. OCR is out of scope.</li>
+          <li><strong>Keep</strong> records an immutable advisory override and queues publication. A provider outage may still leave publication retryable.</li>
+          <li><strong>Replace</strong> requires exactly one eligible, current, same-collection ingested candidate.</li>
+          <li>Replacement can create an availability gap: the old document is verified absent before the new document is published. It never permits old/new overlap.</li>
+          <li><strong>Cancel</strong> removes canonical bytes, private analysis artifacts, and screening points. It does not leave retrievable content.</li>
+          <li>Every decision names the displayed analysis revision. Reload and review again if the server reports that revision or collection data is stale.</li>
         </ul>
       </section>
 
@@ -91,13 +92,13 @@ const libraryOperator: GuidePage = {
         <DocumentationTable
           headings={["What you see", "Meaning", "Correct response"]}
           rows={[
-            ["Scanner unavailable", "The upload trust gate is down", "Wait for readiness; do not request a bypass"],
-            ["Claimed item cannot be cancelled", "Jenkins owns the active attempt", "Let it complete, then request deletion if needed"],
-            [<code key="if">INGEST_FAILED</code>, "Parser or dependency failed operationally", "Repair the named cause, then Retry"],
-            [<code key="df">DELETE_FAILED</code>, "At least one downstream removal failed", "Repair that component, then Retry"],
-            [<code key="cc">CANCEL_CLEANUP</code>, "Cancellation committed but canonical unlink failed", "Repair storage, then use Retry cleanup"],
-            [<code key="dc">DELETE_CLEANUP</code>, "Downstream deletion succeeded but canonical unlink failed", "Repair storage, then replay the identical Jenkins result"],
-            ["Search error", "Retrieval was unavailable or failed correlation", "Keep using catalog pages; no partial results are shown"],
+            ["Scanner unavailable", "The synchronous malware gate could not complete", "Wait for ClamAV readiness; do not request a bypass"],
+            [<code key="r">REJECTED</code>, "The PDF failed a non-overridable parser or text-quality gate", "Obtain a clean text-bearing PDF; do not force its state"],
+            [<code key="if">INGEST_FAILED</code>, "Publication did not complete, but retained work can be retried", "Repair the named embedding or Qdrant cause, then Retry work"],
+            [<code key="rf">REPLACE_FAILED</code>, "Safe replacement stopped at a durable phase", "Confirm whether the old document is still active, repair the cause, then Retry work"],
+            [<code key="df">DELETE_FAILED</code>, "Active removal or verification failed", "Repair Qdrant or storage and retry the document deletion"],
+            [<code key="cf">CLEANUP_FAILED</code>, "A purge step failed after content became unavailable", "Repair storage or the index and retry cleanup"],
+            ["Search error", "Retrieval was unavailable or failed strict correlation", "Use catalog pages while the complete result remains suppressed"],
           ]}
         />
       </section>
@@ -105,9 +106,10 @@ const libraryOperator: GuidePage = {
       <section id="ownership">
         <h2>Where ownership ends</h2>
         <p>
-          You decide collection placement, duplicate intent, and document lifecycle actions. You do
-          not parse PDFs, operate Jenkins, edit Qdrant, or decide which chatbot users may retrieve a
-          collection. Correct a placement mistake by completing deletion and uploading again.
+          You own collection placement and explicit lifecycle decisions. You do not edit SQL,
+          change operation leases, infer candidate eligibility, mutate Qdrant, or decide which
+          chatbot users may retrieve a collection. Correct a placement mistake through supported
+          cancellation or verified deletion, then upload again.
         </p>
       </section>
 
@@ -115,13 +117,13 @@ const libraryOperator: GuidePage = {
         <h2>Implementation map</h2>
         <ModuleReferences
           items={[
-            { path: "pdf_bridge/controllers/web.py", purpose: "Browser routes and transport binding" },
-            { path: "pdf_bridge/services/web_page.py", purpose: "Collection, queue, document, and search page data" },
-            { path: "pdf_bridge/managers/document.py", purpose: "Upload and lifecycle transaction boundaries" },
-            { path: "pdf_bridge/services/document.py", purpose: "Preflight, quarantine copy, scan, and atomic promotion workflow" },
-            { path: "pdf_bridge/services/lifecycle.py", purpose: "Document and operation transition rules" },
-            { path: "pdf_bridge/templates/", purpose: "Browser views" },
-            { path: "tests/test_browser.py", purpose: "End-to-end coworker workflows" },
+            { path: "pdf_bridge/templates/upload.html", purpose: "Upload, evidence, decision, replacement, and retry controls" },
+            { path: "pdf_bridge/static/upload.js", purpose: "Three-request pool, grouped polling, safe text rendering, and restored work" },
+            { path: "pdf_bridge/controllers/api.py", purpose: "Preflight, upload, polling, analysis, decision, retry, cancellation, and deletion routes" },
+            { path: "pdf_bridge/managers/document.py", purpose: "Mutation transaction and compensation boundaries" },
+            { path: "pdf_bridge/services/intake.py", purpose: "Duplicate, decision, replacement eligibility, retry, and deletion rules" },
+            { path: "pdf_bridge/services/catalog.py", purpose: "Upload workspace, evidence pagination, and catalog eligibility" },
+            { path: "tests/test_browser.py", purpose: "Browser workflow and accessibility coverage" },
           ]}
         />
       </section>
@@ -129,219 +131,127 @@ const libraryOperator: GuidePage = {
   ),
 };
 
-const jenkinsOwner: GuidePage = {
+const semanticIntakeOwner: GuidePage = {
   category: "Role guide",
-  title: "Jenkins owner",
+  title: "Semantic intake owner",
   summary:
-    "Use the supported CLI to claim work, verify every downloaded byte and path, stage an immutable batch, and submit the pipeline report.",
+    "Own the internal worker’s extraction, comparison, provider, Qdrant, recovery, and replacement behavior without bypassing durable lifecycle state.",
   facts: [
-    { term: "Primary surface", detail: "pdf-bridge-job CLI and Jenkinsfile" },
-    { term: "Owns", detail: "Authenticated transport and durable staging" },
-    { term: "Hands off to", detail: "The existing RAG pipeline" },
+    { term: "Primary surface", detail: "Worker telemetry, SQL operations, provider health, and Qdrant" },
+    { term: "Runtime", detail: "Two worker slots inside one Litestar process" },
+    { term: "Safety boundary", detail: "No transaction spans parser, provider, or Qdrant calls" },
   ],
   toc: [
-    { id: "before", label: "Before you begin" },
-    { id: "normal-path", label: "Normal path" },
-    { id: "what-you-see", label: "What you see" },
-    { id: "guardrails", label: "Actions and guardrails" },
-    { id: "failure", label: "When something goes wrong" },
-    { id: "ownership", label: "Where ownership ends" },
+    { id: "runtime", label: "Worker runtime" },
+    { id: "analysis", label: "Analysis path" },
+    { id: "indexing", label: "Index publication" },
+    { id: "replacement", label: "Safe replacement" },
+    { id: "recovery", label: "Recovery" },
+    { id: "parser", label: "Parser boundary" },
     { id: "implementation", label: "Implementation map" },
   ],
   content: (
     <>
-      <section id="before">
-        <h2>Before you begin</h2>
+      <section id="runtime">
+        <h2>Worker runtime</h2>
         <p>
-          Use a controlled Linux agent with Python 3.12 and an exact released wheel. Keep the
-          handoff root outside the Jenkins workspace and synchronized directories. Inject the job
-          token from Jenkins credentials; keep the bridge URL and a separate allowed-host pin as
-          reviewed pipeline constants.
+          Application lifespan starts and stops one <code>AnalysisWorker</code>. It has two execution
+          slots, unique process-scoped ownership, SQL leases and heartbeats, and a process-local lock
+          per collection. Expired <code>RUNNING</code> work is reclaimed during ordinary polling.
         </p>
-        <CodeBlock>{"pdf-bridge-job pull \\\n  --base-url https://pdf-bridge.internal \\\n  --allowed-host pdf-bridge.internal \\\n  --destination /srv/rag/pdf-bridge-handoff \\\n  --request-id \"$BUILD_TAG\" \\\n  --result-file pull-result.json"}</CodeBlock>
+        <p>
+          Operations are <code>ANALYZE</code>, <code>INGEST</code>, <code>DELETE</code>, or
+          <code>CLEANUP</code>. Each external step is bracketed by short transactions that record a
+          visible phase, lease, attempt, audit event, or outbox mutation. Never hold SQLite open
+          across parsing, model inference, or Qdrant I/O.
+        </p>
       </section>
 
-      <section id="normal-path">
-        <h2>Normal path</h2>
+      <section id="analysis">
+        <h2>Analysis path</h2>
         <div className="journey">
-          <div><span>1. Your action</span><strong>Run pull with a stable Jenkins request ID.</strong><p>Reuse the same ID for retries of the same build. A no-work claim returns a zero-operation summary.</p></div>
-          <div><span>2. System response</span><strong>The bridge leases up to the configured limit and returns a version 2 manifest.</strong><p>The manifest supplies operation/document IDs, type, collection, size, SHA-256, and the exact relative path.</p></div>
-          <div><span>3. Client response</span><strong>The CLI writes a temporary batch directory and verifies it completely.</strong><p>Paths, byte counts, hashes, and the local manifest are checked before one atomic rename.</p></div>
-          <div><span>4. Client response</span><strong>The CLI acknowledges the exact operation set as staged.</strong><p>The claim lease protects download through staging; it does not bound pipeline execution.</p></div>
-          <div><span>5. Handoff</span><strong>Invoke the existing pipeline with the immutable staged manifest.</strong><p>Keep the batch directory read-only and write results elsewhere.</p></div>
-          <div><span>6. Your action</span><strong>Submit the complete result with the matching pull summary.</strong><p>The CLI validates batch identity and contract shape before contacting the bridge.</p></div>
+          <div><span>Extract</span><strong>Run pinned pypdf in a child process under hard budgets.</strong><p>Preserve page mapping and reject encryption, malformed input, insufficient text, or any page, character, chunk, CPU, memory, or wall-time overrun.</p></div>
+          <div><span>Chunk</span><strong>Create stable paragraph and sentence-aware chunks.</strong><p>Chunks target 400 lexical tokens with 60-token overlap and a 3,500-character hard cap; truncation is forbidden.</p></div>
+          <div><span>Compare</span><strong>Search the selected collection’s active alias and private screening index.</strong><p>Deterministic text, filename, cosine, and repeated BM25 rules choose candidates; reciprocal rank fusion orders them.</p></div>
+          <div><span>Explain</span><strong>Classify the top candidates twice.</strong><p>Independent temperature-zero classifier and skeptical-verifier calls add validated, page-referenced explanation only.</p></div>
+          <div><span>Route</span><strong>Publish clear work or hold advisory evidence.</strong><p>Any candidate, filename warning, qualifying overflow, or incomplete semantic check enters review. Reviews do not expire.</p></div>
         </div>
       </section>
 
-      <section id="what-you-see">
-        <h2>What you see</h2>
-        <DocumentationTable
-          headings={["Artifact", "Important fields"]}
-          rows={[
-            ["Pull summary", "batch ID, request ID, operation count, batch directory, manifest SHA-256, replay flag"],
-            ["manifest.json", "version 2, lease times, and one canonical operation record per item"],
-            ["Report response", "batch aggregate state, successful/failed counts, and an idempotent-replay flag"],
-            ["CLI error", "Safe detail plus bridge request ID when available"],
-          ]}
-        />
-      </section>
-
-      <section id="guardrails">
-        <h2>Actions and guardrails</h2>
+      <section id="indexing">
+        <h2>Index publication</h2>
+        <p>
+          Each logical collection has an epoch-versioned physical collection behind its stable
+          <code>collection_key</code> alias. Unresolved and not-yet-published chunks live in
+          <code>pdf-bridge-screening-v1</code>. Every point uses a deterministic UUIDv5 ID and carries
+          both <code>content_dense</code> and <code>content_bm25</code> vectors.
+        </p>
         <ul>
-          <li>The allowed hostname is validated before the bearer token is read or sent.</li>
-          <li>Redirects are disabled; non-loopback HTTP requires an explicit diagnostic override.</li>
-          <li>Use the server-issued relative path; the display filename never determines a path.</li>
-          <li>An existing final batch is accepted only after manifest and file revalidation.</li>
-          <li>Stage acknowledgement must contain the complete exact operation set.</li>
-          <li>A no-work pull cannot authorize a report.</li>
-          <li>Disable concurrent builds for one bridge instance.</li>
+          <li>Active preparation writes <code>published=false</code>; retrieval cannot see it.</li>
+          <li>SQL outbox entries record ordered UPSERT, PUBLISH, and DELETE intent before mutation.</li>
+          <li>Qdrant writes use strong ordering, wait for apply, and verify the exact document point count.</li>
+          <li>Only a successful publication boundary flips complete active points to <code>published=true</code>.</li>
+          <li>Screening queries require <code>screening=true</code>; active queries require <code>published=true</code> and the current schema version.</li>
         </ul>
       </section>
 
-      <section id="failure">
-        <h2>When something goes wrong</h2>
+      <section id="replacement">
+        <h2>Safe replacement</h2>
+        <ol className="procedure">
+          <li>Prepare or regenerate the new document’s complete dense and sparse vectors without publishing them.</li>
+          <li>Delete the old document’s active points through the outbox and verify an exact count of zero.</li>
+          <li>Purge the old source and analysis artifacts and commit its <code>DELETED</code> tombstone.</li>
+          <li>Write and publish the new active points, verify their count, then remove its screening points.</li>
+          <li>Mark the replacement and new document successful.</li>
+        </ol>
+        <Callout title="Availability gap is intentional" tone="warning">
+          <p>
+            An old-delete failure blocks new publication. A failure after verified old deletion
+            leaves the new document retryable and the old document absent. Never restore the old
+            content ad hoc and never allow old and new points to overlap.
+          </p>
+        </Callout>
+      </section>
+
+      <section id="recovery">
+        <h2>Recovery</h2>
         <DocumentationTable
-          headings={["Failure point", "Correct recovery"]}
+          headings={["Evidence", "Interpretation", "Action"]}
           rows={[
-            ["Bridge unavailable before claim", "Retry the same build and request ID"],
-            ["Interrupted download", "Rerun pull with the same request ID; bytes are reverified"],
-            ["Lease expired before staging", "After requeue, start a new claim with a new request ID"],
-            ["Staged batch did not run", "Run the same staged directory; do not claim replacement work"],
-            ["Lost result response", "Resubmit the identical report"],
-            ["Unsafe path, checksum mismatch, or changed existing batch", "Stop and preserve evidence"],
+            ["Expired RUNNING lease", "The owning process or thread no longer heartbeats", "Confirm the prior owner is gone, restart one process, and let ordinary polling reclaim it"],
+            ["Pending outbox entry", "SQL intent may be ahead of Qdrant, or Qdrant may have applied before acknowledgement", "Replay idempotently and trust exact point-count verification"],
+            ["Incomplete analysis", "Embedding, Qdrant, or classifier checks did not all complete", "Expose the reason for review; do not convert it into a clear result"],
+            ["Keep plus publication failure", "The semantic decision is durable but indexing is incomplete", "Repair the provider or index and retry without requesting another decision"],
+            ["DELETING_EXISTING", "Replacement has not yet permitted new active points", "Repair old deletion and prove zero count before advancing"],
+            ["INGESTING_NEW", "The old document is intentionally gone", "Repair and retry new publication; preserve the recorded ordering"],
           ]}
         />
       </section>
 
-      <section id="ownership">
-        <h2>Where ownership ends</h2>
-        <p>
-          Jenkins owns authenticated claim, verified download, staging, and report submission. It
-          does not choose collection placement, parse PDFs, invent component results, or mutate
-          catalog state directly.
-        </p>
+      <section id="parser">
+        <h2>Parser boundary</h2>
+        <Callout title="A limited subprocess is not a complete sandbox" tone="warning">
+          <p>
+            Linux CPU and address-space limits reduce blast radius, and the child has no provider
+            responsibility, but it still shares the host kernel and is not a full syscall or
+            filesystem isolation boundary. Treat unexpected parser crashes as security-relevant and
+            require disposable least-privilege isolation before production use.
+          </p>
+        </Callout>
       </section>
 
       <section id="implementation">
         <h2>Implementation map</h2>
         <ModuleReferences
           items={[
-            { path: "pdf_bridge/controllers/job_cli.py", purpose: "pull and report command declarations" },
-            { path: "pdf_bridge/managers/job_client.py", purpose: "Client workflow orchestration" },
-            { path: "pdf_bridge/services/job_http.py", purpose: "Host pinning, credentials, TLS, and API calls" },
-            { path: "pdf_bridge/services/job_staging.py", purpose: "Canonical path checks, hash verification, atomic staging, and report parsing" },
-            { path: "pdf_bridge/contracts/job_contracts.py", purpose: "Client options, pull summary, report file, and client error contracts" },
-            { path: "pdf_bridge/services/job_staging.py", purpose: "Staged manifest models plus local verification and promotion" },
-            { path: "Jenkinsfile.example", purpose: "Reference job lifecycle and credential handling" },
-          ]}
-        />
-      </section>
-    </>
-  ),
-};
-
-const ragPipelineOwner: GuidePage = {
-  category: "Role guide",
-  title: "RAG pipeline owner",
-  summary:
-    "Consume every staged operation, preserve authoritative collection routing, and produce one strict result for every operation.",
-  facts: [
-    { term: "Primary surface", detail: "Version 2 staged manifest and report.json" },
-    { term: "Owns", detail: "Parsing, derived files, BM25, dense indexes, and downstream deletion" },
-    { term: "Does not own", detail: "Canonical bridge storage or collection placement" },
-  ],
-  toc: [
-    { id: "inputs", label: "Inputs" },
-    { id: "normal-path", label: "Normal path" },
-    { id: "results", label: "Result contract" },
-    { id: "deletion", label: "Deletion results" },
-    { id: "failure", label: "When something goes wrong" },
-    { id: "ownership", label: "Where ownership ends" },
-    { id: "implementation", label: "Implementation map" },
-  ],
-  content: (
-    <>
-      <section id="inputs">
-        <h2>Inputs</h2>
-        <p>
-          Read the staged <code>manifest.json</code>. Each item carries an operation ID, bridge
-          document UUID, operation type, display filename, size and hash, immutable collection key,
-          exact path <code>pdfs/{`{collection_key}`}/{`{document_id}`}.pdf</code>, and an optional
-          download URL.
-        </p>
-        <p>
-          An <code>INGEST</code> item has a verified PDF at that path. A <code>DELETE</code> item has
-          routing metadata but no downloaded file.
-        </p>
-      </section>
-
-      <section id="normal-path">
-        <h2>Normal path</h2>
-        <div className="journey">
-          <div><span>1. Your action</span><strong>Process every manifest operation independently.</strong><p>Keep the staged directory read-only so a replay can be verified.</p></div>
-          <div><span>2. Ingest</span><strong>Parse the PDF and durably create every downstream component.</strong><p>PDF source, Markdown, BM25, and dense must all succeed before the operation succeeds.</p></div>
-          <div><span>3. Delete</span><strong>Remove PDF source, Markdown, BM25, and dense data.</strong><p>Use the manifest collection and bridge UUID; never infer routing from a filename.</p></div>
-          <div><span>4. Your output</span><strong>Atomically write one complete version 2 report.</strong><p>Include exactly one typed result for every operation, even if the pipeline exits nonzero.</p></div>
-        </div>
-        <p>Keep the durable downstream PDF at the exact collection-only path supplied by the bridge.</p>
-      </section>
-
-      <section id="results">
-        <h2>Result contract</h2>
-        <DocumentationTable
-          headings={["Result", "Component rule", "Error rule"]}
-          rows={[
-            [<code key="s">success: true</code>, "PDF source, Markdown, BM25, and dense all succeeded", "Error is forbidden"],
-            [<code key="f">success: false</code>, "Report the actual state of all four components", "A nonblank bounded error is required"],
-          ]}
-        />
-        <p>
-          Encrypted content, required OCR, no extractable text, parser crashes, and component write
-          failures are ordinary failed ingestion results when they prevent complete success.
-        </p>
-      </section>
-
-      <section id="deletion">
-        <h2>Deletion results</h2>
-        <p>
-          A successful delete requires <code>pdf_source</code>, <code>markdown</code>,
-          <code>bm25</code>, and <code>dense</code> all to succeed. A failure in any component keeps
-          the bridge document in a retryable delete state. Treat already-absent downstream targets
-          as successful so replay is idempotent.
-        </p>
-      </section>
-
-      <section id="failure">
-        <h2>When something goes wrong</h2>
-        <ul>
-          <li>Write the complete report even if one operation fails, then allow the build to remain failed.</li>
-          <li>A crash before a complete report leaves the batch staged for controlled replay.</li>
-          <li>Never fabricate success rows to unblock reporting.</li>
-          <li>Exclude stack dumps, secrets, document contents, and local paths from bounded errors.</li>
-          <li>If a report response is lost, the Jenkins owner resubmits the identical report.</li>
-        </ul>
-      </section>
-
-      <section id="ownership">
-        <h2>Where ownership ends</h2>
-        <p>
-          The pipeline owns parsing, derived storage, BM25, dense/Qdrant, and downstream deletion.
-          PDF Bridge owns canonical clean bytes, leasing, catalog truth, and audit. The pipeline
-          must not change collection placement or omit <code>document_id</code> and
-          <code>collection_key</code> from chunk payloads.
-        </p>
-      </section>
-
-      <section id="implementation">
-        <h2>Implementation map</h2>
-        <ModuleReferences
-          items={[
-            { path: "docs/jenkins.md", purpose: "Manifest, result, component, and recovery contract" },
-            { path: "pdf_bridge/contracts/schemas.py", purpose: "Pipeline components and result validation" },
-            { path: "pdf_bridge/controllers/jobs.py", purpose: "Server-side manifest, download, staging, and results endpoints" },
-            { path: "pdf_bridge/services/lifecycle.py", purpose: "Application of ingest, failure, and deletion results" },
-            { path: "tests/test_pipeline_flow.py", purpose: "End-to-end batch and pipeline transition coverage" },
+            { path: "pdf_bridge/managers/worker.py", purpose: "Worker lifecycle, leases, phases, outbox sequencing, and replacement recovery" },
+            { path: "pdf_bridge/services/extraction.py", purpose: "Parent-side parser process control and limits" },
+            { path: "pdf_bridge/services/extraction_child.py", purpose: "Page-mapped pypdf extraction inside the child" },
+            { path: "pdf_bridge/services/chunking.py", purpose: "Deterministic text normalization and chunking" },
+            { path: "pdf_bridge/services/candidates.py", purpose: "Deterministic candidate thresholds and rank fusion" },
+            { path: "pdf_bridge/services/classification.py", purpose: "Structured classifier/verifier calls and quote validation" },
+            { path: "pdf_bridge/services/vector_index.py", purpose: "Active/screening collections, filters, strong writes, publication, and counts" },
+            { path: "tests/test_worker_lifecycle.py", purpose: "Lease, crash, publication, ordering, and replacement regression coverage" },
           ]}
         />
       </section>
@@ -353,114 +263,146 @@ const platformOperator: GuidePage = {
   category: "Role guide",
   title: "Platform operator",
   summary:
-    "Configure and run the single-process POC, keep scanner and storage dependencies healthy, and preserve the catalog and canonical objects as one dataset.",
+    "Run the supported single-process POC, protect its storage and credentials, monitor worker dependencies, and execute recovery or the coordinated empty reset.",
   facts: [
-    { term: "Primary surface", detail: "Docker Compose, environment, health, and runbook" },
-    { term: "Owns", detail: "Runtime, secrets, storage, backup, maintenance, and ClamAV availability" },
-    { term: "Does not own", detail: "Parser behavior, ranking, or chatbot authorization" },
+    { term: "Supported topology", detail: "Linux, Docker Compose, SQLite, one Uvicorn process" },
+    { term: "Worker", detail: "Lifespan-owned with two slots" },
+    { term: "Recovery unit", detail: "SQLite, canonical PDFs, private analysis storage, and Qdrant snapshots" },
   ],
   toc: [
-    { id: "before", label: "Before you begin" },
-    { id: "normal-path", label: "Normal path" },
-    { id: "what-you-see", label: "What you see" },
-    { id: "guardrails", label: "Actions and guardrails" },
-    { id: "failure", label: "When something goes wrong" },
-    { id: "ownership", label: "Where ownership ends" },
+    { id: "topology", label: "Topology" },
+    { id: "startup", label: "Startup and health" },
+    { id: "storage", label: "Storage and backups" },
+    { id: "recovery", label: "Operational recovery" },
+    { id: "import", label: "Historical import" },
+    { id: "reset", label: "Coordinated reset" },
+    { id: "monitor", label: "Daily checks" },
     { id: "implementation", label: "Implementation map" },
   ],
   content: (
     <>
-      <section id="before">
-        <h2>Before you begin</h2>
+      <section id="topology">
+        <h2>Topology</h2>
         <p>
-          The supported topology is Linux and Docker Compose. Configure independent session and job
-          secrets, allowed hosts, identity mode, collection registry, external storage root,
-          upload chunk size, ClamAV connection, claim lease, and optional retrieval connection and
-          timeout. JSON list values must remain valid JSON.
+          Run exactly one Uvicorn process. SQLite and process-local collection locks are deliberate
+          POC constraints; a second application process can violate collection freshness and worker
+          ownership. Horizontal scaling requires a different database and distributed coordination
+          design.
         </p>
-        <Callout title="One process while the catalog is SQLite" tone="warning">
+        <DocumentationTable
+          headings={["Dependency", "Bridge access", "Exposure rule"]}
+          rows={[
+            ["ClamAV 1.5.3", "Private INSTREAM and PING", "Do not publish port 3310 or mount canonical storage"],
+            ["Embedding endpoint", "Private OpenAI-compatible /embeddings", "Pin model ID and dimension; use a separate secret"],
+            ["Classifier endpoint", "Private OpenAI-compatible /chat/completions", "Pin independent classifier and verifier IDs"],
+            ["Qdrant 1.18.1", "Administrative API key", "Keep on a private network; retrieval receives active-only scoped JWTs"],
+            ["Retrieval service", "Stable authenticated search request", "Use organization-managed TLS when traffic leaves the trusted host"],
+          ]}
+        />
+      </section>
+
+      <section id="startup">
+        <h2>Startup and health</h2>
+        <p>
+          Startup validates settings, creates protected storage directories, applies the reviewed
+          migration, validates configured collection references, then starts the worker during app
+          lifespan. Shutdown stops the worker before closing provider clients and disposing the
+          database engine.
+        </p>
+        <DocumentationTable
+          headings={["Endpoint", "Meaning"]}
+          rows={[
+            [<code key="l">/api/v1/health/live</code>, "The process can answer"],
+            [<code key="r">/api/v1/health/ready</code>, "SQLite, writable storage directories, and ClamAV PING are healthy"],
+            [<code key="d">/api/v1/health/dependencies</code>, "The same detailed dependency body for restricted operator diagnosis"],
+          ]}
+        />
+        <p>
+          Readiness does not prove ClamAV signature freshness, worker progress, model availability,
+          Qdrant integrity, or retrieval conformance. Monitor those separately.
+        </p>
+      </section>
+
+      <section id="storage">
+        <h2>Storage and backups</h2>
+        <CodeBlock>{"<storage-root>/\n  catalog.sqlite3\n  objects/\n  analysis/\n  temporary/\n  quarantine/"}</CodeBlock>
+        <p>
+          UUID-derived object keys, not display filenames, determine paths. Back up SQLite,
+          canonical objects, and compressed analysis artifacts as one consistent unit. Record the
+          application version, migration revision, and pipeline fingerprint. Capture Qdrant through
+          its supported snapshot procedure and record the active alias-to-epoch map.
+        </p>
+      </section>
+
+      <section id="recovery">
+        <h2>Operational recovery</h2>
+        <ol className="procedure">
+          <li>Confirm the prior process or worker thread is gone before allowing an expired lease to recover.</li>
+          <li>Identify the document, operation, phase, attempt, replacement, and pending outbox IDs.</li>
+          <li>Repair storage, ClamAV, provider, Qdrant, alias, or capacity faults without editing lifecycle rows.</li>
+          <li>Use the supported retry endpoint for retained failed work.</li>
+          <li>Reconcile exact active and screening counts, payload flags, aliases, artifacts, and catalog state.</li>
+        </ol>
+      </section>
+
+      <section id="import">
+        <h2>Historical import</h2>
+        <p>
+          <code>pdf-bridge import-manifest</code> accepts strict manifest version 3. Dry run bounds,
+          hashes, validates, and scans every source without creating state. Reviewed apply promotes
+          bytes in one compensated transaction and creates ordinary <code>ANALYZING</code> documents
+          with <code>ANALYZE</code> operations.
+        </p>
+        <CodeBlock>{"pdf-bridge import-manifest historical-v3.json \\\n  --source-root /approved/source-pdfs \\\n  --dry-run \\\n  --actor-id change-1234\n\npdf-bridge import-manifest historical-v3.json \\\n  --source-root /approved/source-pdfs \\\n  --apply \\\n  --actor-id change-1234"}</CodeBlock>
+        <p>
+          Import does not synthesize active rows and is not a backup. Follow every imported item
+          through the normal analysis, review, and publication path. On apply or commit failure,
+          promoted objects are compensated and any failed removals are reported explicitly.
+        </p>
+      </section>
+
+      <section id="reset">
+        <h2>Coordinated reset</h2>
+        <Callout title="This cutover is empty-only" tone="warning">
           <p>
-            The POC runs one Uvicorn worker. Move to managed PostgreSQL and test migrations,
-            concurrency, locking, backup, and least-privilege roles before adding replicas or HA.
+            There is no dual API or compatible in-place migration. Preserve source PDFs externally,
+            stop all traffic and index writers, wipe the disposable catalog, Bridge storage, and
+            old active and screening collections, then deploy Bridge and retrieval together.
           </p>
         </Callout>
+        <ol className="procedure">
+          <li>Inventory, checksum, and externally preserve every source PDF and intended collection.</li>
+          <li>Stop operators, Bridge, retrieval, imports, parser children, and every index writer.</li>
+          <li>Wipe SQLite and migration state, Bridge canonical/private-analysis storage, and all old Qdrant collections.</li>
+          <li>Deploy the empty migration, one Bridge process, pinned Qdrant, and the updated retrieval service.</li>
+          <li>Issue active-only retrieval JWTs that deny screening, then reingest through upload or manifest version 3.</li>
+          <li>Reconcile SQL, storage, aliases, point counts, retrieval, and the evaluation fingerprint before reopening traffic.</li>
+        </ol>
       </section>
 
-      <section id="normal-path">
-        <h2>Normal path</h2>
-        <CodeBlock>{"docker compose up -d --build\ndocker compose ps\ndocker compose logs --tail=100 app clamav"}</CodeBlock>
-        <div className="journey">
-          <div><span>1. System response</span><strong>ClamAV initializes its persistent signature database.</strong><p>The first start may take minutes and requires the scanner memory budget.</p></div>
-          <div><span>2. System response</span><strong>The entrypoint migrates, then the application lifespan creates its database and retrieval resources.</strong><p>Startup validates active collection references against the same database that will serve requests. Owned resources are released even if startup fails.</p></div>
-          <div><span>3. Your action</span><strong>Wait for readiness before admitting users or Jenkins.</strong><p>Database, storage root, objects, temporary import staging, upload quarantine, and scanner must all be usable.</p></div>
-          <div><span>4. Ongoing work</span><strong>Monitor signatures, capacity, queue age, reconciliation, backups, and credentials.</strong><p>Retrieval outages remain visible but do not make the upload/catalog service unready.</p></div>
-        </div>
-      </section>
-
-      <section id="what-you-see">
-        <h2>What you see</h2>
-        <DocumentationTable
-          headings={["Surface", "Meaning"]}
-          rows={[
-            [<code key="l">/api/v1/health/live</code>, "The process can answer HTTP; use for liveness/restart"],
-            [<code key="r">/api/v1/health/ready</code>, "Database, every required storage directory, and ClamAV are usable; use for traffic admission"],
-            [<code key="d">/api/v1/health/dependencies</code>, "Currently the same detailed check body as ready; intended for restricted operator diagnosis"],
-            ["Compose logs", "Migration, application, FreshClam, clamd, and readiness evidence"],
-            ["Queue and ledger", "Claim age, bounded pipeline errors, cleanup state, and correlation identifiers"],
-          ]}
-        />
-      </section>
-
-      <section id="guardrails">
-        <h2>Actions and guardrails</h2>
-        <ul>
-          <li>Keep the service on loopback or a restricted internal network.</li>
-          <li>Keep clamd TCP private; it is unauthenticated and unencrypted.</li>
-          <li>Monitor signature age and FreshClam errors; a PONG does not prove currency.</li>
-          <li>Back up the complete <code>bridge_data</code> volume, not a live SQLite file alone.</li>
-          <li>Run historical import locally with an explicit source root, dry-run, and reviewed manifest.</li>
-          <li>Reserve <code>temporary/</code> for historical imports; live uploads stage under private <code>quarantine/</code>.</li>
-          <li>Treat collection-key changes as coordinated corpus migrations.</li>
-          <li>Never rewrite lifecycle/audit rows or recursively delete computed paths.</li>
+      <section id="monitor">
+        <h2>Daily checks</h2>
+        <ul className="check-list">
+          <li>Readiness, ClamAV signature freshness, scan failures, and capacity.</li>
+          <li>Old <code>RUNNING</code> leases, repeated retries, bounded operation errors, and stalled phases.</li>
+          <li>Embedding and classifier latency, authentication, model IDs, dimensions, and invalid outputs.</li>
+          <li>Qdrant authentication failures, alias or epoch drift, and exact active/screening counts.</li>
+          <li>Retrieval filters, schema version, active-only scopes, and negative screening-access tests.</li>
+          <li>Consistent backups, restore drills, secret rotation, and parser isolation alerts.</li>
         </ul>
-      </section>
-
-      <section id="failure">
-        <h2>When something goes wrong</h2>
-        <DocumentationTable
-          headings={["Symptom", "First interpretation", "Response"]}
-          rows={[
-            ["ClamAV startup is slow", "Signature initialization or memory pressure", "Inspect FreshClam/clamd logs and wait within the documented start window"],
-            ["Scanner unavailable", "Upload trust gate outage", "Restore clamd/signatures/network; keep uploads closed"],
-            ["SQLite locked", "Unsupported concurrency, stalled I/O, or live-file manipulation", "Return to one process and inspect volume health"],
-            ["Startup rejects collections", "Active rows no longer match the deployment registry", "Correct configuration or run a coordinated migration"],
-            ["Historical import commit fails", "The catalog transaction did not complete after one or more promotions", "Confirm every promoted object was removed; any failed storage keys are reported for repair"],
-            ["Cleanup state persists", "Canonical unlink failed after catalog/downstream work", "Repair storage and replay the exact cleanup"],
-          ]}
-        />
-      </section>
-
-      <section id="ownership">
-        <h2>Where ownership ends</h2>
-        <p>
-          Platform operations owns runtime exposure, secrets, database, canonical storage,
-          migrations, ClamAV, monitoring, backup, and controlled maintenance. Parser behavior,
-          search ranking, Qdrant data modeling, and chatbot policy require their respective owners.
-        </p>
       </section>
 
       <section id="implementation">
         <h2>Implementation map</h2>
         <ModuleReferences
           items={[
-            { path: "pdf_bridge/core/config.py", purpose: "Settings validation and enterprise startup guards" },
-            { path: "pdf_bridge/app.py", purpose: "Composition, lifespan-owned resources, startup validation, and middleware" },
-            { path: "pdf_bridge/services/health.py", purpose: "Database, complete storage-layout, and scanner checks" },
-            { path: "pdf_bridge/managers/importing.py", purpose: "Historical import transaction and post-promotion compensation" },
-            { path: "docker-compose.yml", purpose: "Topology, volumes, health, limits, and hardening" },
-            { path: "docker-entrypoint.sh", purpose: "Migration-before-start sequence" },
-            { path: "docs/runbook.md", purpose: "Troubleshooting, backup, upgrades, and cutover" },
-            { path: "docs/importing.md", purpose: "Historical import and acceptance" },
+            { path: "pdf_bridge/core/config.py", purpose: "Strict environment settings and cross-field validation" },
+            { path: "pdf_bridge/app.py", purpose: "Lifespan ownership of database, clients, and worker" },
+            { path: "pdf_bridge/services/health.py", purpose: "Database, storage, and scanner readiness probes" },
+            { path: "pdf_bridge/services/storage.py", purpose: "Private storage layout and atomic promotion" },
+            { path: "pdf_bridge/services/artifacts.py", purpose: "Compressed analysis artifacts, purge, and canonical audit hash" },
+            { path: "pdf_bridge/services/historical_import.py", purpose: "Version-3 validation, scanning, and compensation" },
+            { path: "docs/runbook.md", purpose: "Detailed recovery, reset, smoke test, and incident procedures" },
           ]}
         />
       </section>
@@ -472,18 +414,18 @@ const retrievalIntegrator: GuidePage = {
   category: "Role guide",
   title: "Retrieval service integrator",
   summary:
-    "Implement the grouped search contract and preserve catalog correlation so cross-collection, stale, duplicate, or impossible results fail as a whole.",
+    "Implement the stable grouped search contract over active Qdrant aliases while enforcing publication, schema, UUID, and collection correlation.",
   facts: [
-    { term: "Primary surface", detail: "POST {search-api}/search" },
-    { term: "Owns", detail: "Query execution, ranking, and correlated grouped responses" },
-    { term: "Does not own", detail: "Chatbot authorization or bridge catalog state" },
+    { term: "Primary surface", detail: "External search API and active Qdrant aliases" },
+    { term: "Modes", detail: "keyword, semantic, hybrid" },
+    { term: "Forbidden", detail: "Screening access and lifecycle mutation" },
   ],
   toc: [
     { id: "before", label: "Before you begin" },
-    { id: "normal-path", label: "Normal path" },
-    { id: "contract", label: "Request and response contract" },
-    { id: "guardrails", label: "Actions and guardrails" },
-    { id: "failure", label: "When something goes wrong" },
+    { id: "query", label: "Query behavior" },
+    { id: "contract", label: "Request and response" },
+    { id: "guardrails", label: "Index guardrails" },
+    { id: "failure", label: "Failure behavior" },
     { id: "ownership", label: "Where ownership ends" },
     { id: "implementation", label: "Implementation map" },
   ],
@@ -492,66 +434,74 @@ const retrievalIntegrator: GuidePage = {
       <section id="before">
         <h2>Before you begin</h2>
         <p>
-          Use the same stable lowercase collection keys as PDF Bridge and Qdrant. Every indexed
-          chunk retains the bridge <code>document_id</code> and <code>collection_key</code>. Catalog
-          lifecycle and collection determine retrieval eligibility.
+          Receive a collection-scoped, read-only Qdrant JWT for the active aliases you serve. Do
+          not accept the Bridge administrative key, a global read-only key, collection management
+          permissions, or access to <code>pdf-bridge-screening-v1</code>.
         </p>
       </section>
 
-      <section id="normal-path">
-        <h2>Normal path</h2>
-        <div className="journey">
-          <div><span>1. Bridge request</span><strong>Root library search requests counts for every configured collection.</strong><p><code>include_hits=false</code>; return exactly one group per key, including explicit zero.</p></div>
-          <div><span>2. Bridge request</span><strong>Collection search requests hits for exactly one collection.</strong><p><code>include_hits=true</code>; return the requested page of bridge document UUIDs, scores, and bounded snippets.</p></div>
-          <div><span>3. Your response</span><strong>Echo query and mode exactly.</strong><p>The bridge validates pagination through the expected hit count for the requested page.</p></div>
-          <div><span>4. Bridge validation</span><strong>Every total and hit is checked against the active eligible catalog.</strong><p>Only a completely valid response reaches the coworker.</p></div>
-        </div>
+      <section id="query">
+        <h2>Query behavior</h2>
+        <DocumentationTable
+          headings={["Mode", "Vector", "Ranking"]}
+          rows={[
+            [<code key="k">keyword</code>, <code key="kb">content_bm25</code>, "Native sparse BM25"],
+            [<code key="s">semantic</code>, <code key="sd">content_dense</code>, "Dense similarity"],
+            [<code key="h">hybrid</code>, "Both named vectors", "Reciprocal rank fusion; never mix raw scores"],
+          ]}
+        />
+        <p>
+          Every query targets only the requested stable collection alias and filters both
+          <code>published=true</code> and the current <code>schema_version</code>. Return Bridge
+          <code>document_id</code> and <code>collection_key</code> with each hit.
+        </p>
       </section>
 
       <section id="contract">
         <h2>Request and response contract</h2>
-        <DocumentationTable
-          headings={["Rule", "Requirement"]}
-          rows={[
-            ["Modes", "keyword, semantic, or hybrid"],
-            ["Groups", "Exactly the requested unique collection set"],
-            ["Totals", "Strict nonnegative integer and no larger than eligible bridge catalog"],
-            ["Hits", "Unique bridge UUID, finite score, bounded snippet, optional metadata"],
-            ["Body", "Valid strict schema within the 2 MiB response cap"],
-          ]}
-        />
+        <CodeBlock>{`{
+  "query": "retention policy",
+  "mode": "hybrid",
+  "collections": ["internal"],
+  "include_hits": true,
+  "page": 1,
+  "page_size": 20
+}`}</CodeBlock>
+        <ul>
+          <li>Echo the exact query and mode.</li>
+          <li>Return exactly one unique group for each requested collection and no extra groups.</li>
+          <li>When <code>include_hits=false</code>, return totals with empty hit arrays.</li>
+          <li>When hits are requested, honor the exact page cardinality implied by total, page, and page size.</li>
+          <li>Keep scores finite, snippets bounded, and document IDs unique inside each group.</li>
+        </ul>
       </section>
 
       <section id="guardrails">
-        <h2>Actions and guardrails</h2>
+        <h2>Index guardrails</h2>
         <ul>
-          <li>Return no hits for count-only requests.</li>
-          <li>Return the exact expected hit count for a page, subject to total and final page.</li>
-          <li>Never duplicate groups or document IDs.</li>
-          <li>Never return inactive, unknown, duplicate, or cross-collection content.</li>
-          <li>Do not use metadata fallback when the authoritative index is unavailable.</li>
+          <li>Never list, query, or infer content from the private screening collection.</li>
+          <li>Do not treat a dense-only or sparse-only point as published content.</li>
+          <li>During <code>DELETING</code> or <code>DELETE_FAILED</code>, active points remain eligible until verified removal succeeds.</li>
+          <li>Reject points with a missing or mismatched collection, schema, publication flag, or Bridge UUID.</li>
+          <li>Exercise positive and negative collection tests after every alias, token, schema, or model change.</li>
         </ul>
       </section>
 
       <section id="failure">
-        <h2>When something goes wrong</h2>
+        <h2>Failure behavior</h2>
         <p>
-          An unconfigured or unreachable service yields a visible 503. Non-success upstream
-          responses, malformed JSON, correlation failures, impossible totals, or invalid hits yield
-          a visible 502. The bridge discards the entire response and shows no partial results.
-        </p>
-        <p>
-          Recovery is reconciliation: compare bridge eligibility counts to Qdrant payloads, remove
-          stale/cross-routed chunks, then rerun positive and negative collection tests.
+          The Bridge rejects the complete retrieval response if it is malformed, uncorrelated,
+          over its size bound, or contains unknown, inactive, pending, tombstoned, duplicate, or
+          cross-collection UUIDs. Do not depend on partial acceptance or a catalog metadata fallback.
         </p>
       </section>
 
       <section id="ownership">
         <h2>Where ownership ends</h2>
         <p>
-          The retrieval service owns ranking and search semantics. The pipeline owns chunk creation.
-          PDF Bridge owns catalog validation. End-user authentication and collection authorization
-          belong to the external chatbot manager.
+          Retrieval owns query execution and ranking over active aliases. PDF Bridge owns document
+          state, collection placement, index mutation, and screening. The chatbot manager owns
+          end-user authorization and must constrain the collections it sends to retrieval.
         </p>
       </section>
 
@@ -559,11 +509,11 @@ const retrievalIntegrator: GuidePage = {
         <h2>Implementation map</h2>
         <ModuleReferences
           items={[
-            { path: "pdf_bridge/contracts/schemas.py", purpose: "Strict SearchRequest, SearchResponse, groups, and hits" },
-            { path: "pdf_bridge/services/search.py", purpose: "HTTP call, response cap, and exact echo/group correlation" },
-            { path: "pdf_bridge/services/catalog.py", purpose: "Catalog eligibility validation" },
-            { path: "pdf_bridge/services/web_page.py", purpose: "Count and hit rendering with no partial fallback" },
-            { path: "tests/test_search_failures.py", purpose: "Mismatched, malformed, and cross-boundary response coverage" },
+            { path: "pdf_bridge/contracts/schemas.py", purpose: "Stable search request, group, hit, and response shapes" },
+            { path: "pdf_bridge/services/search.py", purpose: "Bounded transport and exact request/response correlation" },
+            { path: "pdf_bridge/services/catalog.py", purpose: "Catalog eligibility and UUID/collection validation" },
+            { path: "pdf_bridge/services/vector_index.py", purpose: "Active/screening layout, payload schema, and query filters" },
+            { path: "docs/architecture.md", purpose: "Named vectors, aliases, outbox, and retrieval contract" },
           ]}
         />
       </section>
@@ -575,18 +525,18 @@ const chatbotIntegrator: GuidePage = {
   category: "Role guide",
   title: "Chatbot integrator",
   summary:
-    "Derive collection access from authenticated server-side policy and constrain every retrieval request before it reaches Qdrant.",
+    "Apply authenticated server-side collection policy before retrieval and preserve Bridge correlation without exposing operator or screening capabilities.",
   facts: [
-    { term: "Primary surface", detail: "External chatbot manager" },
-    { term: "Owns", detail: "End-user identity, authorization, and allowed-collection intersection" },
-    { term: "Repository status", detail: "Invariant documented here; implementation lives elsewhere" },
+    { term: "Primary surface", detail: "Authenticated chatbot backend" },
+    { term: "Owns", detail: "User policy and allowed-collection intersection" },
+    { term: "Must not receive", detail: "Bridge admin or Qdrant screening credentials" },
   ],
   toc: [
     { id: "boundary", label: "Boundary" },
     { id: "normal-path", label: "Normal path" },
-    { id: "guardrails", label: "Actions and guardrails" },
+    { id: "guardrails", label: "Guardrails" },
     { id: "acceptance", label: "Acceptance evidence" },
-    { id: "failure", label: "When something goes wrong" },
+    { id: "failure", label: "Failure behavior" },
     { id: "ownership", label: "Where ownership ends" },
   ],
   content: (
@@ -594,65 +544,64 @@ const chatbotIntegrator: GuidePage = {
       <section id="boundary">
         <h2>Boundary</h2>
         <p>
-          PDF Bridge does not implement the chatbot manager. Its collection audience label is
-          operator-facing placement metadata, not a grant. Direct Qdrant access also bypasses the
-          bridge-side response checks.
+          Collection audience labels are descriptive operator metadata, not authorization. Derive
+          allowed collections from an authenticated user and server-side policy, intersect that set
+          with the requested set, and pass only the result to retrieval. Never trust a browser-provided
+          collection list by itself.
         </p>
-        <Callout title="Do not trust the browser">
-          <p>
-            A requested collection list or allowlist from a client is untrusted input. Authorization
-            must originate from the authenticated server-side user and policy.
-          </p>
-        </Callout>
       </section>
 
       <section id="normal-path">
         <h2>Normal path</h2>
-        <div className="journey">
-          <div><span>1. Your action</span><strong>Authenticate the end user.</strong><p>Use the organization-approved identity boundary; the bridge browser session is unrelated.</p></div>
-          <div><span>2. Your action</span><strong>Derive <code>allowed_collections</code> from server-side policy.</strong><p>Use the exact stable keys shared by the bridge registry and Qdrant.</p></div>
-          <div><span>3. Your action</span><strong>Intersect the requested set with the allowed set.</strong><p>Reject or remove disallowed collections before retrieval; never broaden the request.</p></div>
-          <div><span>4. Your action</span><strong>Query only the resulting authorized collections.</strong><p>Retain user, policy, collection, and request correlation in approved audit evidence.</p></div>
-        </div>
+        <ol className="procedure">
+          <li>Authenticate the user and load policy from an authoritative server-side source.</li>
+          <li>Intersect policy collections with the requested collections; reject an empty or unauthorized scope.</li>
+          <li>Call retrieval with keyword, semantic, or hybrid mode and only the authorized active aliases.</li>
+          <li>Preserve <code>document_id</code> and <code>collection_key</code> through citations and diagnostics.</li>
+          <li>Apply answer-generation policy without weakening retrieval’s active-only filters.</li>
+        </ol>
       </section>
 
       <section id="guardrails">
-        <h2>Actions and guardrails</h2>
+        <h2>Guardrails</h2>
         <ul>
-          <li>Use collection keys, not mutable display names or audience labels, in policy.</li>
-          <li>Apply authorization before any count, search, or direct vector query.</li>
-          <li>Do not give the client unrestricted search credentials.</li>
-          <li>Ensure caches include the authorized collection scope in their key.</li>
-          <li>Preserve negative authorization decisions in test and audit evidence.</li>
+          <li>Do not call Bridge operator endpoints on behalf of chatbot users.</li>
+          <li>Do not infer authorization from filenames, document UUIDs, audience labels, or snippets.</li>
+          <li>Do not grant the chatbot Bridge’s Qdrant administrative key or any screening permission.</li>
+          <li>Keep user identity, query, authorized scope, response groups, and citations correlated in protected audit evidence.</li>
+          <li>Fail closed if policy, retrieval, or correlation is unavailable.</li>
         </ul>
       </section>
 
       <section id="acceptance">
         <h2>Acceptance evidence</h2>
         <ul className="check-list">
-          <li>An internal-only user can retrieve an internal test topic.</li>
-          <li>A customer-only user receives zero for that internal topic.</li>
-          <li>Changing a client-provided list cannot add a disallowed collection.</li>
-          <li>Unknown collection keys fail closed.</li>
-          <li>Direct Qdrant and cache paths cannot bypass the server policy intersection.</li>
+          <li>An internal-only user can retrieve an internal positive test topic.</li>
+          <li>A customer-only user receives explicit zero for the same internal topic.</li>
+          <li>A mixed request is reduced to the server-authorized intersection.</li>
+          <li>A forged cross-collection hit or unknown UUID fails the complete response.</li>
+          <li>The retrieval credential cannot list or query screening content.</li>
+          <li>Pending, replaced, cancelled, rejected, and deleted content never appears in answers.</li>
         </ul>
       </section>
 
       <section id="failure">
-        <h2>When something goes wrong</h2>
+        <h2>Failure behavior</h2>
         <p>
-          Treat a cross-collection result, policy mismatch, unknown key, or cache-scope leak as a
-          security incident. Restrict retrieval, preserve request/user/policy evidence, reconcile
-          Qdrant and cache contents, and restore access only after the bypass is understood.
+          Policy failure is an authorization failure, not a reason to broaden scope. Retrieval
+          failure is a dependency failure, not a reason to search private analysis or Bridge
+          metadata. Preserve bounded identifiers and error categories without logging query content,
+          snippets, provider secrets, or private PDF text beyond approved policy.
         </p>
       </section>
 
       <section id="ownership">
         <h2>Where ownership ends</h2>
         <p>
-          The chatbot manager owns user authorization. PDF Bridge records corpus placement and
-          validates its own human-facing search proxy, but it cannot prove that an external chatbot
-          applied the correct allowlist.
+          The chatbot manager owns authenticated user policy and answer behavior. Retrieval owns
+          active search. PDF Bridge owns intake, lifecycle, and catalog truth. Changes to any one of
+          those boundaries require coordinated conformance tests; none may silently assume another’s
+          authorization responsibility.
         </p>
       </section>
     </>
@@ -663,11 +612,11 @@ const securityReviewer: GuidePage = {
   category: "Role guide",
   title: "Security reviewer",
   summary:
-    "Trace the complete upload-to-retrieval trust path, separate implemented POC controls from residual risk, and define evidence required for broader deployment.",
+    "Review the complete upload-to-retrieval trust path, including parser containment, model output, private screening data, credentials, and deletion evidence.",
   facts: [
-    { term: "Primary surface", detail: "Threat boundaries, deployment topology, tests, and OSS review" },
-    { term: "Owns", detail: "Risk acceptance and required controls" },
-    { term: "Current claim", detail: "Restricted proof of concept, not enterprise-ready" },
+    { term: "Scope", detail: "File, process, provider, vector, identity, and retrieval boundaries" },
+    { term: "Current claim", detail: "Restricted-network proof of concept" },
+    { term: "Primary artifact", detail: "docs/security.md enterprise gate" },
   ],
   toc: [
     { id: "review-path", label: "Review path" },
@@ -683,48 +632,41 @@ const securityReviewer: GuidePage = {
       <section id="review-path">
         <h2>Review path</h2>
         <ol className="procedure">
-          <li>Confirm the service is restricted and identify browser, bridge, scanner, Jenkins, parser, storage, retrieval, Qdrant, and chatbot trust boundaries.</li>
-          <li>Trace bytes through upload limits/signature/hash, ClamAV INSTREAM, UUID promotion, batch-scoped download, parsing, and derived indexes.</li>
-          <li>Trace browser identity, session, CSRF, same-origin, Host, and security-header behavior.</li>
-          <li>Trace separate Jenkins/retrieval credentials, exact-host pinning, no redirects, and response correlation.</li>
-          <li>Review backup, audit, incident, dependency, and enterprise-gate evidence.</li>
+          <li>Trace bytes through body limits, generated quarantine paths, signature validation, server-side SHA-256, ClamAV, and atomic promotion.</li>
+          <li>Trace the parser child through Linux resource limits, page/text/chunk gates, protected artifacts, and terminal rejection cleanup.</li>
+          <li>Trace untrusted PDF excerpts through embedding and two tool-free structured-output model calls, including citation validation.</li>
+          <li>Trace screening and active points through Qdrant credentials, aliases, payload filters, outbox ordering, and exact-count verification.</li>
+          <li>Trace Keep, Replace, Cancel, retry, deletion, purge, tombstones, and the content-free analysis hash.</li>
+          <li>Trace trusted-header identity, CSRF/origin controls, operator capability, retrieval JWT scope, and chatbot authorization.</li>
         </ol>
-        <Callout title="These guides describe personas, not RBAC" tone="warning">
-          <p>
-            Browser users share one capability set. <code>trusted-header</code> improves identity
-            attribution but does not authorize roles. Jenkins is the only separately enforced role
-            boundary, through its bearer token.
-          </p>
-        </Callout>
       </section>
 
       <section id="implemented">
         <h2>Implemented controls</h2>
         <ul>
-          <li>Bounded multipart spooling followed by a private quarantine copy, strict PDF name/signature checks, SHA-256, and duplicate gates.</li>
-          <li>ClamAV before atomic canonical promotion; detection, timeout, malformed reply, and outage fail closed.</li>
-          <li>UUID-derived paths outside the webroot; filenames remain display metadata.</li>
-          <li>Upload and historical-import transaction failures roll back catalog state and compensate promoted objects; cleanup failures are surfaced.</li>
-          <li>Encrypted/authenticated session state, same-origin mutations, CSRF, and trusted Host checks.</li>
-          <li>Separate automation credentials, exact-host pinning, no redirects, and batch-scoped downloads.</li>
-          <li>Canonical path, byte count, hash, operation-set, and result correlation checks.</li>
-          <li>Audit rows are append-only through SQLAlchemy ORM listeners; direct database administration needs separate controls.</li>
-          <li>Pipeline errors are length-bounded; producers remain responsible for excluding secrets, content, and local paths.</li>
-          <li>Non-root application container with read-only root, dropped capabilities, and no-new-privileges.</li>
+          <li>Uploads are bounded, streamed, server-hashed, format-allowlisted, and ClamAV-scanned before canonical promotion.</li>
+          <li>Exact duplicate rejection is scoped to retained bytes in the selected collection; user filenames never determine storage paths.</li>
+          <li>Parser and text-quality failures reject without override and purge retained content.</li>
+          <li>Browser mutations require session, same-origin/CSRF checks, and actor attribution.</li>
+          <li>Decisions are immutable, revision-bound, target-constrained, and idempotent.</li>
+          <li>Model findings are explanation-only; invalid citations or structured output become visible advisory incompleteness.</li>
+          <li>Screening is private, active points require publication/schema flags, and retrieval receives scoped read-only JWTs.</li>
+          <li>Outbox mutations are idempotent, strongly ordered, waited, and verified by exact counts.</li>
+          <li>Cancellation and deletion purge private content after a canonical content-free audit hash is recorded.</li>
         </ul>
       </section>
 
       <section id="residual">
         <h2>Residual risk</h2>
         <DocumentationTable
-          headings={["Risk", "Why it remains"]}
+          headings={["Risk", "Current limit", "Required direction"]}
           rows={[
-            ["Parser compromise", "A clean signature scan does not neutralize malformed, novel, encrypted, or resource-exhausting PDFs"],
-            ["Anonymous access", "anonymous-poc labels a session but authenticates no person and grants every browser user the same actions"],
-            ["Service-wide token", "Disclosure permits batch download and lifecycle mutation until rotation"],
-            ["Single data volume", "Catalog metadata and canonical PDFs are one compromise/backup domain"],
-            ["Sensitive metadata", "Filenames, actors, queries, snippets, and bounded errors may still be confidential"],
-            ["Misrouting", "Wrong collection configuration or stale Qdrant payloads can bypass otherwise correct bridge checks"],
+            ["PDF parser compromise", "A clean scan and resource-limited child are not a safety proof", "Disposable least-privilege sandbox with no network and an owned patch response"],
+            ["Prompt injection", "Quoted untrusted text and citation checks do not classify prompt injection", "Threat review; never treat model prose as executable or mutation authority"],
+            ["Anonymous operator access", "anonymous-poc attributes a session but proves no identity", "Network isolation or trusted-header SSO; add authorization if operators should differ"],
+            ["Qdrant admin key", "Disclosure exposes active and screening data and alias mutation", "Secret manager, restricted network, monitored denial, coordinated rotation, and regenerated JWTs"],
+            ["Provider outage override", "Keep may accept incomplete advisory analysis", "Publication still requires complete dense and BM25 points; alert on retained pending work"],
+            ["Single process", "SQLite and local locks are not highly available", "Redesign database and coordination before multiple replicas"],
           ]}
         />
       </section>
@@ -732,51 +674,49 @@ const securityReviewer: GuidePage = {
       <section id="gates">
         <h2>Deployment gates</h2>
         <ul className="check-list">
-          <li>Organization-managed TLS, SSO, trusted proxy enforcement, and explicit browser authorization.</li>
-          <li>Server-derived chatbot collection policy applied before every retrieval path.</li>
-          <li>Approved secret management, rotation, revocation, and incident owners.</li>
-          <li>Disposable least-privilege parser sandbox with CPU, memory, time, process, and network limits.</li>
-          <li>Encrypted-PDF, content-disarm, scan-limit, and signature-age policy.</li>
-          <li>Managed PostgreSQL and approved durable encrypted object storage before HA.</li>
-          <li>Cross-store reconciliation, negative isolation tests, SAST, image/dependency scanning, DAST, and focused penetration testing.</li>
+          <li>Organization-managed TLS, trusted proxy CIDRs, enterprise SSO, host validation, and operator authorization decision.</li>
+          <li>Separate secret ownership and rotation for session, Qdrant, embedding, LLM, and retrieval credentials.</li>
+          <li>Active-only Qdrant JWT scopes, explicit screening denial, network restriction, audit, and alias reconciliation.</li>
+          <li>Disposable parser sandbox, malicious-PDF testing, ClamAV freshness, and encrypted-document policy.</li>
+          <li>Provider data-use, retention, residency, authentication, logging, and model-change policy.</li>
+          <li>Encrypted storage, backup, legal hold, retention, verified deletion, and restore drills.</li>
+          <li>External retrieval conformance for named vectors, hybrid RRF, publication/schema filters, and catalog correlation.</li>
+          <li>Labeled same-collection evaluation corpus with candidate recall at least 0.98 and recorded fingerprints.</li>
         </ul>
       </section>
 
       <section id="oss">
-        <h2>Playwright and ClamAV decisions</h2>
-        <DocumentationTable
-          headings={["Component", "Decision", "Open work"]}
-          rows={[
-            ["Playwright 1.61.0", "Accept as development-only browser tooling", "Inventory the downloaded browser separately; make five tests a required job where skips fail"],
-            ["ClamAV 1.5.3", "Accept as the POC malware gate", "Run live acceptance; monitor/reject stale signatures; define limits/encrypted policy; harden container; own non-LTS updates"],
-            ["Repository", "OSS posture is not complete", "Choose a project license and add third-party notices or an SBOM"],
-          ]}
-        />
+        <h2>OSS decisions</h2>
+        <p>
+          Playwright 1.61.0 remains development-only browser tooling; inventory its downloaded
+          browser separately and make the browser suite a required CI check. ClamAV 1.5.3 remains a
+          fail-closed POC gate, not proof that arbitrary PDFs are safe. Track signature freshness,
+          non-LTS lifecycle, image licensing, and live clean/EICAR acceptance.
+        </p>
       </section>
 
       <section id="incident">
         <h2>Incident path</h2>
-        <p>
-          Restrict traffic and stop new claims/uploads without destroying evidence. Rotate affected
-          credentials, record request/document/operation/batch/pipeline IDs, preserve approved logs
-          and storage evidence, and inspect downstream parser and indexes. Do not rewrite audit or
-          lifecycle rows. Restore access only after root cause and scanner state are understood.
-        </p>
+        <ol className="procedure">
+          <li>Contain uploads, worker, provider, Qdrant, and retrieval traffic without deleting evidence.</li>
+          <li>Preserve protected logs, document/analysis/operation/replacement/outbox IDs, timestamps, hashes, and fingerprints.</li>
+          <li>Rotate affected credentials and regenerate Qdrant JWTs after an administrative-key change.</li>
+          <li>Use SQL as catalog authority; quarantine inconsistent points and externally preserve verified source PDFs.</li>
+          <li>Correct the cause, rebuild through supported workflows, and run positive, negative, replacement, purge, and access-denial tests.</li>
+        </ol>
       </section>
 
       <section id="implementation">
         <h2>Evidence map</h2>
         <ModuleReferences
           items={[
-            { path: "docs/security.md", purpose: "Controls, residual risks, enterprise gates, ClamAV, and incident procedure" },
-            { path: "docs/oss-review.md", purpose: "Official-source dependency due diligence and Monday checklist" },
-            { path: "pdf_bridge/http/security.py", purpose: "Session actor, CSRF, origin, proxy, and Jenkins credential checks" },
-            { path: "pdf_bridge/services/scanner.py", purpose: "Fail-closed clamd INSTREAM protocol" },
-            { path: "pdf_bridge/services/storage.py", purpose: "Private quarantine/import staging, atomic promotion, canonical paths, and controlled unlink behavior" },
-            { path: "tests/test_app_lifecycle.py", purpose: "Owned-resource validation, startup-failure cleanup, and injected-resource ownership" },
-            { path: "tests/test_uploads.py", purpose: "Quarantine, private modes, responsiveness, and transaction compensation evidence" },
-            { path: "tests/test_security_and_import.py", purpose: "Security and administrative import evidence" },
-            { path: "tests/test_clamav_integration.py", purpose: "Opt-in clean/EICAR live-daemon check" },
+            { path: "docs/security.md", purpose: "Implemented controls, residual risks, and mandatory enterprise gate" },
+            { path: "pdf_bridge/http/security.py", purpose: "Session actor, CSRF, origin, trusted peer, and identity-header checks" },
+            { path: "pdf_bridge/services/scanner.py", purpose: "Fail-closed ClamAV transport" },
+            { path: "pdf_bridge/services/extraction.py", purpose: "Parser child limits and timeout enforcement" },
+            { path: "pdf_bridge/services/classification.py", purpose: "Untrusted-text prompting, strict schema, and quote validation" },
+            { path: "pdf_bridge/services/artifacts.py", purpose: "Private compressed artifacts, purge, and audit hash" },
+            { path: "pdf_bridge/services/vector_index.py", purpose: "Qdrant access patterns, payload filters, and exact verification" },
           ]}
         />
       </section>
@@ -788,15 +728,15 @@ const codeMaintainer: GuidePage = {
   category: "Role guide",
   title: "Code maintainer",
   summary:
-    "Trace behavior through the one-way package layers, change the narrowest responsible module, and preserve lifecycle, correlation, and compensation invariants.",
+    "Change the one-way package layers, durable worker, strict contracts, and compensating workflows while preserving intake and retrieval invariants.",
   facts: [
-    { term: "Primary surface", detail: "Python package, migrations, templates, and tests" },
-    { term: "Owns", detail: "Bridge behavior and its public contracts" },
-    { term: "Does not own", detail: "The external parser, Qdrant, or chatbot manager" },
+    { term: "Architecture", detail: "One-way package layers with manager-owned transactions" },
+    { term: "Concurrency", detail: "Sync handlers plus one lifespan-owned worker" },
+    { term: "Rule", detail: "Persist intent before external mutation" },
   ],
   toc: [
     { id: "orientation", label: "Orient in the package" },
-    { id: "normal-path", label: "Normal change path" },
+    { id: "flows", label: "Core flows" },
     { id: "change-map", label: "Choose the change point" },
     { id: "invariants", label: "Invariants" },
     { id: "verification", label: "Verification" },
@@ -806,109 +746,88 @@ const codeMaintainer: GuidePage = {
     <>
       <section id="orientation">
         <h2>Orient in the package</h2>
-        <p>
-          <code>pdf_bridge/app.py</code> is the composition root. Its lifespan builds the engine,
-          session factory, and shared synchronous retrieval client from the active settings,
-          validates the database it will serve, and releases owned resources on shutdown or startup
-          failure. Test-injected clients remain caller-owned. Other package-root modules should not
-          accumulate implementation behavior.
-        </p>
-        <DocumentationTable
-          headings={["Layer", "Responsibility"]}
-          rows={[
-            [<code key="c">controllers/</code>, "HTTP/CLI binding, auth dependencies, public responses, and error translation"],
-            [<code key="m">managers/</code>, "Locks, transaction commit/rollback, orchestration, and multi-step compensation"],
-            [<code key="s">services/</code>, "Lifecycle rules, queries, files, scanner, retrieval, staging, and page-data behavior"],
-            [<code key="co">contracts/</code>, "Strict transport-neutral Pydantic wire models"],
-            [<code key="p">persistence/</code>, "SQLAlchemy setup, models, constraints, indexes, and audit hooks"],
-            [<code key="h">http/</code>, "Security, middleware, and problem responses without routes"],
-            [<code key="pr">presentation/</code>, "View models, serializers, and theme formatting"],
-          ]}
-        />
+        <CodeBlock>{"app → controllers → managers → services\n                      ↓          ↓\n                 http/contracts/presentation/persistence/core"}</CodeBlock>
+        <ul>
+          <li><code>app.py</code> composes settings, database, clients, scanner, worker, middleware, and shutdown ownership.</li>
+          <li>Controllers bind Litestar or Typer inputs and translate safe errors; they do not construct SQL.</li>
+          <li>Managers own locks, transaction commit/rollback, compensation, and multi-step workflow sequencing.</li>
+          <li>Services own reusable domain rules and I/O without importing transport or managers.</li>
+          <li>Contracts are strict public shapes; persistence models and migrations own durable representation.</li>
+          <li>Presentation is stateless and never calls services or issues SQL.</li>
+          <li>Blocking controller work declares <code>sync_to_thread=True</code>; worker I/O runs in its owned threads.</li>
+        </ul>
       </section>
 
-      <section id="normal-path">
-        <h2>Normal change path</h2>
-        <ol className="procedure">
-          <li>Start at the HTTP route or Typer command that exposes the behavior.</li>
-          <li>Follow its manager to find transaction, lock, and cleanup sequencing.</li>
-          <li>Change domain rules or I/O in the matching service.</li>
-          <li>Update strict contracts and persistence/migrations when the boundary changes.</li>
-          <li>Update presentation and repository/wiki documentation where the experience changes.</li>
-          <li>Add focused tests, then run the full suite and relevant opt-in integration checks.</li>
-        </ol>
+      <section id="flows">
+        <h2>Core flows</h2>
+        <DocumentationTable
+          headings={["Experience", "Trace"]}
+          rows={[
+            ["Upload", "controllers/api.py → managers/document.py → services/document.py + intake.py + storage.py + scanner.py"],
+            ["Worker operation", "app.py lifespan → managers/worker.py → extraction/analysis/providers/vector_index/artifacts services"],
+            ["Review decision", "controllers/api.py → managers/document.py → services/intake.py → durable operation wakeup"],
+            ["Catalog and evidence", "controllers/api.py → managers/catalog.py → services/catalog.py → presentation serializers"],
+            ["Search", "controllers/api.py → managers/search.py → services/search.py + catalog.py"],
+            ["Historical import", "controllers/admin_cli.py → managers/importing.py → services/historical_import.py"],
+          ]}
+        />
       </section>
 
       <section id="change-map">
         <h2>Choose the change point</h2>
-        <DocumentationTable
-          headings={["Change", "Start in"]}
-          rows={[
-            ["Route, binding, credential dependency, public error", <code key="1">controllers/ or http/</code>],
-            ["Transaction, lock, compensation, cleanup sequence", <code key="2">managers/</code>],
-            ["Lifecycle eligibility or transition", <code key="3">services/lifecycle.py</code>],
-            ["Upload, storage, scanner, search, staging behavior", <code key="4">matching services module</code>],
-            ["Wire shape", <code key="5">contracts/ plus contract/transport tests</code>],
-            ["Catalog field or constraint", <code key="6">persistence/models.py plus Alembic migration</code>],
-            ["Browser wording/layout", <code key="7">services/web_page.py, presentation/, templates/, static/</code>],
-            ["Runtime setting", <code key="8">core/config.py, .env.example, Compose, and configuration docs</code>],
-          ]}
-        />
+        <p>
+          Put a rule in the lowest layer that owns it. Transport parsing stays in a controller;
+          transaction, lock, compensation, and workflow sequencing stay in a manager; reusable
+          validation, lifecycle rules, provider calls, and filesystem/index I/O stay in services;
+          resource lifecycle stays in the composition root. Persisted fields require a reviewed
+          model and Alembic change together.
+        </p>
       </section>
 
       <section id="invariants">
         <h2>Invariants</h2>
         <ul>
-          <li>Dependencies point downward; services never import Litestar, HTTP, managers, controllers, or app.</li>
-          <li>Controllers do not construct SQL; managers own commits and rollbacks.</li>
-          <li>Blocking upload, scanner, page, and retrieval work uses <code>sync_to_thread=True</code> to run in Litestar worker threads so the event loop remains responsive.</li>
-          <li>Scanner, path, staging, result, and search-correlation failures fail closed.</li>
-          <li>User metadata never forms canonical storage or handoff paths.</li>
-          <li>Collection is required for every document and immutable after queue.</li>
-          <li>Filesystem promotion and database mutation have explicit compensation through audit flush and commit; cleanup failures surface.</li>
-          <li>Idempotent replays must match material request/result data exactly.</li>
-          <li>Cleanup-pending states preserve enough information for exact replay after failure.</li>
+          <li>Only exact same-collection bytes hard-fail as a duplicate; every semantic finding remains advisory.</li>
+          <li>Parser and text-quality rejection is terminal and non-overridable; cleanup removes all retained content.</li>
+          <li>No database transaction spans parser, HTTP provider, or Qdrant work.</li>
+          <li>Only complete dense plus BM25 points may be published; screening is never retrieval-eligible.</li>
+          <li>Decisions bind an exact analysis revision and replacement target eligibility is checked live.</li>
+          <li>Verified old deletion precedes every new active replacement write.</li>
+          <li>External mutations are idempotent, outbox-backed, strongly ordered, waited, and exactly counted.</li>
+          <li>Tombstones retain content-free hashes and metadata, never source, excerpts, vectors, prompts, or raw output.</li>
+          <li>One Uvicorn process remains the only supported runtime.</li>
         </ul>
       </section>
 
       <section id="verification">
         <h2>Verification</h2>
-        <DocumentationTable
-          headings={["Check", "Purpose"]}
-          rows={[
-            [<code key="pt">python -m pytest</code>, "Application, contracts, lifecycle, storage, HTTP, CLI, and architecture"],
-            [<code key="rf">python -m ruff check .</code>, "Static quality and imports"],
-            ["Browser opt-in", "Chromium workflows across upload, queue, search, navigation, and deletion"],
-            ["ClamAV opt-in", "Clean PDF-shaped fixture and EICAR against a real daemon"],
-            [<code key="ar">tests/test_architecture.py</code>, "Exact modules, one-way imports, transaction ownership, and service transport independence"],
-            [<code key="al">tests/test_app_lifecycle.py</code>, "Settings-owned database, shared search client, and startup/shutdown resource ownership"],
-            [<code key="up">tests/test_uploads.py</code>, "Private quarantine, concurrent responsiveness, and upload compensation"],
-          ]}
-        />
+        <ul className="check-list">
+          <li>Run Ruff, architecture checks, unit tests, and the full pytest suite.</li>
+          <li>Exercise same- versus cross-collection duplicates, filename families, chunk stability, thresholds, rank fusion, and quote validation.</li>
+          <li>Exercise lease expiry, provider outages, stale decisions, retry idempotency, and every outbox crash boundary.</li>
+          <li>Prove active/screening filters, named vectors, strong waits, exact counts, and denial of screening access.</li>
+          <li>Prove replacement call ordering and retryability after old deletion.</li>
+          <li>Prove cancellation/deletion purge while content-free audit hashes remain.</li>
+          <li>Run browser coverage for restoration, evidence pagination, decisions, multiple files, accessibility, and narrow layouts.</li>
+        </ul>
       </section>
 
       <section id="documentation">
         <h2>Documentation standard</h2>
         <p>
-          Public classes, functions, and methods have descriptive docstrings. Use section comments
-          to orient readers around terse multi-step logic such as idempotent correlation,
-          compensation, and eligibility queries; do not narrate individual statements.
-        </p>
-        <p>
-          If a change alters what a role sees, decides, waits for, or recovers from, update the
-          matching role guide as well as the closest repository Markdown reference and test.
+          Update architecture, configuration, operations, security, import, README, and this site
+          whenever a lifecycle, endpoint, provider, Qdrant payload, credential, or recovery rule
+          changes. Remove superseded contracts instead of documenting parallel paths. State the
+          parser limitation plainly: a resource-limited subprocess is not a complete sandbox.
         </p>
       </section>
     </>
   ),
 };
 
-// Role guides are exported in the same order as the wiki navigation.
-
 export const roleGuides: Record<string, GuidePage> = {
   "library-operator": libraryOperator,
-  "jenkins-owner": jenkinsOwner,
-  "rag-pipeline-owner": ragPipelineOwner,
+  "semantic-intake-owner": semanticIntakeOwner,
   "platform-operator": platformOperator,
   "retrieval-integrator": retrievalIntegrator,
   "chatbot-integrator": chatbotIntegrator,

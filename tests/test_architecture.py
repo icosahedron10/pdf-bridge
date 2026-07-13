@@ -11,7 +11,6 @@ EXPECTED_MODULES = (
     "__init__.py",
     "app.py",
     "contracts/__init__.py",
-    "contracts/job_contracts.py",
     "contracts/schemas.py",
     "core/__init__.py",
     "core/config.py",
@@ -19,22 +18,19 @@ EXPECTED_MODULES = (
     "controllers/__init__.py",
     "controllers/admin_cli.py",
     "controllers/api.py",
-    "controllers/job_cli.py",
-    "controllers/jobs.py",
     "controllers/web.py",
     "http/__init__.py",
     "http/middleware.py",
     "http/problems.py",
     "http/security.py",
     "managers/__init__.py",
-    "managers/batch.py",
     "managers/catalog.py",
     "managers/document.py",
     "managers/health.py",
     "managers/importing.py",
-    "managers/job_client.py",
     "managers/search.py",
     "managers/web.py",
+    "managers/worker.py",
     "persistence/__init__.py",
     "persistence/db.py",
     "persistence/models.py",
@@ -43,19 +39,40 @@ EXPECTED_MODULES = (
     "presentation/theme.py",
     "presentation/view_models.py",
     "services/__init__.py",
+    "services/analysis.py",
+    "services/artifacts.py",
+    "services/bm25.py",
+    "services/candidates.py",
     "services/catalog.py",
+    "services/chunking.py",
+    "services/classification.py",
     "services/document.py",
+    "services/embeddings.py",
     "services/errors.py",
+    "services/extraction.py",
+    "services/extraction_child.py",
+    "services/filenames.py",
+    "services/fingerprint.py",
     "services/health.py",
     "services/historical_import.py",
+    "services/intake.py",
+    "services/scanner.py",
+    "services/search.py",
+    "services/storage.py",
+    "services/vector_index.py",
+    "services/web_page.py",
+)
+
+FORBIDDEN_LEGACY_MODULES = (
+    "contracts/job_contracts.py",
+    "controllers/job_cli.py",
+    "controllers/jobs.py",
+    "managers/batch.py",
+    "managers/job_client.py",
     "services/job_batch.py",
     "services/job_http.py",
     "services/job_staging.py",
     "services/lifecycle.py",
-    "services/scanner.py",
-    "services/search.py",
-    "services/storage.py",
-    "services/web_page.py",
 )
 
 OBSOLETE_ROOT_MODULES = (
@@ -211,6 +228,13 @@ def test_internal_architecture_module_set_is_exact() -> None:
 def test_package_root_contains_only_init_and_composition_root() -> None:
     root_modules = sorted(path.name for path in PACKAGE_ROOT.glob("*.py"))
     assert root_modules == ["__init__.py", "app.py"]
+
+
+def test_jenkins_and_batch_modules_do_not_return() -> None:
+    remaining = [
+        module for module in FORBIDDEN_LEGACY_MODULES if (PACKAGE_ROOT / module).exists()
+    ]
+    assert not remaining, "Legacy Jenkins modules remain:\n" + "\n".join(remaining)
 
 
 def test_obsolete_root_forwarding_modules_do_not_exist() -> None:
