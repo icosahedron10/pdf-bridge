@@ -16,33 +16,42 @@ DEFAULT_CHUNK_BYTES = 1024 * 1024
 
 
 class StorageError(RuntimeError):
-    pass
+    """Base failure raised by canonical PDF storage operations."""
 
 
 class InvalidFilenameError(StorageError):
-    pass
+    """Raised when an upload filename violates display-name constraints."""
 
 
 class InvalidPdfError(StorageError):
-    pass
+    """Raised when content is empty or lacks an allowlisted PDF signature."""
 
 
 class FileTooLargeError(StorageError):
+    """Raised when streamed content exceeds its configured byte limit."""
+
     def __init__(self, max_bytes: int) -> None:
         super().__init__(f"file exceeds the configured {max_bytes}-byte limit")
         self.max_bytes = max_bytes
 
 
 class UnsafePathError(StorageError):
-    pass
+    """Raised when a storage or import path escapes its approved root."""
 
 
 class AsyncReadable(Protocol):
-    async def read(self, size: int = -1) -> bytes: ...
+    """Minimal asynchronous byte reader accepted by upload streaming."""
+
+    async def read(self, size: int = -1) -> bytes:
+        """Read up to ``size`` bytes, or all remaining bytes when negative."""
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
 class StorageLayout:
+    """Resolved canonical, temporary, and quarantine storage directories."""
+
     root: Path
     objects: Path
     temporary: Path
@@ -50,6 +59,8 @@ class StorageLayout:
 
     @classmethod
     def from_root(cls, root: Path) -> StorageLayout:
+        """Resolve a storage root and ensure its protected directories exist."""
+
         resolved = root.expanduser().resolve(strict=False)
         layout = cls(
             root=resolved,
@@ -64,6 +75,8 @@ class StorageLayout:
 
 @dataclass(frozen=True, slots=True)
 class StagedFile:
+    """Temporary validated upload with its size and SHA-256 digest."""
+
     path: Path
     size_bytes: int
     sha256: str
@@ -71,6 +84,8 @@ class StagedFile:
 
 @dataclass(frozen=True, slots=True)
 class PromotedFile:
+    """Canonical storage location returned after atomic promotion."""
+
     storage_key: str
     path: Path
 
@@ -199,6 +214,8 @@ def copy_source_to_temporary(
 
 
 def storage_key_for(document_id: uuid.UUID) -> str:
+    """Derive the sharded canonical storage key for a document UUID."""
+
     identifier = str(document_id)
     return f"objects/{identifier[:2]}/{identifier}.pdf"
 
@@ -238,6 +255,8 @@ def promote_staged_file(
 def remove_storage_key(
     layout: StorageLayout, storage_key: str, *, missing_ok: bool = False
 ) -> None:
+    """Remove a canonical object after validating its storage key."""
+
     path = resolve_storage_key(layout, storage_key)
     path.unlink(missing_ok=missing_ok)
 
@@ -260,6 +279,8 @@ def validate_source_path(source_root: Path, candidate: Path | str) -> Path:
 
 
 def hash_file(path: Path, *, chunk_bytes: int = DEFAULT_CHUNK_BYTES) -> tuple[int, str]:
+    """Return a file's byte size and streaming SHA-256 digest."""
+
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as file:

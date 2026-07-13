@@ -172,6 +172,8 @@ class BridgeJobClient:
         self._client.close()
 
     def claim(self, request: BatchClaimRequest) -> BatchClaimResponse | None:
+        """Claim a batch, returning ``None`` when no work is queued."""
+
         response = self._client.post(
             "api/v1/jobs/batches/claim", json=request.model_dump(mode="json")
         )
@@ -181,11 +183,15 @@ class BridgeJobClient:
         return BatchClaimResponse.model_validate_json(response.content)
 
     def manifest(self, batch_id: uuid.UUID) -> BatchManifestResponse:
+        """Fetch and validate the manifest for a claimed batch."""
+
         response = self._client.get(f"api/v1/jobs/batches/{batch_id}/manifest")
         _ensure_success(response)
         return BatchManifestResponse.model_validate_json(response.content)
 
     def stream_operation(self, download_url: str) -> AbstractContextManager[httpx.Response]:
+        """Open a same-origin streaming response for operation content."""
+
         target = httpx.URL(download_url)
         resolved = self._base_url.join(target)
         if (
@@ -201,6 +207,8 @@ class BridgeJobClient:
     def acknowledge_staged(
         self, batch_id: uuid.UUID, request: BatchStageRequest
     ) -> BatchStageResponse:
+        """Acknowledge that a batch was durably staged locally."""
+
         response = self._client.post(
             f"api/v1/jobs/batches/{batch_id}/staged",
             json=request.model_dump(mode="json"),
@@ -211,6 +219,8 @@ class BridgeJobClient:
     def report_results(
         self, batch_id: uuid.UUID, request: BatchResultsRequest
     ) -> BatchResultsResponse:
+        """Submit and validate pipeline results for a staged batch."""
+
         response = self._client.post(
             f"api/v1/jobs/batches/{batch_id}/results",
             json=request.model_dump(mode="json"),
@@ -248,6 +258,8 @@ def _client(
 
 
 def client_from_options(options: ClientOptions) -> BridgeJobClient:
+    """Build an authenticated job client from validated CLI options."""
+
     return _client(
         base_url=options.base_url,
         allowed_host=options.allowed_host,

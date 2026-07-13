@@ -58,8 +58,6 @@ def _upload_files(
 def _run_job_batch(
     client: httpx.Client,
     request_id: str,
-    *,
-    review_required: bool = False,
 ) -> dict:
     claim = client.post(
         "/api/v1/jobs/batches/claim",
@@ -80,7 +78,7 @@ def _run_job_batch(
     for operation in manifest["operations"]:
         result: dict[str, object] = {
             "operation_id": operation["operation_id"],
-            "outcome": "succeeded",
+            "success": True,
             "components": {
                 "pdf_source": "succeeded",
                 "markdown": "succeeded",
@@ -89,36 +87,7 @@ def _run_job_batch(
             },
         }
         if operation["operation_type"] == "INGEST":
-            if review_required:
-                result.update(
-                    {
-                        "outcome": "review_required",
-                        "components": {
-                            "pdf_source": "succeeded",
-                            "markdown": "succeeded",
-                            "bm25": "not_applicable",
-                            "dense": "not_applicable",
-                        },
-                        "classification": {
-                            "language": "und",
-                            "status": "review_required",
-                            "method": "browser-test-parser",
-                            "reason": "low_confidence",
-                        },
-                    }
-                )
-            else:
-                result.update(
-                    {
-                        "chunk_count": 4,
-                        "classification": {
-                            "language": "en",
-                            "status": "detected",
-                            "method": "browser-test-parser",
-                            "confidence": 0.98,
-                        },
-                    }
-                )
+            result["chunk_count"] = 4
         results.append(result)
     reported = client.post(
         f"/api/v1/jobs/batches/{batch['batch_id']}/results",
@@ -365,38 +334,29 @@ def test_duplicate_confirmation_exact_duplicate_and_queue_removal(live_server: s
     os.getenv("PDF_BRIDGE_RUN_BROWSER_TESTS") != "1",
     reason="set PDF_BRIDGE_RUN_BROWSER_TESTS=1 after installing Playwright Chromium",
 )
-def test_review_workspace_records_audited_language_override(app, live_server: str) -> None:
+def test_language_and_review_controls_are_absent(app, live_server: str) -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1200, "height": 820})
-        _upload_files(
+        [document_path] = _upload_files(
             page,
             live_server,
             [{"name": "quebec-policy.pdf", "mimeType": "application/pdf", "buffer": PDF_A}],
             collection="internal",
         )
+        page.goto(f"{live_server}/queue")
+        expect(page.get_by_role("link", name="Needs review")).to_have_count(0)
+        expect(page.get_by_label("Language")).to_have_count(0)
+        expect(page.get_by_role("columnheader", name="Language")).to_have_count(0)
+
         job_headers = {"Authorization": f"Bearer {app.state.settings.job_token.get_secret_value()}"}
         with httpx.Client(base_url=live_server, headers=job_headers) as job_client:
-            _run_job_batch(job_client, "browser-review-job", review_required=True)
+            _run_job_batch(job_client, "browser-collection-only-job")
 
-        page.goto(f"{live_server}/review")
-        expect(page.get_by_text("quebec-policy.pdf")).to_be_visible()
-        expect(page.get_by_text("Internal only")).to_be_visible()
-        expect(page.get_by_text("Low Confidence", exact=False)).to_be_visible()
-        page.get_by_label("Language").select_option("fr")
-        page.get_by_label("Audit reason").fill("Verified by the Quebec policy owner")
-        def classification_finished(response) -> bool:
-            return response.url.endswith("/classification")
-
-        with page.expect_response(classification_finished) as info:
-            page.get_by_role("button", name="Save language").click()
-        classification_response = info.value
-        assert classification_response.status == 200, classification_response.text()
-        expect(page.get_by_text("No documents need review")).to_be_visible()
-
-        page.goto(f"{live_server}/queue?collection=internal&language=fr")
-        expect(page.get_by_text("quebec-policy.pdf")).to_be_visible()
-        expect(page.locator(".language-label")).to_contain_text("Français")
+        page.goto(f"{live_server}{document_path}")
+        expect(page.get_by_text("Classification", exact=False)).to_have_count(0)
+        review_response = page.goto(f"{live_server}/review")
+        assert review_response is not None and review_response.status == 404
         browser.close()
 
 
@@ -428,11 +388,12 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
             assert ingest_manifest["operations"][0]["document_id"] == document_id
             assert ingest_manifest["operations"][0]["collection_key"] == "customer"
             assert ingest_manifest["operations"][0]["relative_path"].startswith(
-                "pdfs/und/customer/"
+                "pdfs/customer/"
             )
 
             def search_handler(request: httpx.Request) -> httpx.Response:
                 payload = json.loads(request.content)
+                assert "language" not in payload
                 groups = []
                 for collection in payload["collections"]:
                     if not payload["include_hits"]:
@@ -464,7 +425,6 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
                     json={
                         "query": payload["query"],
                         "mode": payload["mode"],
-                        "language": payload["language"],
                         "groups": groups,
                     },
                 )

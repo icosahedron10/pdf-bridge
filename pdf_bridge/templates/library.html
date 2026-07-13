@@ -3,7 +3,6 @@
 
 {% set selected_mode = search_mode|default('hybrid', true) %}
 {% set current_query = search_query|default('', true) %}
-{% set selected_language = language_filter|default('all', true) %}
 
 {% block title %}Collections · PDF Bridge{% endblock %}
 
@@ -36,14 +35,6 @@
           <option value="semantic" {% if selected_mode == 'semantic' %}selected{% endif %}>Semantic</option>
         </select>
       </div>
-      <div class="field field--inline field--language">
-        <label for="library-language">Language</label>
-        <select id="library-language" name="language">
-          <option value="all" {% if selected_language == 'all' %}selected{% endif %}>All languages</option>
-          <option value="en" {% if selected_language == 'en' %}selected{% endif %}>English</option>
-          <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
-        </select>
-      </div>
       <button class="button button--primary" type="submit">Search</button>
       {% if current_query %}<a class="button button--quiet" href="/library">Clear</a>{% endif %}
     </form>
@@ -55,16 +46,6 @@
         <strong>Collection counts are unavailable</strong>
         <p>{{ search_error }} No fallback search was used.</p>
       </div>
-    </div>
-  {% endif %}
-
-  {% if unassigned_review_count|default(0) %}
-    <div class="notice notice--warning" role="status">
-      <div>
-        <strong>{{ unassigned_review_count }} unassigned document{% if unassigned_review_count != 1 %}s need{% else %} needs{% endif %} review</strong>
-        <p>Assign a collection before these documents can enter either retrieval corpus.</p>
-      </div>
-      <a class="button button--quiet button--small" href="/review?collection=unassigned">Open review</a>
     </div>
   {% endif %}
 
@@ -96,7 +77,6 @@
           <dl class="collection-entry__counts">
             <div><dt>Available</dt><dd>{{ item.available }}</dd></div>
             <div><dt>Processing</dt><dd>{{ item.processing }}</dd></div>
-            <div><dt>Needs review</dt><dd>{{ item.review_required }}</dd></div>
           </dl>
 
           <div class="collection-entry__action">

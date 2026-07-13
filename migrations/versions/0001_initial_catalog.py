@@ -75,6 +75,8 @@ operation_state = sa.Enum(
 
 
 def upgrade() -> None:
+    """Create the initial document catalog, work queue, batches, and audit ledger."""
+
     op.create_table(
         "documents",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -230,6 +232,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Remove every catalog object created by this revision."""
+
     op.drop_index("ix_audit_events_event_type", table_name="audit_events")
     op.drop_index("ix_audit_events_document_time", table_name="audit_events")
     op.drop_table("audit_events")

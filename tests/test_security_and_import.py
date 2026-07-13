@@ -9,6 +9,7 @@ from litestar.testing import RequestFactory, TestClient
 from pydantic import SecretStr, ValidationError
 
 from pdf_bridge.app import create_app
+from pdf_bridge.contracts.schemas import HistoricalImportManifest
 from pdf_bridge.core.config import Settings
 from pdf_bridge.http.problems import ProblemError
 from pdf_bridge.http.security import get_actor
@@ -273,13 +274,11 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
                         "path": "one.pdf",
                         "filename": "one.pdf",
                         "collection_key": "internal",
-                        "language": "en",
                     },
                     {
                         "path": "two.pdf",
                         "filename": "two.pdf",
                         "collection_key": "internal",
-                        "language": "en",
                     },
                 ],
             }
@@ -331,7 +330,6 @@ def test_historical_import_applies_scanned_canonical_record(
                         "chunk_count": 12,
                         "pipeline_run_id": "historical-run-1",
                         "collection_key": "internal",
-                        "language": "en",
                     }
                 ],
             }
@@ -361,3 +359,19 @@ def test_historical_import_applies_scanned_canonical_record(
         assert document.chunk_count == 12
         assert document.storage_key is not None
         assert (layout.root / document.storage_key).read_bytes() == PDF_A
+
+
+def test_historical_manifest_version_two_rejects_legacy_fields() -> None:
+    with pytest.raises(ValidationError, match="language"):
+        HistoricalImportManifest.model_validate(
+            {
+                "version": 2,
+                "documents": [
+                    {
+                        "path": "existing.pdf",
+                        "collection_key": "internal",
+                        "language": "en",
+                    }
+                ],
+            }
+        )

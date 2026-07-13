@@ -16,10 +16,14 @@ class BridgeClientError(RuntimeError):
 
 
 class CliModel(BaseModel):
+    """Strict base model for command-line client data contracts."""
+
     model_config = ConfigDict(extra="forbid")
 
 
 class PullResult(CliModel):
+    """Machine-readable summary of a batch pull and local staging operation."""
+
     version: Literal[1] = 1
     batch_id: uuid.UUID | None
     request_id: str
@@ -30,6 +34,8 @@ class PullResult(CliModel):
 
 
 class ReportFile(CliModel):
+    """Validated pipeline report loaded by the Jenkins client."""
+
     version: Literal[2] = 2
     batch_id: uuid.UUID
     pipeline_run_id: str = Field(min_length=1, max_length=255)
@@ -38,6 +44,8 @@ class ReportFile(CliModel):
     @field_validator("pipeline_run_id")
     @classmethod
     def normalize_pipeline_run_id(cls, value: str) -> str:
+        """Trim and validate the pipeline run identifier."""
+
         normalized = value.strip()
         if not normalized:
             raise ValueError("pipeline_run_id must contain non-whitespace characters")
@@ -45,6 +53,8 @@ class ReportFile(CliModel):
 
     @model_validator(mode="after")
     def unique_results(self) -> ReportFile:
+        """Require exactly one result for each reported operation."""
+
         operation_ids = [result.operation_id for result in self.results]
         if len(set(operation_ids)) != len(operation_ids):
             raise ValueError("results must contain exactly one entry per operation")

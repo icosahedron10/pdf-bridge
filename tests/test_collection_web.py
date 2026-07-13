@@ -11,8 +11,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
-    LanguageCode,
-    LanguageStatus,
     ScanState,
     utc_now,
 )
@@ -21,8 +19,7 @@ from pdf_bridge.persistence.models import (
 def _document(
     *,
     filename: str,
-    collection_key: str | None,
-    language: LanguageCode,
+    collection_key: str,
     state: DocumentState = DocumentState.INGESTED,
 ) -> Document:
     document_id = uuid.uuid4()
@@ -37,17 +34,6 @@ def _document(
         idempotency_key=f"web-test:{document_id}",
         state=state,
         collection_key=collection_key,
-        language=language,
-        language_status=(
-            LanguageStatus.REVIEW_REQUIRED
-            if state == DocumentState.CLASSIFICATION_REVIEW or language == LanguageCode.UND
-            else LanguageStatus.DETECTED
-        ),
-        language_reason=(
-            "low_confidence"
-            if state == DocumentState.CLASSIFICATION_REVIEW or language == LanguageCode.UND
-            else None
-        ),
         scan_state=ScanState.CLEAN,
         scan_engine="test-clamd",
         scanned_at=utc_now(),
@@ -64,12 +50,10 @@ def test_collection_overview_and_browse_are_strictly_scoped(
     customer = _document(
         filename="customer-product.pdf",
         collection_key="customer",
-        language=LanguageCode.EN,
     )
     internal = _document(
         filename="<script>alert(1)</script>-benefits.pdf",
         collection_key="internal",
-        language=LanguageCode.FR,
     )
     with session_factory() as session:
         session.add_all([customer, internal])
@@ -90,7 +74,7 @@ def test_collection_overview_and_browse_are_strictly_scoped(
     assert "Customer-facing" in customer_page.text
     assert "<code>customer</code>" in customer_page.text
 
-    internal_page = client.get("/library/internal?language=fr")
+    internal_page = client.get("/library/internal")
     assert internal_page.status_code == 200
     assert "&lt;script&gt;alert(1)&lt;/script&gt;-benefits.pdf" in internal_page.text
     assert "<script>alert(1)</script>" not in internal_page.text
@@ -105,7 +89,6 @@ def test_root_search_shows_authoritative_collection_counts_and_preserves_query(
     internal = _document(
         filename="employee-benefits.pdf",
         collection_key="internal",
-        language=LanguageCode.EN,
     )
     with session_factory() as session:
         session.add(internal)
@@ -115,12 +98,12 @@ def test_root_search_shows_authoritative_collection_counts_and_preserves_query(
         payload = json.loads(request.content)
         assert payload["collections"] == ["customer", "internal"]
         assert payload["include_hits"] is False
+        assert "language" not in payload
         return httpx.Response(
             200,
             json={
                 "query": payload["query"],
                 "mode": payload["mode"],
-                "language": payload["language"],
                 "groups": [
                     {"collection_key": "customer", "total": 0, "hits": []},
                     {"collection_key": "internal", "total": 1, "hits": []},
@@ -131,12 +114,12 @@ def test_root_search_shows_authoritative_collection_counts_and_preserves_query(
     search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
-        response = client.get("/library?q=employee+benefits&mode=keyword&language=en")
+        response = client.get("/library?q=employee+benefits&mode=keyword")
         assert response.status_code == 200
         assert "0" in response.text
         assert "1" in response.text
         assert "matching documents" in response.text
-        expected_link = "/library/customer?q=employee+benefits&amp;mode=keyword&amp;language=en"
+        expected_link = "/library/customer?q=employee+benefits&amp;mode=keyword"
         assert expected_link in response.text
     finally:
         asyncio.run(search_client.aclose())
@@ -150,7 +133,6 @@ def test_collection_page_rejects_cross_collection_search_hits(
     internal = _document(
         filename="private-hr-policy.pdf",
         collection_key="internal",
-        language=LanguageCode.EN,
     )
     with session_factory() as session:
         session.add(internal)
@@ -164,7 +146,6 @@ def test_collection_page_rejects_cross_collection_search_hits(
             json={
                 "query": payload["query"],
                 "mode": payload["mode"],
-                "language": payload["language"],
                 "groups": [
                     {
                         "collection_key": "customer",
@@ -201,7 +182,6 @@ def test_root_search_rejects_all_counts_atomically(
     internal = _document(
         filename="employee-policy.pdf",
         collection_key="internal",
-        language=LanguageCode.EN,
     )
     with session_factory() as session:
         session.add(internal)
@@ -214,7 +194,6 @@ def test_root_search_rejects_all_counts_atomically(
             json={
                 "query": payload["query"],
                 "mode": payload["mode"],
-                "language": payload["language"],
                 "groups": [
                     {"collection_key": "customer", "total": 0, "hits": []},
                     {"collection_key": "internal", "total": 2, "hits": []},
@@ -233,16 +212,15 @@ def test_root_search_rejects_all_counts_atomically(
         asyncio.run(search_client.aclose())
 
 
-def test_undetermined_deletion_record_is_not_retrieval_eligible(
+def test_cleanup_record_is_not_retrieval_eligible(
     app,
     client: TestClient,
     session_factory: sessionmaker[Session],
 ) -> None:
     held = _document(
-        filename="held-undetermined.pdf",
+        filename="cleanup-pending.pdf",
         collection_key="customer",
-        language=LanguageCode.UND,
-        state=DocumentState.DELETE_QUEUED,
+        state=DocumentState.DELETE_CLEANUP,
     )
     with session_factory() as session:
         session.add(held)
@@ -273,7 +251,6 @@ def test_undetermined_deletion_record_is_not_retrieval_eligible(
             json={
                 "query": payload["query"],
                 "mode": payload["mode"],
-                "language": payload["language"],
                 "groups": [
                     {
                         "collection_key": "customer",
@@ -301,28 +278,12 @@ def test_undetermined_deletion_record_is_not_retrieval_eligible(
         asyncio.run(search_client.aclose())
 
 
-def test_review_and_upload_surfaces_make_collection_assignment_explicit(
-    client: TestClient,
-    session_factory: sessionmaker[Session],
-) -> None:
-    review_document = _document(
-        filename="legacy-policy.pdf",
-        collection_key=None,
-        language=LanguageCode.UND,
-        state=DocumentState.CLASSIFICATION_REVIEW,
-    )
-    with session_factory() as session:
-        session.add(review_document)
-        session.commit()
+def test_upload_requires_collection_and_review_workspace_is_absent(client: TestClient) -> None:
+    review = client.get("/review")
+    assert review.status_code == 404
 
-    review = client.get("/review?collection=unassigned")
-    assert review.status_code == 200
-    assert "Not exposed to retrieval" in review.text
-    assert "No collection assigned" in review.text
-    assert 'name="action" value="detect"' in review.text
-    assert 'name="action" value="override"' in review.text
-    assert 'name="reason"' in review.text
-
+    library = client.get("/library")
+    assert "Needs review" not in library.text
     upload = client.get("/upload")
     assert upload.status_code == 200
     assert upload.text.count('name="collection_key"') == 2

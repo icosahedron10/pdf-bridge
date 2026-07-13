@@ -12,18 +12,21 @@ from sqlalchemy.exc import IntegrityError
 
 from pdf_bridge.contracts.schemas import (
     BatchResultsRequest,
-    LanguageClassificationResult,
+    BatchResultsResponse,
     OperationResultInput,
 )
 from pdf_bridge.core.config import Settings
-from pdf_bridge.persistence.models import (
-    Document,
-    DocumentState,
-    LanguageCode,
-    LanguageStatus,
-    ScanState,
-)
+from pdf_bridge.persistence.models import Document, DocumentState, ScanState
 from pdf_bridge.services.lifecycle import validate_collection_references
+
+LANGUAGE_COLUMNS = {
+    "language",
+    "language_status",
+    "language_method",
+    "language_confidence",
+    "language_reason",
+    "language_detected_at",
+}
 
 
 def _settings_values(storage_root: Path) -> dict[str, object]:
@@ -34,6 +37,13 @@ def _settings_values(storage_root: Path) -> dict[str, object]:
         "session_secret": SecretStr("collection-test-session-secret-32-characters"),
         "job_token": SecretStr("collection-test-job-token-32-characters-long"),
     }
+
+
+def _alembic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> tuple[Config, str]:
+    database_path = tmp_path / name
+    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("PDF_BRIDGE_DATABASE_URL", database_url)
+    return Config(str(Path(__file__).parents[1] / "alembic.ini")), database_url
 
 
 def test_collections_are_required_and_validated_before_storage_is_created(
@@ -95,36 +105,50 @@ def test_collection_registry_is_bounded_by_search_contract(tmp_path: Path) -> No
         )
 
 
-def test_active_collection_references_are_validated(session_factory) -> None:
+def test_every_document_requires_collection_but_only_active_keys_are_configured(
+    session_factory,
+) -> None:
     with session_factory() as session:
-        review = Document(
-            original_filename="legacy-review.pdf",
-            normalized_filename="legacy-review.pdf",
+        missing_collection = Document(
+            original_filename="tombstone.pdf",
+            normalized_filename="tombstone.pdf",
             size_bytes=10,
             sha256="b" * 64,
-            idempotency_key="legacy-review-reference",
-            state=DocumentState.CLASSIFICATION_REVIEW,
+            idempotency_key="missing-collection-tombstone",
+            state=DocumentState.DELETED,
             scan_state=ScanState.CLEAN,
             uploader_identity="model-test",
+        )
+        session.add(missing_collection)
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+
+        tombstone = Document(
+            original_filename="retired.pdf",
+            normalized_filename="retired.pdf",
+            size_bytes=10,
+            sha256="c" * 64,
+            idempotency_key="retired-tombstone",
+            state=DocumentState.DELETED,
+            scan_state=ScanState.CLEAN,
+            uploader_identity="model-test",
+            collection_key="retired",
         )
         active = Document(
             original_filename="active.pdf",
             normalized_filename="active.pdf",
             size_bytes=10,
-            sha256="c" * 64,
+            sha256="d" * 64,
             idempotency_key="active-reference",
             state=DocumentState.QUEUED,
             scan_state=ScanState.CLEAN,
             uploader_identity="model-test",
+            collection_key="retired",
         )
-        session.add_all([review, active])
+        session.add_all([tombstone, active])
         session.flush()
 
-        with pytest.raises(RuntimeError, match="without a collection"):
-            validate_collection_references(session, {"customer"})
-
-        active.collection_key = "retired"
-        session.flush()
         with pytest.raises(RuntimeError, match="unconfigured collections: retired"):
             validate_collection_references(session, {"customer"})
 
@@ -133,271 +157,148 @@ def test_active_collection_references_are_validated(session_factory) -> None:
         validate_collection_references(session, {"customer"})
 
 
+def _failed_result(**extra: object) -> dict[str, object]:
+    return {
+        "operation_id": "00000000-0000-0000-0000-000000000001",
+        "success": False,
+        "components": {
+            "pdf_source": "failed",
+            "markdown": "not_applicable",
+            "bm25": "not_applicable",
+            "dense": "not_applicable",
+        },
+        "error": "parser failed",
+        **extra,
+    }
+
+
+def test_pipeline_result_requires_consistent_success_components_and_error() -> None:
+    with pytest.raises(ValidationError, match="non-whitespace"):
+        OperationResultInput.model_validate(_failed_result(error="   "))
+    with pytest.raises(ValidationError, match="every component"):
+        OperationResultInput.model_validate(
+            _failed_result(success=True, error=None)
+        )
+    with pytest.raises(ValidationError, match="cannot include an error"):
+        OperationResultInput.model_validate(
+            _failed_result(
+                success=True,
+                components={
+                    "pdf_source": "succeeded",
+                    "markdown": "succeeded",
+                    "bm25": "succeeded",
+                    "dense": "succeeded",
+                },
+            )
+        )
+
+
 @pytest.mark.parametrize(
-    "payload",
+    ("legacy_field", "value"),
     [
-        {
-            "language": "en",
-            "status": "detected",
-            "method": "   ",
-        },
-        {
-            "operation_id": "00000000-0000-0000-0000-000000000001",
-            "outcome": "failed",
-            "components": {
-                "pdf_source": "failed",
-                "markdown": "not_applicable",
-                "bm25": "not_applicable",
-                "dense": "not_applicable",
-            },
-            "error": "   ",
-        },
-        {
-            "operation_id": "00000000-0000-0000-0000-000000000001",
-            "outcome": "failed",
-            "components": {
-                "pdf_source": "succeeded",
-                "markdown": "succeeded",
-                "bm25": "succeeded",
-                "dense": "succeeded",
-            },
-            "classification": {
-                "language": "und",
-                "status": "review_required",
-                "method": "downstream-parser",
-                "reason": "low_confidence",
-            },
-            "error": "indexing failed after classification",
-        },
-    ],
-    ids=[
-        "blank-classification-method",
-        "blank-failure-error",
-        "review-classification-with-failed-outcome",
+        ("language", "en"),
+        ("classification", {"status": "detected"}),
+        ("outcome", "failed"),
+        ("review_required", False),
     ],
 )
-def test_pipeline_evidence_must_be_nonblank(payload: dict[str, object]) -> None:
-    model = (
-        LanguageClassificationResult
-        if "language" in payload
-        else OperationResultInput
-    )
-    with pytest.raises(ValidationError):
-        model.model_validate(payload)
+def test_pipeline_result_rejects_legacy_fields(legacy_field: str, value: object) -> None:
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        OperationResultInput.model_validate(_failed_result(**{legacy_field: value}))
+
+
+def test_batch_response_rejects_legacy_review_counter() -> None:
+    with pytest.raises(ValidationError, match="review_required"):
+        BatchResultsResponse.model_validate(
+            {
+                "batch_id": uuid.uuid4(),
+                "state": "COMPLETED",
+                "completed_at": "2026-07-12T12:00:00Z",
+                "succeeded": 1,
+                "failed": 0,
+                "review_required": 0,
+            }
+        )
 
 
 def test_pipeline_run_id_must_be_nonblank() -> None:
     with pytest.raises(ValidationError, match="pipeline_run_id"):
         BatchResultsRequest.model_validate(
-            {
-                "pipeline_run_id": "   ",
-                "results": [
-                    {
-                        "operation_id": "00000000-0000-0000-0000-000000000001",
-                        "outcome": "failed",
-                        "components": {
-                            "pdf_source": "failed",
-                            "markdown": "not_applicable",
-                            "bm25": "not_applicable",
-                            "dense": "not_applicable",
-                        },
-                        "error": "parser failed",
-                    }
-                ],
-            }
+            {"pipeline_run_id": "   ", "results": [_failed_result()]}
         )
 
 
-def test_document_language_defaults_indexes_and_confidence_constraint(
-    session_factory,
-) -> None:
-    with session_factory() as session:
-        document = Document(
-            original_filename="language.pdf",
-            normalized_filename="language.pdf",
-            size_bytes=10,
-            sha256="a" * 64,
-            idempotency_key="language-model-test",
-            state=DocumentState.QUEUED,
-            scan_state=ScanState.CLEAN,
-            uploader_identity="model-test",
-        )
-        session.add(document)
-        session.flush()
-
-        assert document.language is LanguageCode.UND
-        assert document.language_status is LanguageStatus.PENDING
-        assert document.collection_key is None
-
-        document.language_confidence = 1.01
-        with pytest.raises(IntegrityError):
-            session.flush()
-
+def test_model_schema_has_only_collection_partitioning(session_factory) -> None:
     inspector = sa.inspect(session_factory.kw["bind"])
+    columns = {column["name"]: column for column in inspector.get_columns("documents")}
     indexes = {index["name"] for index in inspector.get_indexes("documents")}
+
+    assert columns["collection_key"]["nullable"] is False
+    assert LANGUAGE_COLUMNS.isdisjoint(columns)
     assert "ix_documents_collection_state" in indexes
-    assert "ix_documents_collection_language_state" in indexes
+    assert "ix_documents_collection_language_state" not in indexes
 
 
-def test_migration_moves_only_active_legacy_documents_to_review(
+def test_blank_migration_upgrade_and_downgrade_are_collection_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    database_path = tmp_path / "legacy.sqlite3"
-    database_url = f"sqlite+pysqlite:///{database_path.as_posix()}"
-    monkeypatch.setenv("PDF_BRIDGE_DATABASE_URL", database_url)
-    alembic = Config(str(Path(__file__).parents[1] / "alembic.ini"))
-
-    command.upgrade(alembic, "0001_initial_catalog")
-    engine = sa.create_engine(database_url)
-    now = "2026-07-11 12:00:00+00:00"
-    document_ids: dict[str, str] = {}
-    with engine.begin() as connection:
-        for state in ("INGESTED", "DELETED", "CANCELLED"):
-            document_id = uuid.uuid4().hex
-            document_ids[state] = document_id
-            connection.execute(
-                sa.text(
-                    """
-                    INSERT INTO documents (
-                        id, original_filename, normalized_filename, size_bytes, sha256,
-                        content_type, idempotency_key, state, scan_state, uploader_identity,
-                        uploaded_at, updated_at
-                    ) VALUES (
-                        :id, :filename, :filename, 10, :sha256,
-                        'application/pdf', :idempotency_key, :state, 'CLEAN',
-                        'migration-test', :now, :now
-                    )
-                    """
-                ),
-                {
-                    "id": document_id,
-                    "filename": f"{state.lower()}.pdf",
-                    "sha256": state[0].lower() * 64,
-                    "idempotency_key": f"legacy-{state.lower()}",
-                    "state": state,
-                    "now": now,
-                },
-            )
-        batch_id = uuid.uuid4().hex
-        connection.execute(
-            sa.text(
-                """
-                INSERT INTO job_batches (
-                    id, request_id, state, manifest_version, operation_count,
-                    created_at, claimed_at, lease_expires_at
-                ) VALUES (
-                    :id, 'legacy-batch', 'STAGED', 1, 4, :now, :now, :now
-                )
-                """
-            ),
-            {"id": batch_id, "now": now},
-        )
-        for attempt, state in enumerate(("QUEUED", "CLAIMED", "STAGED"), start=1):
-            connection.execute(
-                sa.text(
-                    """
-                    INSERT INTO queue_operations (
-                        id, document_id, batch_id, operation_type, state, attempt,
-                        created_at, updated_at, claimed_at, lease_expires_at, staged_at,
-                        pipeline_run_id
-                    ) VALUES (
-                        :id, :document_id, :batch_id, 'INGEST', :state, :attempt,
-                        :now, :now, :now, :now, :now, 'legacy-run'
-                    )
-                    """
-                ),
-                {
-                    "id": uuid.uuid4().hex,
-                    "document_id": document_ids["INGESTED"],
-                    "batch_id": batch_id,
-                    "state": state,
-                    "attempt": attempt,
-                    "now": now,
-                },
-            )
-        connection.execute(
-            sa.text(
-                """
-                INSERT INTO queue_operations (
-                    id, document_id, batch_id, operation_type, state, attempt,
-                    created_at, updated_at, claimed_at, lease_expires_at, staged_at,
-                    pipeline_run_id
-                ) VALUES (
-                    :id, :document_id, :batch_id, 'DELETE', 'STAGED', 4,
-                    :now, :now, :now, :now, :now, 'legacy-delete-run'
-                )
-                """
-            ),
-            {
-                "id": uuid.uuid4().hex,
-                "document_id": document_ids["INGESTED"],
-                "batch_id": batch_id,
-                "now": now,
-            },
-        )
-
+    alembic, database_url = _alembic(tmp_path, monkeypatch, "blank.sqlite3")
     command.upgrade(alembic, "head")
-    with engine.connect() as connection:
-        rows = {
-            row.id: row
-            for row in connection.execute(
-                sa.text(
-                    "SELECT id, state, collection_key, language, language_status FROM documents"
-                )
-            ).mappings()
-        }
 
-    active = rows[document_ids["INGESTED"]]
-    assert active.state == "CLASSIFICATION_REVIEW"
-    assert active.collection_key is None
-    assert active.language == "und"
-    assert active.language_status == "review_required"
-    assert rows[document_ids["DELETED"]].state == "DELETED"
-    assert rows[document_ids["DELETED"]].language_status == "pending"
-    assert rows[document_ids["CANCELLED"]].state == "CANCELLED"
-    assert rows[document_ids["CANCELLED"]].language_status == "pending"
-    upgraded_columns = {
-        column["name"]: column for column in sa.inspect(engine).get_columns("documents")
-    }
-    assert upgraded_columns["language_reason"]["type"].length == 500
-
-    with engine.connect() as connection:
-        operations = list(
-            connection.execute(
-                sa.text(
-                    """
-                    SELECT operation_type, state, batch_id, claimed_at, lease_expires_at, staged_at,
-                           completed_at, pipeline_run_id
-                    FROM queue_operations
-                    ORDER BY attempt
-                    """
-                )
-            ).mappings()
-        )
-        batch = connection.execute(
-            sa.text("SELECT state, operation_count FROM job_batches WHERE id = :id"),
-            {"id": batch_id},
-        ).mappings().one()
-    assert len(operations) == 4
-    assert all(
-        operation.state == "REVIEW_REQUIRED"
-        for operation in operations
-        if operation.operation_type == "INGEST"
+    engine = sa.create_engine(database_url)
+    inspector = sa.inspect(engine)
+    columns = {column["name"]: column for column in inspector.get_columns("documents")}
+    indexes = {index["name"] for index in inspector.get_indexes("documents")}
+    document_checks = " ".join(
+        constraint["sqltext"] for constraint in inspector.get_check_constraints("documents")
     )
-    assert next(
-        operation for operation in operations if operation.operation_type == "DELETE"
-    ).state == "CANCELLED"
-    assert all(operation.batch_id is None for operation in operations)
-    assert all(operation.claimed_at is None for operation in operations)
-    assert all(operation.lease_expires_at is None for operation in operations)
-    assert all(operation.staged_at is None for operation in operations)
-    assert all(operation.completed_at is not None for operation in operations)
-    assert all(operation.pipeline_run_id is None for operation in operations)
-    assert batch.state == "EXPIRED"
-    assert batch.operation_count == 0
+    operation_checks = " ".join(
+        constraint["sqltext"]
+        for constraint in inspector.get_check_constraints("queue_operations")
+    )
+
+    assert columns["collection_key"]["nullable"] is False
+    assert LANGUAGE_COLUMNS.isdisjoint(columns)
+    assert "ix_documents_collection_state" in indexes
+    assert "ix_documents_collection_language_state" not in indexes
+    assert "CLASSIFICATION_REVIEW" not in document_checks
+    assert "REVIEW_REQUIRED" not in operation_checks
 
     command.downgrade(alembic, "0001_initial_catalog")
+    assert "collection_key" not in {
+        column["name"] for column in sa.inspect(engine).get_columns("documents")
+    }
+    engine.dispose()
+
+
+def test_nonempty_version_one_catalog_requires_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    alembic, database_url = _alembic(tmp_path, monkeypatch, "nonempty.sqlite3")
+    command.upgrade(alembic, "0001_initial_catalog")
+    engine = sa.create_engine(database_url)
+    now = "2026-07-12 12:00:00+00:00"
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                """
+                INSERT INTO documents (
+                    id, original_filename, normalized_filename, size_bytes, sha256,
+                    content_type, idempotency_key, state, scan_state, uploader_identity,
+                    uploaded_at, updated_at
+                ) VALUES (
+                    :id, 'legacy.pdf', 'legacy.pdf', 10, :sha256,
+                    'application/pdf', 'legacy-row', 'INGESTED', 'CLEAN',
+                    'migration-test', :now, :now
+                )
+                """
+            ),
+            {"id": uuid.uuid4().hex, "sha256": "a" * 64, "now": now},
+        )
+
+    with pytest.raises(RuntimeError, match="reset required.*nonempty version-1 catalog"):
+        command.upgrade(alembic, "head")
+
     columns = {column["name"] for column in sa.inspect(engine).get_columns("documents")}
     assert "collection_key" not in columns
-    assert "language" not in columns
     engine.dispose()

@@ -178,7 +178,7 @@ def report(
         typer.Option("--allow-http", help="Allow the bearer token over non-loopback HTTP."),
     ] = False,
 ) -> None:
-    """Validate and submit one outcome for every operation in a staged batch."""
+    """Validate and submit one result for every operation in a staged batch."""
 
     try:
         response = job_client.report_batch(

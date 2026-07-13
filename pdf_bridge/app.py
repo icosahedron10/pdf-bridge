@@ -87,11 +87,15 @@ def create_app(
     search_http_client: httpx.AsyncClient | None = None,
     db_provider: DBProvider | None = None,
 ) -> Litestar:
+    """Assemble and configure the PDF Bridge Litestar application."""
+
     active_settings = settings or get_settings()
     configure_logging()
 
     @asynccontextmanager
     async def lifespan(_application: Litestar):
+        """Validate persisted collection references before accepting requests."""
+
         if active_settings.app_env != "test":
             engine = build_engine(active_settings.database_url)
             try:

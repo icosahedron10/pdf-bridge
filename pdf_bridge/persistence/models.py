@@ -11,7 +11,6 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     DateTime,
-    Float,
     ForeignKey,
     Index,
     Integer,
@@ -30,10 +29,14 @@ from .db import Base
 
 
 def utc_now() -> datetime:
+    """Return the current timezone-aware UTC timestamp."""
+
     return datetime.now(UTC)
 
 
 class DocumentState(str, enum.Enum):
+    """Lifecycle state of a catalog document."""
+
     QUEUED = "QUEUED"
     CLAIMED = "CLAIMED"
     STAGED = "STAGED"
@@ -46,10 +49,11 @@ class DocumentState(str, enum.Enum):
     DELETE_FAILED = "DELETE_FAILED"
     CANCEL_CLEANUP = "CANCEL_CLEANUP"
     CANCELLED = "CANCELLED"
-    CLASSIFICATION_REVIEW = "CLASSIFICATION_REVIEW"
 
 
 class ScanState(str, enum.Enum):
+    """Malware scan outcome recorded for an uploaded document."""
+
     PENDING = "PENDING"
     CLEAN = "CLEAN"
     INFECTED = "INFECTED"
@@ -57,34 +61,26 @@ class ScanState(str, enum.Enum):
 
 
 class OperationType(str, enum.Enum):
+    """Pipeline work type represented by a queue operation."""
+
     INGEST = "INGEST"
     DELETE = "DELETE"
 
 
 class OperationState(str, enum.Enum):
+    """Lifecycle state of a queued pipeline operation."""
+
     QUEUED = "QUEUED"
     CLAIMED = "CLAIMED"
     STAGED = "STAGED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
-    REVIEW_REQUIRED = "REVIEW_REQUIRED"
-
-
-class LanguageCode(str, enum.Enum):
-    UND = "und"
-    EN = "en"
-    FR = "fr"
-
-
-class LanguageStatus(str, enum.Enum):
-    PENDING = "pending"
-    DETECTED = "detected"
-    REVIEW_REQUIRED = "review_required"
-    OVERRIDDEN = "overridden"
 
 
 class BatchState(str, enum.Enum):
+    """Lifecycle state of a leased Jenkins operation batch."""
+
     EMPTY = "EMPTY"
     CLAIMED = "CLAIMED"
     STAGED = "STAGED"
@@ -103,28 +99,18 @@ def enum_type(enum_class: type[enum.Enum], name: str) -> SAEnum:
         native_enum=False,
         create_constraint=True,
         validate_strings=True,
-        values_callable=lambda members: [member.value for member in members],
     )
 
 
 class Document(Base):
+    """Canonical catalog record for an uploaded PDF and its lifecycle metadata."""
+
     __tablename__ = "documents"
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="size_bytes_nonnegative"),
         CheckConstraint("length(sha256) = 64", name="sha256_length"),
-        CheckConstraint(
-            "language_confidence IS NULL OR "
-            "(language_confidence >= 0 AND language_confidence <= 1)",
-            name="language_confidence_range",
-        ),
         Index("ix_documents_sha256_state", "sha256", "state"),
         Index("ix_documents_collection_state", "collection_key", "state"),
-        Index(
-            "ix_documents_collection_language_state",
-            "collection_key",
-            "language",
-            "state",
-        ),
         Index(
             "ix_documents_normalized_filename_size",
             "normalized_filename",
@@ -145,25 +131,7 @@ class Document(Base):
     state: Mapped[DocumentState] = mapped_column(
         enum_type(DocumentState, "document_state"), nullable=False, index=True
     )
-    collection_key: Mapped[str | None] = mapped_column(String(63), nullable=True)
-    language: Mapped[LanguageCode] = mapped_column(
-        enum_type(LanguageCode, "language_code"),
-        nullable=False,
-        default=LanguageCode.UND,
-        server_default=LanguageCode.UND.value,
-    )
-    language_status: Mapped[LanguageStatus] = mapped_column(
-        enum_type(LanguageStatus, "language_status"),
-        nullable=False,
-        default=LanguageStatus.PENDING,
-        server_default=LanguageStatus.PENDING.value,
-    )
-    language_method: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    language_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    language_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    language_detected_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    collection_key: Mapped[str] = mapped_column(String(63), nullable=False)
 
     scan_state: Mapped[ScanState] = mapped_column(
         enum_type(ScanState, "scan_state"), nullable=False, default=ScanState.PENDING
@@ -197,6 +165,8 @@ class Document(Base):
 
 
 class JobBatch(Base):
+    """Idempotent lease grouping queue operations for a Jenkins run."""
+
     __tablename__ = "job_batches"
     __table_args__ = (CheckConstraint("operation_count >= 0", name="operation_count_nonnegative"),)
 
@@ -220,6 +190,8 @@ class JobBatch(Base):
 
 
 class QueueOperation(Base):
+    """One attempt to ingest or delete a catalog document."""
+
     __tablename__ = "queue_operations"
     __table_args__ = (
         CheckConstraint("attempt >= 1", name="attempt_positive"),
@@ -269,6 +241,8 @@ class QueueOperation(Base):
 
 
 class AuditEvent(Base):
+    """Append-only record of a security- or lifecycle-relevant action."""
+
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_document_time", "document_id", "occurred_at"),)
 
@@ -293,9 +267,13 @@ class AuditEvent(Base):
 
 @event.listens_for(AuditEvent, "before_update")
 def prevent_audit_update(_mapper: object, _connection: object, _target: AuditEvent) -> None:
+    """Reject updates so the audit ledger remains append-only."""
+
     raise RuntimeError("audit events are append-only")
 
 
 @event.listens_for(AuditEvent, "before_delete")
 def prevent_audit_delete(_mapper: object, _connection: object, _target: AuditEvent) -> None:
+    """Reject deletes so the audit ledger remains append-only."""
+
     raise RuntimeError("audit events are append-only")

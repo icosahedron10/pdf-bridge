@@ -18,19 +18,21 @@ MAX_RESPONSE_BYTES = 16 * 1024
 
 
 class ScannerError(RuntimeError):
-    pass
+    """Base failure raised by the malware-scanning boundary."""
 
 
 class ScannerUnavailableError(ScannerError):
-    pass
+    """Raised when clamd cannot be reached or completes no exchange."""
 
 
 class ScannerProtocolError(ScannerError):
-    pass
+    """Raised when clamd returns a malformed or unsafe response."""
 
 
 @dataclass(frozen=True, slots=True)
 class ScanResult:
+    """Normalized malware scan outcome stored with a document."""
+
     state: ScanState
     engine: str
     scanned_at: datetime

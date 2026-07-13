@@ -16,8 +16,6 @@ from pdf_bridge.contracts.schemas import (
     HistoricalImportItemResult,
     HistoricalImportManifest,
     HistoricalImportResponse,
-    LanguageResultStatus,
-    PipelineOutcome,
 )
 from pdf_bridge.persistence.models import (
     AuditEvent,
@@ -25,8 +23,6 @@ from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
     JobBatch,
-    LanguageCode,
-    LanguageStatus,
     OperationState,
     OperationType,
     QueueOperation,
@@ -56,11 +52,12 @@ ACTIVE_DOCUMENT_STATES = (
     DocumentState.DELETE_CLEANUP,
     DocumentState.DELETE_FAILED,
     DocumentState.CANCEL_CLEANUP,
-    DocumentState.CLASSIFICATION_REVIEW,
 )
 
 
 class LifecycleError(RuntimeError):
+    """Deliberate catalog transition failure with a stable transport code."""
+
     def __init__(self, message: str, *, code: str, status: int = 409) -> None:
         super().__init__(message)
         self.code = code
@@ -68,6 +65,8 @@ class LifecycleError(RuntimeError):
 
 
 class DuplicateDocumentError(LifecycleError):
+    """Raised when active catalog content has an identical checksum."""
+
     def __init__(self, document: Document) -> None:
         super().__init__(
             "An active document has identical file contents.",
@@ -78,6 +77,8 @@ class DuplicateDocumentError(LifecycleError):
 
 
 class PossibleDuplicateError(LifecycleError):
+    """Raised when matching filename and size require operator confirmation."""
+
     def __init__(self, documents: list[Document]) -> None:
         super().__init__(
             "A document with the same normalized filename and size already exists.",
@@ -89,6 +90,8 @@ class PossibleDuplicateError(LifecycleError):
 
 @dataclass(frozen=True, slots=True)
 class UploadRegistration:
+    """Document, operation, and storage result of registering an upload."""
+
     document: Document
     operation: QueueOperation
     promoted: PromotedFile | None
@@ -97,28 +100,35 @@ class UploadRegistration:
 
 @dataclass(frozen=True, slots=True)
 class BatchClaim:
+    """Claimed batch paired with its idempotent replay status."""
+
     batch: JobBatch
     idempotent_replay: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class BatchStage:
+    """Staged batch paired with its idempotent replay status."""
+
     batch: JobBatch
     idempotent_replay: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class DeletionCleanup:
+    """Canonical object that must be removed after a successful deletion."""
+
     document_id: uuid.UUID
     storage_key: str
 
 
 @dataclass(frozen=True, slots=True)
 class BatchReport:
+    """Applied batch outcomes plus any pending storage cleanup work."""
+
     batch: JobBatch
     succeeded: int
     failed: int
-    review_required: int = 0
     cleanup_items: tuple[DeletionCleanup, ...] = ()
     idempotent_replay: bool = False
 
@@ -155,6 +165,8 @@ def _as_utc(value: datetime) -> datetime:
 def find_preflight_duplicates(
     session: Session, *, normalized_filename: str, size_bytes: int
 ) -> list[Document]:
+    """Find recent active documents matching a normalized filename and size."""
+
     return list(
         session.scalars(
             select(Document)
@@ -170,6 +182,8 @@ def find_preflight_duplicates(
 
 
 def find_active_checksum_duplicate(session: Session, sha256: str) -> Document | None:
+    """Return the newest active document with an identical SHA-256 digest."""
+
     return session.scalar(
         select(Document)
         .where(Document.sha256 == sha256, Document.state.in_(ACTIVE_DOCUMENT_STATES))
@@ -186,32 +200,20 @@ def validate_collection_references(session: Session, configured_keys: set[str]) 
             select(Document.collection_key)
             .where(
                 Document.state.in_(ACTIVE_DOCUMENT_STATES),
-                Document.collection_key.is_not(None),
                 Document.collection_key.not_in(configured_keys),
             )
             .distinct()
         ).all()
     )
-    improperly_unassigned = session.scalar(
-        select(func.count()).select_from(Document).where(
-            Document.state.in_(
-                tuple(
-                    state
-                    for state in ACTIVE_DOCUMENT_STATES
-                    if state != DocumentState.CLASSIFICATION_REVIEW
-                )
-            ),
-            Document.collection_key.is_(None),
-        )
+    unassigned = session.scalar(
+        select(func.count()).select_from(Document).where(Document.collection_key.is_(None))
     )
     if unknown:
         raise RuntimeError(
             "active documents reference unconfigured collections: " + ", ".join(sorted(unknown))
         )
-    if improperly_unassigned:
-        raise RuntimeError(
-            "active documents without a collection must be held in classification review"
-        )
+    if unassigned:
+        raise RuntimeError("every catalog document, including tombstones, must have a collection")
 
 
 def register_staged_upload(
@@ -227,6 +229,10 @@ def register_staged_upload(
     scan_result: ScanResult,
     allow_possible_duplicate: bool,
 ) -> UploadRegistration:
+    """Validate and atomically register a scanned staged upload."""
+
+    # Resolve idempotency before duplicate checks so an exact replay returns the
+    # original operation without touching canonical storage.
     existing = (
         session.execute(
             select(Document)
@@ -259,6 +265,8 @@ def register_staged_upload(
         operation = max(ingest_operations, key=lambda item: (item.attempt, item.created_at))
         return UploadRegistration(existing, operation, None, idempotent_replay=True)
 
+    # A new request must clear filename, content, confirmation, and scanner gates
+    # before its document and initial queue operation are constructed.
     display_filename = validate_pdf_filename(filename)
     normalized = normalize_filename(display_filename)
     duplicate = find_active_checksum_duplicate(session, staged.sha256)
@@ -290,8 +298,6 @@ def register_staged_upload(
         scanned_at=scan_result.scanned_at,
         uploader_identity=actor_id,
         collection_key=collection_key,
-        language=LanguageCode.UND,
-        language_status=LanguageStatus.PENDING,
     )
     operation = QueueOperation(
         document=document,
@@ -299,6 +305,8 @@ def register_staged_upload(
         state=OperationState.QUEUED,
         attempt=1,
     )
+    # Canonical promotion and the catalog flush form one compensating boundary:
+    # remove the promoted object if persistence rejects the new records.
     promoted: PromotedFile | None = None
     try:
         promoted = promote_staged_file(staged, layout, document.id)
@@ -320,8 +328,7 @@ def register_staged_upload(
         details={
             "status": DocumentState.QUEUED.value,
             "collection_key": collection_key,
-            "language": LanguageCode.UND.value,
-            "detail": "PDF queued for ingestion and downstream language classification.",
+            "detail": "PDF queued for downstream ingestion.",
         },
     )
     _audit(
@@ -349,6 +356,8 @@ def register_staged_upload(
 def cancel_queued_document(
     session: Session, *, operation_id: uuid.UUID, actor_type: str, actor_id: str
 ) -> tuple[Document, str | None]:
+    """Mark an unclaimed ingest cancelled and return any storage cleanup key."""
+
     operation = session.scalar(
         select(QueueOperation)
         .where(QueueOperation.id == operation_id)
@@ -400,6 +409,8 @@ def finalize_cancelled_storage(
     actor_type: str,
     actor_id: str,
 ) -> Document:
+    """Complete cancellation after its canonical PDF has been removed."""
+
     document = session.get(Document, document_id)
     if document is None:
         raise LifecycleError("Document was not found.", code="document-not-found", status=404)
@@ -428,6 +439,8 @@ def finalize_cancelled_storage(
 def retry_failed_document(
     session: Session, *, operation_id: uuid.UUID, actor_type: str, actor_id: str
 ) -> QueueOperation:
+    """Create the next attempt for the current failed ingest or deletion."""
+
     failed = session.scalar(
         select(QueueOperation)
         .where(QueueOperation.id == operation_id)
@@ -486,113 +499,6 @@ def retry_failed_document(
     return operation
 
 
-def queue_classification_review(
-    session: Session,
-    *,
-    document_id: uuid.UUID,
-    collection_key: str,
-    language: LanguageCode | None,
-    reason: str | None,
-    actor_type: str,
-    actor_id: str,
-) -> QueueOperation:
-    """Resolve a held document by re-detecting or applying an audited language override."""
-
-    document = session.get(Document, document_id)
-    if document is None:
-        raise LifecycleError("Document was not found.", code="document-not-found", status=404)
-    if document.state != DocumentState.CLASSIFICATION_REVIEW:
-        raise LifecycleError(
-            "Only a document held for classification review can be resolved.",
-            code="document-not-reviewable",
-        )
-    if document.collection_key is not None and document.collection_key != collection_key:
-        raise LifecycleError(
-            "A document's collection cannot change after it has entered the pipeline.",
-            code="collection-immutable",
-        )
-    if language is None and document.collection_key is not None:
-        raise LifecycleError(
-            "Automatic detection is only available while assigning an unassigned legacy "
-            "document. Override the language or remove this review item.",
-            code="classification-detect-not-allowed",
-        )
-    if not document.storage_key:
-        raise LifecycleError(
-            "The reviewed document has no canonical PDF storage key.",
-            code="catalog-inconsistent",
-            status=500,
-        )
-    if language is not None and language not in {LanguageCode.EN, LanguageCode.FR}:
-        raise LifecycleError(
-            "A language override must be English or French.",
-            code="invalid-language-override",
-            status=422,
-        )
-    if language is not None and not (reason or "").strip():
-        raise LifecycleError(
-            "A language override requires an audit reason.",
-            code="language-override-reason-required",
-            status=422,
-        )
-
-    latest_attempt = (
-        session.scalar(
-            select(func.max(QueueOperation.attempt)).where(
-                QueueOperation.document_id == document.id,
-                QueueOperation.operation_type == OperationType.INGEST,
-            )
-        )
-        or 0
-    )
-    operation = QueueOperation(
-        document=document,
-        operation_type=OperationType.INGEST,
-        state=OperationState.QUEUED,
-        attempt=latest_attempt + 1,
-    )
-    document.collection_key = collection_key
-    document.state = DocumentState.QUEUED
-    document.last_error = None
-    if language is None:
-        document.language = LanguageCode.UND
-        document.language_status = LanguageStatus.PENDING
-        document.language_method = None
-        document.language_confidence = None
-        document.language_reason = None
-        document.language_detected_at = None
-        event_type = "language_redetection_requested"
-        details: dict[str, Any] = {
-            "collection_key": collection_key,
-            "language": LanguageCode.UND.value,
-        }
-    else:
-        document.language = language
-        document.language_status = LanguageStatus.OVERRIDDEN
-        document.language_method = "operator_override"
-        document.language_confidence = None
-        document.language_reason = reason.strip() if reason else None
-        document.language_detected_at = utc_now()
-        event_type = "language_overridden"
-        details = {
-            "collection_key": collection_key,
-            "language": language.value,
-            "reason": document.language_reason,
-        }
-    session.add(operation)
-    session.flush()
-    _audit(
-        session,
-        event_type=event_type,
-        actor_type=actor_type,
-        actor_id=actor_id,
-        document=document,
-        operation=operation,
-        details=details,
-    )
-    return operation
-
-
 def queue_document_deletion(
     session: Session,
     *,
@@ -601,6 +507,8 @@ def queue_document_deletion(
     actor_id: str,
     reason: str | None = None,
 ) -> QueueOperation:
+    """Queue deletion of an ingested document."""
+
     document = session.get(Document, document_id)
     if document is None:
         raise LifecycleError("Document was not found.", code="document-not-found", status=404)
@@ -620,16 +528,10 @@ def queue_document_deletion(
         return retry_failed_document(
             session, operation_id=failed.id, actor_type=actor_type, actor_id=actor_id
         )
-    if document.state not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}:
+    if document.state != DocumentState.INGESTED:
         raise LifecycleError(
-            "Only an ingested or review-held document can be queued for deletion.",
+            "Only an ingested document can be queued for deletion.",
             code="document-not-deletable",
-        )
-    if document.collection_key is None:
-        raise LifecycleError(
-            "Assign a collection before removing a legacy review document.",
-            code="collection-required",
-            status=422,
         )
     latest_attempt = (
         session.scalar(
@@ -660,13 +562,14 @@ def queue_document_deletion(
             "status": DocumentState.DELETE_QUEUED.value,
             "detail": reason or "Deletion queued for the pipeline.",
             "collection_key": document.collection_key,
-            "language": document.language.value,
         },
     )
     return operation
 
 
 def expire_claims(session: Session, *, now: Any | None = None) -> int:
+    """Expire elapsed leases and return their claimed operations to the queue."""
+
     current_time = now or utc_now()
     batches = (
         session.scalars(
@@ -715,6 +618,8 @@ def claim_batch(
     lease_minutes: int,
     actor_id: str = "jenkins",
 ) -> BatchClaim:
+    """Lease the oldest queued operations under an idempotent request ID."""
+
     # Expire old claims before resolving an idempotency key. Otherwise a replay
     # can keep an already-expired lease alive indefinitely.
     expire_claims(session)
@@ -794,6 +699,8 @@ def claim_batch(
 def acknowledge_staged_batch(
     session: Session, *, batch_id: uuid.UUID, operation_ids: list[uuid.UUID]
 ) -> BatchStage:
+    """Mark a claimed batch staged after an exact operation acknowledgement."""
+
     batch = (
         session.execute(
             select(JobBatch)
@@ -858,86 +765,18 @@ def acknowledge_staged_batch(
 
 def _component_rows(result: Any) -> list[dict[str, Any]]:
     components = result.components.model_dump(mode="json")
-    rows = [{"name": name, "status": status} for name, status in components.items()]
-    if result.classification is not None:
-        classification = result.classification.model_dump(mode="json")
-        rows.append({"name": "language", **classification})
-    return rows
+    return [{"name": name, "status": status} for name, status in components.items()]
 
 
 def _result_operation_state(result: Any) -> OperationState:
-    if result.outcome == PipelineOutcome.SUCCEEDED:
-        return OperationState.SUCCEEDED
-    if result.outcome == PipelineOutcome.REVIEW_REQUIRED:
-        return OperationState.REVIEW_REQUIRED
-    return OperationState.FAILED
-
-
-def _validate_ingest_classification(document: Document, result: Any) -> None:
-    classification = result.classification
-    if result.outcome == PipelineOutcome.FAILED:
-        if classification is None:
-            return
-        if document.language_status == LanguageStatus.OVERRIDDEN:
-            if (
-                classification.status != LanguageResultStatus.OVERRIDDEN
-                or classification.language != document.language
-            ):
-                raise LifecycleError(
-                    "The failed pipeline result did not preserve the operator language override.",
-                    code="classification-override-mismatch",
-                    status=422,
-                )
-        elif classification.status == LanguageResultStatus.OVERRIDDEN:
-            raise LifecycleError(
-                "The pipeline cannot create an operator override.",
-                code="classification-result-invalid",
-                status=422,
-            )
-        return
-    if classification is None:
-        raise LifecycleError(
-            "Every non-failed ingestion result requires language classification.",
-            code="classification-result-missing",
-            status=422,
-        )
-    if document.language_status == LanguageStatus.OVERRIDDEN:
-        if (
-            result.outcome != PipelineOutcome.SUCCEEDED
-            or classification.status != LanguageResultStatus.OVERRIDDEN
-            or classification.language != document.language
-        ):
-            raise LifecycleError(
-                "The pipeline result did not preserve the operator language override.",
-                code="classification-override-mismatch",
-                status=422,
-            )
-        return
-    if result.outcome == PipelineOutcome.REVIEW_REQUIRED:
-        if classification.status != LanguageResultStatus.REVIEW_REQUIRED:
-            raise LifecycleError(
-                "A review-required outcome must include undetermined classification.",
-                code="classification-result-invalid",
-                status=422,
-            )
-        return
-    if classification.language not in {LanguageCode.EN, LanguageCode.FR}:
-        raise LifecycleError(
-            "A successful ingestion must resolve to English or French.",
-            code="classification-result-invalid",
-            status=422,
-        )
-    if classification.status != LanguageResultStatus.DETECTED:
-        raise LifecycleError(
-            "Automatic ingestion must report a detected language.",
-            code="classification-result-invalid",
-            status=422,
-        )
+    return OperationState.SUCCEEDED if result.success else OperationState.FAILED
 
 
 def report_batch_results(
     session: Session, *, batch_id: uuid.UUID, request: BatchResultsRequest
 ) -> BatchReport:
+    """Apply correlated pipeline results to a staged batch and its documents."""
+
     batch = (
         session.execute(
             select(JobBatch)
@@ -957,6 +796,8 @@ def report_batch_results(
             code="batch-result-mismatch",
             status=422,
         )
+    # A finalized batch is replayable only when every material result field still
+    # matches; this prevents a reused pipeline run ID from rewriting history.
     if batch.state in {BatchState.COMPLETED, BatchState.PARTIAL, BatchState.FAILED}:
         if batch.pipeline_run_id != request.pipeline_run_id:
             raise LifecycleError(
@@ -967,7 +808,7 @@ def report_batch_results(
         for result in request.results:
             operation = by_id[result.operation_id]
             expected_state = _result_operation_state(result)
-            expected_error = result.error if result.outcome == PipelineOutcome.FAILED else None
+            expected_error = result.error if not result.success else None
             if (
                 operation.state != expected_state
                 or operation.chunk_count != result.chunk_count
@@ -979,10 +820,7 @@ def report_batch_results(
                     code="batch-result-conflict",
                 )
         succeeded = sum(op.state == OperationState.SUCCEEDED for op in batch.operations)
-        review_required = sum(
-            op.state == OperationState.REVIEW_REQUIRED for op in batch.operations
-        )
-        failed = len(batch.operations) - succeeded - review_required
+        failed = len(batch.operations) - succeeded
         cleanup_items = tuple(
             DeletionCleanup(operation.document.id, operation.document.storage_key)
             for operation in batch.operations
@@ -993,63 +831,40 @@ def report_batch_results(
             batch=batch,
             succeeded=succeeded,
             failed=failed,
-            review_required=review_required,
             cleanup_items=cleanup_items,
             idempotent_replay=True,
         )
     if batch.state != BatchState.STAGED:
         raise LifecycleError("Only a staged batch can report results.", code="batch-not-staged")
 
+    # Apply operation and document transitions with one completion timestamp so
+    # the batch remains an internally consistent audit unit.
     by_id = {operation.id: operation for operation in batch.operations}
     succeeded = 0
     failed = 0
-    review_required = 0
     cleanup_items: list[DeletionCleanup] = []
     completed_at = utc_now()
     for result in request.results:
         operation = by_id[result.operation_id]
         document = operation.document
         component_rows = _component_rows(result)
-        if operation.operation_type == OperationType.INGEST:
-            _validate_ingest_classification(document, result)
-        elif result.outcome == PipelineOutcome.REVIEW_REQUIRED or result.classification is not None:
-            raise LifecycleError(
-                "Deletion results cannot contain language classification.",
-                code="classification-result-unexpected",
-                status=422,
-            )
 
         operation.pipeline_run_id = request.pipeline_run_id
         operation.chunk_count = result.chunk_count
         operation.component_results = component_rows
         operation.completed_at = completed_at
-        if result.outcome == PipelineOutcome.SUCCEEDED:
+        if result.success:
             operation.state = OperationState.SUCCEEDED
             operation.error = None
             document.last_error = None
             document.pipeline_run_id = request.pipeline_run_id
             if operation.operation_type == OperationType.INGEST:
-                classification = result.classification
-                if classification is None:  # guarded above; keeps the type checker honest
-                    raise AssertionError("ingestion classification unexpectedly missing")
                 document.state = DocumentState.INGESTED
                 document.ingested_at = completed_at
                 document.chunk_count = result.chunk_count
-                document.language = classification.language
-                document.language_status = (
-                    LanguageStatus.OVERRIDDEN
-                    if classification.status == LanguageResultStatus.OVERRIDDEN
-                    else LanguageStatus.DETECTED
-                )
-                document.language_method = classification.method
-                document.language_confidence = classification.confidence
-                if classification.status != LanguageResultStatus.OVERRIDDEN:
-                    document.language_reason = None
-                document.language_detected_at = completed_at
                 document.pipeline_metadata = {
                     "components": component_rows,
                     "collection_key": document.collection_key,
-                    "language": classification.model_dump(mode="json"),
                 }
                 event_type = "ingestion_succeeded"
             else:
@@ -1063,30 +878,6 @@ def report_batch_results(
                 cleanup_items.append(DeletionCleanup(document.id, document.storage_key))
                 event_type = "deletion_cleanup_pending"
             succeeded += 1
-        elif result.outcome == PipelineOutcome.REVIEW_REQUIRED:
-            classification = result.classification
-            if classification is None:  # guarded above
-                raise AssertionError("review classification unexpectedly missing")
-            operation.state = OperationState.REVIEW_REQUIRED
-            operation.error = None
-            document.state = DocumentState.CLASSIFICATION_REVIEW
-            document.last_error = None
-            document.pipeline_run_id = request.pipeline_run_id
-            document.language = LanguageCode.UND
-            document.language_status = LanguageStatus.REVIEW_REQUIRED
-            document.language_method = classification.method
-            document.language_confidence = classification.confidence
-            document.language_reason = (
-                classification.reason.value if classification.reason else None
-            )
-            document.language_detected_at = completed_at
-            document.pipeline_metadata = {
-                "components": component_rows,
-                "collection_key": document.collection_key,
-                "language": classification.model_dump(mode="json"),
-            }
-            event_type = "language_review_required"
-            review_required += 1
         else:
             message = result.error or "The downstream operation failed."
             operation.state = OperationState.FAILED
@@ -1116,17 +907,18 @@ def report_batch_results(
                 "pipeline_run_id": request.pipeline_run_id,
                 "detail": operation.error,
                 "collection_key": document.collection_key,
-                "language": document.language.value,
             },
         )
 
+    # Derive the aggregate batch state only after all per-operation transitions
+    # and cleanup obligations have been recorded.
     batch.completed_at = completed_at
     batch.pipeline_run_id = request.pipeline_run_id
     batch.state = (
         BatchState.COMPLETED
-        if failed == 0 and review_required == 0
+        if failed == 0
         else BatchState.FAILED
-        if succeeded == 0 and review_required == 0
+        if succeeded == 0
         else BatchState.PARTIAL
     )
     session.flush()
@@ -1134,7 +926,6 @@ def report_batch_results(
         batch=batch,
         succeeded=succeeded,
         failed=failed,
-        review_required=review_required,
         cleanup_items=tuple(cleanup_items),
     )
 
@@ -1142,6 +933,8 @@ def report_batch_results(
 def finalize_deleted_storage(
     session: Session, *, document_id: uuid.UUID, storage_key: str
 ) -> Document:
+    """Complete deletion after the matching canonical PDF has been removed."""
+
     document = session.get(Document, document_id)
     if document is None:
         raise LifecycleError("Document was not found.", code="document-not-found", status=404)
@@ -1168,6 +961,8 @@ def finalize_deleted_storage(
 
 
 def can_serve_content(document: Document) -> bool:
+    """Return whether a clean retained document may be served to a browser."""
+
     return (
         document.scan_state == ScanState.CLEAN
         and document.storage_key is not None
@@ -1195,11 +990,15 @@ def import_historical_manifest(
     actor_id: str,
     configured_collections: set[str],
 ) -> HistoricalImportResponse:
+    """Validate, scan, and optionally register a trusted historical manifest."""
+
     manifest = HistoricalImportManifest.model_validate_json(manifest_path.read_bytes())
     results: list[HistoricalImportItemResult] = []
     promoted: list[PromotedFile] = []
     seen_sources: set[Path] = set()
     seen_checksums: set[str] = set()
+    # Each entry follows the same path, duplicate, format, and scan gates as a
+    # live upload before dry-run reporting or canonical promotion.
     try:
         for entry in manifest.documents:
             if entry.collection_key not in configured_collections:
@@ -1243,7 +1042,6 @@ def import_historical_manifest(
                             sha256=staged.sha256,
                             size_bytes=staged.size_bytes,
                             collection_key=entry.collection_key,
-                            language=entry.language,
                         )
                     )
                     continue
@@ -1262,11 +1060,6 @@ def import_historical_manifest(
                     scanned_at=scan_result.scanned_at,
                     uploader_identity=actor_id,
                     collection_key=entry.collection_key,
-                    language=entry.language,
-                    language_status=LanguageStatus.OVERRIDDEN,
-                    language_method="historical_manifest",
-                    language_reason="Operator-attested historical import metadata.",
-                    language_detected_at=entry.ingested_at or utc_now(),
                     ingested_at=entry.ingested_at or utc_now(),
                     chunk_count=entry.chunk_count,
                     pipeline_run_id=entry.pipeline_run_id,
@@ -1295,7 +1088,6 @@ def import_historical_manifest(
                     details={
                         "status": DocumentState.INGESTED.value,
                         "collection_key": entry.collection_key,
-                        "language": entry.language.value,
                     },
                 )
                 results.append(
@@ -1304,12 +1096,13 @@ def import_historical_manifest(
                         sha256=staged.sha256,
                         size_bytes=staged.size_bytes,
                         collection_key=entry.collection_key,
-                        language=entry.language,
                         document_id=document.id,
                     )
                 )
             finally:
                 staged.path.unlink(missing_ok=True)
+    # Database rollback remains manager-owned; compensate here for files already
+    # promoted before a later manifest entry failed.
     except Exception:
         for promoted_file in promoted:
             promoted_file.path.unlink(missing_ok=True)

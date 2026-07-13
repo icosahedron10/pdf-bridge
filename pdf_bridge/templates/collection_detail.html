@@ -1,9 +1,8 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import status_label, audience_label, language_label, document_icon, external_icon, empty_state, pagination %}
+{% from "macros/ui.html" import status_label, audience_label, document_icon, external_icon, empty_state, pagination %}
 
 {% set selected_mode = search_mode|default('hybrid', true) %}
 {% set current_query = search_query|default('', true) %}
-{% set selected_language = language_filter|default('all', true) %}
 {% set library_items = search_results if search_results is defined and current_query else documents|default([], true) %}
 
 {% block title %}{{ collection.display_name }} · PDF Bridge{% endblock %}
@@ -44,16 +43,8 @@
           <option value="semantic" {% if selected_mode == 'semantic' %}selected{% endif %}>Semantic</option>
         </select>
       </div>
-      <div class="field field--inline field--language">
-        <label for="library-language">Language</label>
-        <select id="library-language" name="language">
-          <option value="all" {% if selected_language == 'all' %}selected{% endif %}>All languages</option>
-          <option value="en" {% if selected_language == 'en' %}selected{% endif %}>English</option>
-          <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
-        </select>
-      </div>
       <button class="button button--primary" type="submit">Search collection</button>
-      {% if current_query or selected_language != 'all' %}<a class="button button--quiet" href="/library/{{ collection.key }}">Clear</a>{% endif %}
+      {% if current_query %}<a class="button button--quiet" href="/library/{{ collection.key }}">Clear</a>{% endif %}
     </form>
   </section>
 
@@ -73,7 +64,7 @@
         {% if current_query %}
           <p>{{ result_count|default(0) }} result{% if result_count|default(0) != 1 %}s{% endif %} in {{ collection.display_name }} for “{{ current_query }}” using {{ selected_mode }} search.</p>
         {% elif document_count is defined %}
-          <p>{{ document_count }} document{% if document_count != 1 %}s{% endif %}{% if selected_language != 'all' %} in the selected language{% endif %}.</p>
+          <p>{{ document_count }} document{% if document_count != 1 %}s{% endif %}.</p>
         {% endif %}
       </div>
     </div>
@@ -86,7 +77,6 @@
             <tr>
               <th scope="col">Document</th>
               {% if current_query %}<th scope="col">Match</th>{% endif %}
-              <th scope="col">Language</th>
               <th scope="col">Status</th>
               <th scope="col">Ingested</th>
               <th scope="col">Chunks</th>
@@ -116,7 +106,6 @@
                     {% if item.score is defined and item.score is not none %}<span class="match-score">Score {{ '%.3f'|format(item.score) }}</span>{% endif %}
                   </td>
                 {% endif %}
-                <td data-label="Language">{{ language_label(doc.language, doc.language_status) }}</td>
                 <td data-label="Status">{{ status_label(document_status) }}</td>
                 <td data-label="Ingested">{{ doc.ingested_at_display|default(doc.ingested_at, true)|default('Not reported', true) }}</td>
                 <td data-label="Chunks">{{ doc.chunk_count|default('—', true) }}</td>
@@ -141,9 +130,9 @@
       </div>
       {{ pagination(page|default(1, true), total_pages|default(1, true), '/library/' ~ collection.key, pagination_query|default('', true)) }}
     {% elif current_query and not search_error|default(false) %}
-      {{ empty_state('No matching documents in this collection', 'This is an authoritative zero for the selected collection and language.') }}
+      {{ empty_state('No matching documents in this collection', 'This is an authoritative zero for the selected collection.') }}
     {% elif not search_error|default(false) %}
-      {{ empty_state('No documents in this view', 'Upload a PDF to this collection or choose another language.', '/upload?collection=' ~ collection.key, 'Upload PDF') }}
+      {{ empty_state('No documents in this view', 'Upload a PDF to this collection.', '/upload?collection=' ~ collection.key, 'Upload PDF') }}
     {% endif %}
   </section>
 {% endblock %}

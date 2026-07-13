@@ -23,6 +23,5 @@ def duplicate_match(document: Document) -> DuplicateMatch:
         size_bytes=document.size_bytes,
         state=document.state,
         collection_key=document.collection_key,
-        language=document.language,
         detail_url=f"/documents/{document.id}",
     )

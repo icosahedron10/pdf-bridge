@@ -156,8 +156,7 @@
         setSubmitting(form, true);
 
         try {
-          // Attribute access avoids HTML named-property collisions from fields such as
-          // the classification discriminator named "action".
+          // Attribute access avoids HTML named-property collisions with form fields.
           const action = new URL(form.getAttribute("action") || window.location.href, window.location.href);
           if (action.origin !== window.location.origin) throw new Error("Cross-origin form actions are not allowed.");
 

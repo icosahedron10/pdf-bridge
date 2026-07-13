@@ -21,6 +21,8 @@ async def search_documents(
     request: SearchRequest,
     client: httpx.AsyncClient | None,
 ) -> SearchResponse:
+    """Run retrieval only after validating request and response catalog boundaries."""
+
     catalog.validate_configured_collections(definitions, request.collections)
     response = await search_retrieval(settings, request, client=client)
     catalog.validate_search_response(session, request, response)

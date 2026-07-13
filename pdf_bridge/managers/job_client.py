@@ -18,6 +18,8 @@ def pull_batch(
     result_file: Path | None,
     client_options: ClientOptions,
 ) -> PullResult:
+    """Claim, validate, download, and acknowledge one Jenkins batch."""
+
     stable_request_id = request_id or f"manual-{uuid.uuid4()}"
     claim_request = BatchClaimRequest(request_id=stable_request_id, limit=limit)
     destination_root = job_staging._validate_destination_root(destination)
@@ -32,6 +34,8 @@ def pull_batch(
                 batch_directory=None,
             )
         else:
+            # Correlate the remote claim before writing anything locally, then
+            # acknowledge only after the complete batch is durably promoted.
             remote = client.manifest(claim.batch_id)
             job_staging.validate_claim_manifest(
                 claim,
@@ -81,6 +85,8 @@ def report_batch(
     pull_result_path: Path,
     client_options: ClientOptions,
 ) -> BatchResultsResponse:
+    """Validate local result files, submit them, and verify the response batch."""
+
     parsed, request = job_staging.prepare_report_submission(
         report_path,
         pull_result_path,

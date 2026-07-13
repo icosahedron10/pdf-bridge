@@ -6,6 +6,7 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 import httpx
+import pytest
 from litestar.testing import TestClient
 
 from pdf_bridge.persistence.models import (
@@ -32,15 +33,6 @@ def _components(*, failed: str | None = None) -> dict[str, str]:
     if failed:
         values[failed] = "failed"
     return values
-
-
-def _detected_language(language: str = "en") -> dict[str, object]:
-    return {
-        "language": language,
-        "status": "detected",
-        "method": "test-parser",
-        "confidence": 0.99,
-    }
 
 
 def _claim_and_stage(
@@ -82,9 +74,7 @@ def test_end_to_end_ingest_search_and_delete(
     assert manifest["version"] == 2
     assert ingest_item["operation_type"] == "INGEST"
     assert ingest_item["collection_key"] == "customer"
-    assert ingest_item["language"] == "und"
-    assert ingest_item["classification_required"] is True
-    assert ingest_item["relative_path"] == f"pdfs/und/customer/{document_id}.pdf"
+    assert ingest_item["relative_path"] == f"pdfs/customer/{document_id}.pdf"
 
     downloaded = client.get(ingest_item["download_url"], headers=job_headers)
     assert downloaded.status_code == 200
@@ -96,10 +86,9 @@ def test_end_to_end_ingest_search_and_delete(
         "results": [
             {
                 "operation_id": ingest_item["operation_id"],
-                "outcome": "succeeded",
+                "success": True,
                 "chunk_count": 17,
                 "components": _components(),
-                "classification": _detected_language(),
             }
         ],
     }
@@ -146,11 +135,24 @@ def test_end_to_end_ingest_search_and_delete(
         "status": "succeeded",
     }
 
+    # Model the downstream Qdrant corpus with the exact identity payload the pipeline owns.
+    # Search below reads from this point, and delete removes it before reporting success.
+    qdrant_points = {
+        document_id: {
+            "document_id": document_id,
+            "collection_key": "customer",
+        }
+    }
+    assert set(qdrant_points[document_id]) == {"document_id", "collection_key"}
+
     def search_handler(request: httpx.Request) -> httpx.Response:
         request_payload = __import__("json").loads(request.content)
         groups = []
         for collection_key in request_payload["collections"]:
-            matches_customer = collection_key == "customer"
+            point = qdrant_points.get(document_id)
+            matches_customer = bool(
+                point and point["collection_key"] == collection_key == "customer"
+            )
             hits = (
                 [
                     {
@@ -175,7 +177,6 @@ def test_end_to_end_ingest_search_and_delete(
             json={
                 "query": request_payload["query"],
                 "mode": request_payload["mode"],
-                "language": request_payload.get("language"),
                 "groups": groups,
             },
         )
@@ -217,9 +218,8 @@ def test_end_to_end_ingest_search_and_delete(
     assert delete_item["operation_type"] == "DELETE"
     assert delete_item["download_url"] is None
     assert delete_item["collection_key"] == "customer"
-    assert delete_item["language"] == "en"
-    assert delete_item["classification_required"] is False
-    assert delete_item["relative_path"] == f"pdfs/en/customer/{document_id}.pdf"
+    assert delete_item["relative_path"] == f"pdfs/customer/{document_id}.pdf"
+    del qdrant_points[document_id]
     deleted = client.post(
         f"/api/v1/jobs/batches/{delete_batch['batch_id']}/results",
         headers=job_headers,
@@ -228,7 +228,7 @@ def test_end_to_end_ingest_search_and_delete(
             "results": [
                 {
                     "operation_id": delete_item["operation_id"],
-                    "outcome": "succeeded",
+                    "success": True,
                     "components": _components(),
                 }
             ],
@@ -239,32 +239,96 @@ def test_end_to_end_ingest_search_and_delete(
     assert tombstone.json()["state"] == "DELETED"
     assert tombstone.json()["detail_url"] == f"/documents/{document_id}"
     assert client.get(f"/api/v1/documents/{document_id}/content").status_code == 409
+    assert qdrant_points == {}
+
+    post_delete_search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    app.state.search_http_client = post_delete_search_client
+    try:
+        post_delete_search = client.post(
+            "/api/v1/search",
+            headers=csrf_headers,
+            json={
+                "query": "retention",
+                "mode": "hybrid",
+                "collections": ["customer"],
+                "include_hits": True,
+                "page_size": 10,
+            },
+        )
+        assert post_delete_search.status_code == 200
+        assert post_delete_search.json()["groups"] == [
+            {"collection_key": "customer", "total": 0, "hits": []}
+        ]
+    finally:
+        import asyncio
+
+        asyncio.run(post_delete_search_client.aclose())
+
     reuploaded = upload_pdf(filename="handbook.pdf", key="pipeline-key-2")
     assert reuploaded.status_code == 201
     assert reuploaded.json()["document"]["id"] != document_id
 
 
+@pytest.mark.parametrize(
+    ("case", "components", "error"),
+    [
+        (
+            "encrypted",
+            {
+                "pdf_source": "succeeded",
+                "markdown": "failed",
+                "bm25": "not_applicable",
+                "dense": "not_applicable",
+            },
+            "PDF is encrypted",
+        ),
+        (
+            "ocr-required",
+            {
+                "pdf_source": "succeeded",
+                "markdown": "failed",
+                "bm25": "not_applicable",
+                "dense": "not_applicable",
+            },
+            "PDF requires OCR",
+        ),
+        (
+            "no-text",
+            {
+                "pdf_source": "succeeded",
+                "markdown": "failed",
+                "bm25": "not_applicable",
+                "dense": "not_applicable",
+            },
+            "PDF contains no extractable text",
+        ),
+        ("dense", _components(failed="dense"), "Dense index write failed"),
+    ],
+)
 def test_failed_ingestion_can_retry(
     client: TestClient,
     csrf_headers: dict[str, str],
     upload_pdf,
     job_headers: dict[str, str],
+    case: str,
+    components: dict[str, str],
+    error: str,
 ) -> None:
-    uploaded = upload_pdf(filename="failure.pdf", key="failure-key-1")
+    uploaded = upload_pdf(filename=f"{case}.pdf", key=f"failure-{case}")
     document_id = uploaded.json()["document"]["id"]
-    batch, manifest = _claim_and_stage(client, job_headers, "jenkins-failure-001")
+    batch, manifest = _claim_and_stage(client, job_headers, f"jenkins-failure-{case}")
     operation_id = manifest["operations"][0]["operation_id"]
     failed = client.post(
         f"/api/v1/jobs/batches/{batch['batch_id']}/results",
         headers=job_headers,
         json={
-            "pipeline_run_id": "pipeline-failure-001",
+            "pipeline_run_id": f"pipeline-failure-{case}",
             "results": [
                 {
                     "operation_id": operation_id,
-                    "outcome": "failed",
-                    "components": _components(failed="dense"),
-                    "error": "Dense index write failed",
+                    "success": False,
+                    "components": components,
+                    "error": error,
                 }
             ],
         },
@@ -294,6 +358,7 @@ def test_stale_failed_attempt_cannot_be_retried(
         sha256="f" * 64,
         idempotency_key="superseded-upload-key",
         state=DocumentState.INGEST_FAILED,
+        collection_key="customer",
         scan_state=ScanState.CLEAN,
         scan_engine="test-clamd",
         scanned_at=utc_now(),
@@ -344,14 +409,13 @@ def test_mixed_batch_results_are_recorded_as_partial(
             "results": [
                 {
                     "operation_id": operations[0]["operation_id"],
-                    "outcome": "succeeded",
+                    "success": True,
                     "chunk_count": 3,
                     "components": _components(),
-                    "classification": _detected_language(),
                 },
                 {
                     "operation_id": operations[1]["operation_id"],
-                    "outcome": "failed",
+                    "success": False,
                     "components": _components(failed="dense"),
                     "error": "Dense write failed",
                 },
@@ -390,10 +454,9 @@ def test_failed_deletion_retains_canonical_pdf_and_can_retry(
                 "results": [
                     {
                         "operation_id": ingest_manifest["operations"][0]["operation_id"],
-                        "outcome": "succeeded",
+                        "success": True,
                         "chunk_count": 5,
                         "components": _components(),
-                        "classification": _detected_language(),
                     }
                 ],
             },
@@ -413,7 +476,7 @@ def test_failed_deletion_retains_canonical_pdf_and_can_retry(
             "results": [
                 {
                     "operation_id": delete_manifest["operations"][0]["operation_id"],
-                    "outcome": "failed",
+                    "success": False,
                     "components": _components(failed="bm25"),
                     "error": "BM25 removal failed",
                 }
@@ -602,10 +665,9 @@ def test_deletion_cleanup_failure_can_be_replayed(
         "results": [
             {
                 "operation_id": ingest_manifest["operations"][0]["operation_id"],
-                "outcome": "succeeded",
+                "success": True,
                 "chunk_count": 2,
                 "components": _components(),
-                "classification": _detected_language(),
             }
         ],
     }
@@ -629,7 +691,7 @@ def test_deletion_cleanup_failure_can_be_replayed(
         "results": [
             {
                 "operation_id": delete_manifest["operations"][0]["operation_id"],
-                "outcome": "succeeded",
+                "success": True,
                 "components": _components(),
             }
         ],

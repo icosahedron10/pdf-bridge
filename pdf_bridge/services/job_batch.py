@@ -99,7 +99,7 @@ def _manifest_metadata(
     operation: QueueOperation,
     *,
     configured_collection_keys: set[str],
-) -> tuple[str, str, bool, str]:
+) -> tuple[str, str]:
     document = operation.document
     collection_key = document.collection_key
     if (
@@ -121,20 +121,8 @@ def _manifest_metadata(
             title="Batch document metadata is invalid",
         )
 
-    language = getattr(document.language, "value", document.language)
-    if language not in {"und", "en", "fr"}:
-        raise ServiceError(
-            "A queued document has an unsupported language value.",
-            status=500,
-            code="invalid-batch-document-metadata",
-            title="Batch document metadata is invalid",
-        )
-
-    classification_required = (
-        operation.operation_type == OperationType.INGEST and language == "und"
-    )
-    relative_path = f"pdfs/{language}/{collection_key}/{document.id}.pdf"
-    return collection_key, language, classification_required, relative_path
+    relative_path = f"pdfs/{collection_key}/{document.id}.pdf"
+    return collection_key, relative_path
 
 
 def build_batch_manifest(
@@ -154,7 +142,7 @@ def build_batch_manifest(
 
     operations: list[BatchManifestItem] = []
     for operation in batch.operations:
-        collection_key, language, classification_required, relative_path = _manifest_metadata(
+        collection_key, relative_path = _manifest_metadata(
             operation,
             configured_collection_keys=configured_collection_keys,
         )
@@ -167,8 +155,6 @@ def build_batch_manifest(
                 size_bytes=operation.document.size_bytes,
                 sha256=operation.document.sha256,
                 collection_key=collection_key,
-                language=language,
-                classification_required=classification_required,
                 relative_path=relative_path,
                 download_url=(
                     f"/api/v1/jobs/batches/{batch.id}/operations/{operation.id}/content"

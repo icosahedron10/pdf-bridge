@@ -20,6 +20,8 @@ async def search_retrieval(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> SearchResponse:
+    """Call retrieval and strictly correlate its bounded response to the request."""
+
     configured = {collection.key for collection in settings.collections}
     unknown = [key for key in request.collections if key not in configured]
     if unknown:
@@ -70,7 +72,6 @@ async def search_retrieval(
         if (
             result.query != request.query
             or result.mode != request.mode
-            or result.language != request.language
             or actual_groups != expected_groups
             or len(result.groups) != len(request.collections)
             or invalid_hits

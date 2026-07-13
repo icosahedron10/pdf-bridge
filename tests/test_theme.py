@@ -213,7 +213,6 @@ def test_theme_css_contains_configured_tokens_and_accessible_foregrounds(
         ("/library", 200),
         ("/library/customer", 200),
         ("/queue", 200),
-        ("/review", 200),
         ("/upload", 200),
         ("/library/not-configured", 404),
     ),

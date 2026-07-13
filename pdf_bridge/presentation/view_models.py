@@ -7,12 +7,6 @@ from typing import Any
 
 from pdf_bridge.persistence.models import AuditEvent, Document, DocumentState, QueueOperation
 
-LANGUAGE_LABELS = {
-    "en": "English",
-    "fr": "Français",
-    "und": "Undetermined",
-}
-
 PREVIEW_BLOCKED_STATES = frozenset(
     {
         DocumentState.INGEST_FAILED,
@@ -29,6 +23,8 @@ CLEANUP_PENDING_STATES = frozenset(
 
 
 def format_size(size_bytes: int) -> str:
+    """Format a byte count with compact binary units for browser display."""
+
     if size_bytes < 1024:
         return f"{size_bytes} B"
     value = float(size_bytes)
@@ -41,6 +37,8 @@ def format_size(size_bytes: int) -> str:
 
 
 def format_time(value: datetime | None) -> str | None:
+    """Format an optional timestamp consistently in UTC."""
+
     if value is None:
         return None
     if value.tzinfo is None:
@@ -49,14 +47,15 @@ def format_time(value: datetime | None) -> str | None:
 
 
 def document_view(document: Document) -> dict[str, Any]:
+    """Convert a document model into the compatibility-rich template mapping."""
+
+    # Templates intentionally consume both domain-oriented and legacy display
+    # aliases; centralizing them keeps Jinja pages free of lifecycle logic.
     can_preview = (
         document.scan_state.value == "CLEAN"
         and document.storage_key is not None
         and document.state not in PREVIEW_BLOCKED_STATES
     )
-    language = getattr(document.language, "value", document.language)
-    language_status = getattr(document.language_status, "value", document.language_status)
-    confidence = document.language_confidence
     return {
         "id": str(document.id),
         "document_id": str(document.id),
@@ -92,23 +91,14 @@ def document_view(document: Document) -> dict[str, Any]:
         "pipeline_metadata": document.pipeline_metadata,
         "error_message": document.last_error,
         "collection_key": document.collection_key,
-        "language": language,
-        "language_label": LANGUAGE_LABELS.get(language, "Undetermined"),
-        "language_status": language_status,
-        "language_method": document.language_method,
-        "language_confidence": confidence,
-        "language_confidence_display": (
-            f"{confidence:.0%}" if confidence is not None else None
-        ),
-        "language_reason": document.language_reason,
-        "language_detected_at": document.language_detected_at,
-        "language_detected_at_display": format_time(document.language_detected_at),
         "can_preview": can_preview,
         "cleanup_pending": document.state in CLEANUP_PENDING_STATES,
     }
 
 
 def operation_view(operation: QueueOperation) -> dict[str, Any]:
+    """Convert a queue operation and its document into template-ready data."""
+
     return {
         "id": str(operation.id),
         "operation_id": str(operation.id),
@@ -138,6 +128,8 @@ def operation_view(operation: QueueOperation) -> dict[str, Any]:
 
 
 def audit_event_view(event: AuditEvent) -> dict[str, Any]:
+    """Convert an audit event into its concise timeline representation."""
+
     details = event.details or {}
     return {
         "id": event.id,
@@ -156,6 +148,8 @@ def audit_event_view(event: AuditEvent) -> dict[str, Any]:
 
 
 def components_view(operation: QueueOperation | None) -> list[dict[str, Any]]:
+    """Return pipeline component rows for an operation when reported."""
+
     if not operation or not operation.component_results:
         return []
     return [

@@ -30,6 +30,8 @@ def database_url() -> str:
 
 
 def run_migrations_offline() -> None:
+    """Run migrations without creating a live database connection."""
+
     context.configure(
         url=database_url(),
         target_metadata=target_metadata,
@@ -43,6 +45,8 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    """Run migrations through an engine configured from the resolved URL."""
+
     configuration = config.get_section(config.config_ini_section, {})
     configuration["sqlalchemy.url"] = database_url()
     connectable = engine_from_config(

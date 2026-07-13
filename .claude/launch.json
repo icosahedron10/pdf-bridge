@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pdf-bridge-demo",
+      "runtimeExecutable": "C:\\Users\\madse\\OneDrive\\Documents\\pdf-storage-manager\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "C:\\Users\\madse\\AppData\\Local\\Temp\\claude\\C--Users-madse-OneDrive-Documents-pdf-storage-manager\\ff865188-d271-4113-b7c8-cf46be4652cc\\scratchpad\\demo_server.py"
+      ],
+      "port": 8123
+    }
+  ]
+}

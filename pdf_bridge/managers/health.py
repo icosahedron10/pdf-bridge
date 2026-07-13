@@ -16,4 +16,6 @@ def check_dependencies(
     *,
     scanner_probe: Callable[..., bool],
 ) -> dict[str, str]:
+    """Probe database, storage, scanner, and retrieval dependencies."""
+
     return dependency_checks(settings, session, scanner_probe=scanner_probe)

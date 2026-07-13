@@ -16,7 +16,6 @@ from pdf_bridge.contracts.schemas import (
     UploadResponse,
 )
 from pdf_bridge.core.config import CollectionDefinition, Settings
-from pdf_bridge.persistence.models import LanguageCode
 from pdf_bridge.services import document
 from pdf_bridge.services.scanner import Scanner
 from pdf_bridge.services.storage import AsyncReadable
@@ -30,6 +29,8 @@ def preflight_upload(
     size_bytes: int,
     collection_key: str,
 ) -> UploadPreflightResponse:
+    """Validate upload metadata and find possible catalog duplicates."""
+
     return document.preflight_upload(
         session,
         definitions=definitions,
@@ -55,6 +56,10 @@ async def upload_document(
     actor_type: str,
     actor_id: str,
 ) -> UploadResponse:
+    """Prepare, scan, register, and commit a document upload atomically."""
+
+    # Expensive streaming and malware scanning happen before the transition lock;
+    # only canonical promotion and catalog mutation need serialization.
     idempotency_key = document.validate_idempotency_key(
         header_value=header_idempotency_key,
         form_value=form_idempotency_key,
@@ -104,6 +109,8 @@ async def upload_document(
 
 
 def content(session: Session, *, document_id: UUID, storage_root: Path):
+    """Resolve a document that is eligible to be served from storage."""
+
     return document.content(
         session,
         document_id=document_id,
@@ -121,6 +128,8 @@ def cancel_queue_item(
     actor_id: str,
     remove_file: Callable[..., None],
 ) -> DocumentMutationResponse:
+    """Cancel a queued ingest and finalize its storage cleanup."""
+
     with transition_lock:
         try:
             record, storage_key = document.begin_queue_cancellation(
@@ -166,42 +175,13 @@ def retry_queue_item(
     actor_type: str,
     actor_id: str,
 ) -> DocumentMutationResponse:
+    """Commit a new queue attempt for a retryable document."""
+
     with transition_lock:
         try:
             response = document.retry_queue_item(
                 session,
                 operation_id=operation_id,
-                actor_type=actor_type,
-                actor_id=actor_id,
-            )
-            session.commit()
-        except Exception:
-            session.rollback()
-            raise
-    return response
-
-
-def resolve_classification(
-    session: Session,
-    *,
-    definitions: Sequence[CollectionDefinition],
-    transition_lock: RLock,
-    document_id: UUID,
-    collection_key: str | None,
-    language: LanguageCode | None,
-    reason: str | None,
-    actor_type: str,
-    actor_id: str,
-) -> DocumentMutationResponse:
-    with transition_lock:
-        try:
-            response = document.resolve_classification(
-                session,
-                definitions=definitions,
-                document_id=document_id,
-                collection_key=collection_key,
-                language=language,
-                reason=reason,
                 actor_type=actor_type,
                 actor_id=actor_id,
             )
@@ -221,6 +201,8 @@ def request_deletion(
     actor_id: str,
     reason: str | None,
 ) -> DocumentMutationResponse:
+    """Commit a request to delete an eligible document."""
+
     with transition_lock:
         try:
             response = document.request_deletion(
