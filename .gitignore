@@ -13,6 +13,8 @@ output/playwright/
 test-results/
 dist/
 build/
+!interactive-docs/build/
+!interactive-docs/build/sites-vite-plugin.ts
 *.db
 *.sqlite*
 runtime-data/
