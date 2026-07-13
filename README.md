@@ -28,16 +28,16 @@ collection, and either publishes it or asks an operator to choose Keep, Replace,
 ## Runtime shape
 
 ```mermaid
-flowchart LR
-    O["Operator browser"] -->|"upload · poll · decide"| B["PDF Bridge /api/v1"]
-    B --> S[("SQLite + canonical/analysis storage")]
+graph LR
+    O["Operator browser"] --> B["PDF Bridge API"]
+    B --> S["SQLite and canonical / analysis storage"]
     B --> C["ClamAV"]
     B --> W["Two-slot internal worker"]
     W --> P["Resource-limited pypdf subprocess"]
-    W --> M["Private embedding + LLM endpoints"]
-    W --> Q[("Qdrant active aliases + private screening")]
-    R["External retrieval service"] -->|"active aliases only"| Q
-    B -->|"stable search request/response"| R
+    W --> M["Private embedding and LLM endpoints"]
+    W --> Q["Qdrant active aliases and private screening"]
+    R["External retrieval service"] --> Q
+    B --> R
 ```
 
 The supported topology is SQLite plus exactly one Uvicorn application process. The worker uses two
