@@ -226,7 +226,7 @@ def test_enterprise_mode_disables_all_openapi_routes(tmp_path: Path) -> None:
         database_url=f"sqlite+pysqlite:///{database_path.as_posix()}",
         session_secret=SecretStr("enterprise-docs-session-secret-32-characters"),
         job_token=SecretStr("enterprise-docs-job-token-32-characters-long"),
-        allowed_hosts=["testserver"],
+        allowed_hosts=["testserver.local"],
         trusted_proxy_cidrs=["127.0.0.0/8"],
         collections=[
             {
@@ -244,7 +244,7 @@ def test_enterprise_mode_disables_all_openapi_routes(tmp_path: Path) -> None:
 
     with TestClient(
         application,
-        base_url="http://testserver",
+        base_url="http://testserver.local",
         raise_server_exceptions=True,
     ) as test_client:
         for path in (
@@ -301,6 +301,53 @@ def test_historical_import_dry_run_rejects_duplicate_manifest_contents(
             actor_id="import-test",
             configured_collections={"customer", "internal"},
         )
+
+
+def test_historical_import_stages_through_temporary_not_quarantine(
+    tmp_path: Path, session_factory
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    (source_root / "historic.pdf").write_bytes(PDF_A)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "documents": [
+                    {
+                        "path": "historic.pdf",
+                        "filename": "historic.pdf",
+                        "collection_key": "internal",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    layout = StorageLayout.from_root(tmp_path / "bridge-storage")
+    observed: dict[str, Path] = {}
+
+    def capturing_scanner(path: Path):
+        observed["parent"] = path.parent
+        return clean_scanner(path)
+
+    with session_factory() as session:
+        import_historical_manifest(
+            session,
+            manifest_path=manifest,
+            source_root=source_root,
+            layout=layout,
+            scanner=capturing_scanner,
+            max_bytes=1024 * 1024,
+            dry_run=True,
+            actor_id="import-staging-test",
+            configured_collections={"customer", "internal"},
+        )
+
+    assert observed["parent"] == layout.temporary
+    assert list(layout.temporary.iterdir()) == []
+    assert list(layout.quarantine.iterdir()) == []
 
 
 def test_historical_source_path_cannot_escape_root(tmp_path: Path) -> None:

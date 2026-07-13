@@ -9,6 +9,7 @@ from pydantic import SecretStr, ValidationError
 
 from pdf_bridge.app import create_app
 from pdf_bridge.core.config import Settings
+from pdf_bridge.persistence.db import build_engine, create_schema
 from tests.conftest import clean_scanner
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +57,7 @@ def settings_kwargs(tmp_path: Path) -> dict[str, object]:
         "database_url": "sqlite+pysqlite:///:memory:",
         "session_secret": SecretStr("theme-test-session-secret-at-least-32-characters"),
         "job_token": SecretStr("theme-test-job-token-different-at-least-32-characters"),
+        "allowed_hosts": ["testserver.local", "localhost", "127.0.0.1"],
         "collections": [
             {
                 "key": "customer",
@@ -176,12 +178,17 @@ def test_theme_css_contains_configured_tokens_and_accessible_foregrounds(
         "brand_secondary_1": "#805500",
         "brand_secondary_2": "#ffeeaa",
     }
-    settings = Settings(**settings_kwargs, **configured)
+    # The lifespan validates the served catalog, so use the default file-backed
+    # SQLite database beneath the storage root and create its schema first.
+    settings = Settings(**{**settings_kwargs, "database_url": ""}, **configured)
+    engine = build_engine(settings.database_url)
+    create_schema(engine)
+    engine.dispose()
     application = create_app(settings, scanner=clean_scanner)
 
     with TestClient(
         application,
-        base_url="http://testserver",
+        base_url="http://testserver.local",
         raise_server_exceptions=True,
     ) as client:
         response = client.get("/theme.css")

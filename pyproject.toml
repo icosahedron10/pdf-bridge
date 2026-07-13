@@ -50,6 +50,10 @@ markers = [
   "browser: runs a real Playwright browser against a live local app",
   "clamav: requires a live clamd service",
 ]
+filterwarnings = [
+  # Tests must use testserver.local; the bare test host breaks cookie handling.
+  "error:The base_url.*might cause issues:UserWarning",
+]
 
 [tool.ruff]
 target-version = "py312"

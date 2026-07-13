@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
+import io
+import os
 import re
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 from litestar.testing import TestClient
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge.app import create_app
+from pdf_bridge.managers import document as document_manager
 from pdf_bridge.persistence.models import (
+    AuditEvent,
     Document,
     DocumentState,
     OperationState,
@@ -23,7 +29,7 @@ from pdf_bridge.persistence.models import (
     utc_now,
 )
 from pdf_bridge.services.scanner import ScannerProtocolError, ScannerUnavailableError, ScanResult
-from pdf_bridge.services.storage import StorageLayout, stream_upload
+from pdf_bridge.services.storage import StorageLayout, promote_staged_file, stream_upload
 from tests.conftest import PDF_A, PDF_B, clean_scanner
 
 
@@ -262,10 +268,10 @@ def test_cancel_cleanup_failure_can_be_retried(
 
 
 def test_trusted_host_accepts_arbitrary_valid_ports(client: TestClient) -> None:
-    matched = client.get("/library", headers={"Host": "testserver:49152"})
+    matched = client.get("/library", headers={"Host": "testserver.local:49152"})
     unmatched = client.get(
         "/api/v1/does-not-exist",
-        headers={"Host": "testserver:65535"},
+        headers={"Host": "testserver.local:65535"},
     )
 
     assert matched.status_code == 200
@@ -277,8 +283,8 @@ def test_trusted_host_accepts_arbitrary_valid_ports(client: TestClient) -> None:
     (
         ("/library", "evil.example:443"),
         ("/api/v1/does-not-exist", "evil.example"),
-        ("/library", "testserver:not-a-port"),
-        ("/library", "testserver:"),
+        ("/library", "testserver.local:not-a-port"),
+        ("/library", "testserver.local:"),
         ("/library", "testserver..example"),
         ("/api/v1/does-not-exist", ""),
     ),
@@ -344,14 +350,15 @@ def test_trusted_host_wildcard_accepts_only_subdomains(
 
 def test_concurrent_distinct_uploads_are_all_registered(
     app,
+    client: TestClient,
 ) -> None:
     def upload(index: int) -> tuple[int, str]:
-        # Do not enter multiple concurrent lifespan contexts for one Litestar
-        # app. Independent non-context clients preserve separate browser
-        # sessions while sharing the app's transition lock.
+        # The client fixture keeps the single lifespan open. Additional
+        # non-context clients preserve separate browser sessions while sharing
+        # the app's transition lock and lifespan-owned state.
         worker = TestClient(
             app,
-            base_url="http://testserver",
+            base_url="http://testserver.local",
             raise_server_exceptions=True,
         )
         page = worker.get("/upload")
@@ -445,7 +452,7 @@ def test_idempotency_commit_race_uses_the_winning_catalog_row(
     try:
         with TestClient(
             application,
-            base_url="http://testserver",
+            base_url="http://testserver.local",
             raise_server_exceptions=True,
         ) as race_client:
             page = race_client.get("/upload")
@@ -477,14 +484,229 @@ def test_idempotency_commit_race_uses_the_winning_catalog_row(
     else:
         assert response.status_code == 409, response.text
         assert response.json()["code"] == "idempotency-key-conflict"
+    # The losing request promoted canonical bytes before its commit lost the
+    # race; resolving the conflict must also remove that orphaned object.
+    assert list((settings.storage_root / "objects").rglob("*.pdf")) == []
+    assert list((settings.storage_root / "quarantine").iterdir()) == []
 
 
-def test_interrupted_upload_removes_partial_temporary_file(tmp_path) -> None:
+def _assert_upload_state_is_clean(
+    settings, session_factory: sessionmaker[Session]
+) -> None:
+    """Assert no catalog rows or canonical/staged bytes survived a failed upload."""
+
+    assert list((settings.storage_root / "objects").rglob("*.pdf")) == []
+    assert list((settings.storage_root / "quarantine").iterdir()) == []
+    assert list((settings.storage_root / "temporary").iterdir()) == []
+    with session_factory() as session:
+        assert session.scalars(select(Document)).all() == []
+        assert session.scalars(select(AuditEvent)).all() == []
+
+
+def _upload_through(client: TestClient, *, key: str) -> object:
+    page = client.get("/upload")
+    token_match = re.search(r'<meta name="csrf-token" content="([^"]+)"', page.text)
+    assert token_match
+    return client.post(
+        "/api/v1/uploads",
+        headers={"X-CSRF-Token": token_match.group(1), "Idempotency-Key": key},
+        files={"file": ("compensated.pdf", PDF_A, "application/pdf")},
+        data={
+            "idempotency_key": key,
+            "possible_duplicate_confirmed": "false",
+            "collection_key": "customer",
+        },
+    )
+
+
+def test_commit_failure_rolls_back_and_removes_promoted_bytes(
+    settings,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_session = session_factory()
+
+    def database_override():
+        yield request_session
+
+    def failing_commit() -> None:
+        raise RuntimeError("simulated commit failure")
+
+    application = create_app(settings, scanner=clean_scanner, db_provider=database_override)
+    monkeypatch.setattr(request_session, "commit", failing_commit)
+    try:
+        with TestClient(
+            application,
+            base_url="http://testserver.local",
+            raise_server_exceptions=False,
+        ) as client:
+            response = _upload_through(client, key="commit-failure-key")
+    finally:
+        request_session.close()
+
+    assert response.status_code == 500
+    _assert_upload_state_is_clean(settings, session_factory)
+
+
+def test_audit_flush_failure_rolls_back_and_removes_promoted_bytes(
+    settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    request_session = session_factory()
+
+    @event.listens_for(request_session, "before_flush")
+    def reject_audit_rows(session, _flush_context, _instances) -> None:
+        if any(isinstance(item, AuditEvent) for item in session.new):
+            raise RuntimeError("simulated audit insert failure")
+
+    def database_override():
+        yield request_session
+
+    application = create_app(settings, scanner=clean_scanner, db_provider=database_override)
+    try:
+        with TestClient(
+            application,
+            base_url="http://testserver.local",
+            raise_server_exceptions=False,
+        ) as client:
+            response = _upload_through(client, key="audit-flush-failure-key")
+    finally:
+        request_session.close()
+
+    assert response.status_code == 500
+    _assert_upload_state_is_clean(settings, session_factory)
+
+
+def test_upload_compensation_failure_is_surfaced_not_swallowed(
+    settings,
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_unlink = Path.unlink
+
+    def selective_unlink(self: Path, missing_ok: bool = False) -> None:
+        if "objects" in self.parts:
+            raise OSError("canonical cleanup blocked")
+        original_unlink(self, missing_ok=missing_ok)
+
+    def failing_commit() -> None:
+        raise RuntimeError("simulated commit failure")
+
+    with session_factory() as session:
+        monkeypatch.setattr(session, "commit", failing_commit)
+        monkeypatch.setattr(Path, "unlink", selective_unlink)
+        with pytest.raises(OSError, match="canonical cleanup blocked") as failure:
+            document_manager.upload_document(
+                session,
+                settings=settings,
+                scanner=clean_scanner,
+                transition_lock=threading.RLock(),
+                file=io.BytesIO(PDF_A),
+                filename="cleanup-failure.pdf",
+                content_type="application/pdf",
+                collection_key="customer",
+                possible_duplicate_confirmed=False,
+                header_idempotency_key="cleanup-failure-key",
+                form_idempotency_key=None,
+                actor_type="anonymous",
+                actor_id="compensation-test",
+            )
+
+    # The transaction failure stays visible as the chained context, and the
+    # orphaned object remains on disk because its removal was refused.
+    assert isinstance(failure.value.__context__, RuntimeError)
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    orphaned = list((settings.storage_root / "objects").rglob("*.pdf"))
+    assert len(orphaned) == 1
+    with session_factory() as session:
+        assert session.scalars(select(Document)).all() == []
+
+
+def test_uploads_stage_in_quarantine_before_private_promotion(
+    app,
+    client: TestClient,
+    upload_pdf,
+    settings,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def capturing_scanner(path: Path) -> ScanResult:
+        observed["parent"] = path.parent
+        observed["mode"] = path.stat().st_mode & 0o777
+        return ScanResult(state=ScanState.CLEAN, engine="test-clamd", scanned_at=utc_now())
+
+    app.state.scanner = capturing_scanner
+    response = upload_pdf(key="quarantine-staging-key")
+
+    assert response.status_code == 201, response.text
+    assert observed["parent"] == settings.storage_root / "quarantine"
+    if os.name == "posix":
+        assert observed["mode"] == 0o600
+    assert list((settings.storage_root / "quarantine").iterdir()) == []
+    stored = list((settings.storage_root / "objects").rglob("*.pdf"))
+    assert len(stored) == 1
+    assert stored[0].read_bytes() == PDF_A
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX private file modes")
+def test_staged_and_promoted_files_keep_private_posix_modes(tmp_path) -> None:
+    layout = StorageLayout.from_root(tmp_path / "mode-storage")
+    staged = stream_upload(io.BytesIO(PDF_A), layout, max_bytes=1024 * 1024)
+    assert staged.path.stat().st_mode & 0o777 == 0o600
+    promoted = promote_staged_file(staged, layout, uuid.uuid4())
+    assert promoted.path.stat().st_mode & 0o777 == 0o600
+    for directory in (layout.objects, layout.temporary, layout.quarantine):
+        assert directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_staging_permission_failures_propagate(tmp_path, monkeypatch) -> None:
+    layout = StorageLayout.from_root(tmp_path / "denied-storage")
+
+    def denied_open(*_args, **_kwargs):
+        raise PermissionError("private staging refused")
+
+    monkeypatch.setattr(os, "open", denied_open)
+    with pytest.raises(PermissionError, match="private staging refused"):
+        stream_upload(io.BytesIO(PDF_A), layout, max_bytes=1024 * 1024)
+
+
+def test_liveness_responds_while_an_upload_blocks_a_worker_thread(
+    app,
+    client: TestClient,
+) -> None:
+    scan_entered = threading.Event()
+    release_scan = threading.Event()
+
+    def blocking_scanner(_path: Path) -> ScanResult:
+        scan_entered.set()
+        assert release_scan.wait(timeout=15), "test released the scanner"
+        return ScanResult(state=ScanState.CLEAN, engine="test-clamd", scanned_at=utc_now())
+
+    app.state.scanner = blocking_scanner
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        # Both the upload and the liveness probe go through the same client,
+        # so both coroutines share the fixture's single event loop.
+        pending_upload = executor.submit(_upload_through, client, key="blocking-upload-key")
+        try:
+            assert scan_entered.wait(timeout=15), "upload never reached the scanner"
+            # The upload handler is parked in a worker thread; the event loop
+            # must still answer liveness immediately.
+            live = client.get("/api/v1/health/live")
+            assert live.status_code == 200
+            assert not pending_upload.done()
+        finally:
+            release_scan.set()
+        response = pending_upload.result(timeout=30)
+    assert response.status_code == 201, response.text
+
+
+def test_interrupted_upload_removes_partial_quarantine_file(tmp_path) -> None:
     class InterruptedReader:
         def __init__(self) -> None:
             self.reads = 0
 
-        async def read(self, _size: int = -1) -> bytes:
+        def read(self, _size: int = -1) -> bytes:
             self.reads += 1
             if self.reads == 1:
                 return PDF_A[:20]
@@ -492,5 +714,6 @@ def test_interrupted_upload_removes_partial_temporary_file(tmp_path) -> None:
 
     layout = StorageLayout.from_root(tmp_path / "interrupted-storage")
     with pytest.raises(ConnectionError, match="disconnected"):
-        asyncio.run(stream_upload(InterruptedReader(), layout, max_bytes=1024))
+        stream_upload(InterruptedReader(), layout, max_bytes=1024)
+    assert list(layout.quarantine.iterdir()) == []
     assert list(layout.temporary.iterdir()) == []

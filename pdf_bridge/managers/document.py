@@ -18,7 +18,7 @@ from pdf_bridge.contracts.schemas import (
 from pdf_bridge.core.config import CollectionDefinition, Settings
 from pdf_bridge.services import document
 from pdf_bridge.services.scanner import Scanner
-from pdf_bridge.services.storage import AsyncReadable
+from pdf_bridge.services.storage import BinaryReadable
 
 
 def preflight_upload(
@@ -40,13 +40,13 @@ def preflight_upload(
     )
 
 
-async def upload_document(
+def upload_document(
     session: Session,
     *,
     settings: Settings,
     scanner: Scanner,
     transition_lock: RLock,
-    file: AsyncReadable,
+    file: BinaryReadable,
     filename: str,
     content_type: str | None,
     collection_key: str,
@@ -64,7 +64,7 @@ async def upload_document(
         header_value=header_idempotency_key,
         form_value=form_idempotency_key,
     )
-    prepared = await document.prepare_upload(
+    prepared = document.prepare_upload(
         settings=settings,
         scanner=scanner,
         file=file,
@@ -75,6 +75,8 @@ async def upload_document(
     registration = None
     try:
         with transition_lock:
+            # Compensation covers registration, audit inserts, and the commit
+            # itself: any transaction failure removes the promoted bytes.
             try:
                 registration = document.register_upload(
                     session,
@@ -89,8 +91,7 @@ async def upload_document(
                 session.commit()
             except IntegrityError as exc:
                 session.rollback()
-                if registration is not None and registration.promoted is not None:
-                    registration.promoted.path.unlink(missing_ok=True)
+                document.discard_promoted_upload(registration)
                 return document.resolve_idempotency_conflict(
                     session,
                     prepared=prepared,
@@ -99,6 +100,7 @@ async def upload_document(
                 )
             except Exception:
                 session.rollback()
+                document.discard_promoted_upload(registration)
                 raise
     finally:
         prepared.staged.path.unlink(missing_ok=True)

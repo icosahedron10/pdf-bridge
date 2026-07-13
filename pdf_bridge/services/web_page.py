@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import ceil
 from typing import Any
@@ -56,7 +55,7 @@ PROCESSING_STATES = tuple(
 )
 PAGE_SIZE = 25
 
-SearchRetriever = Callable[..., Awaitable[SearchResponse]]
+SearchRetriever = Callable[..., SearchResponse]
 ScannerPing = Callable[..., bool]
 ThemeRenderer = Callable[[Settings], str]
 
@@ -169,7 +168,7 @@ def index_location() -> str:
     return "/library"
 
 
-async def build_library_page(
+def build_library_page(
     state: WebRequestState,
     db: Session,
     *,
@@ -209,7 +208,7 @@ async def build_library_page(
                 page=1,
                 page_size=1,
             )
-            search_response = await search_retriever(
+            search_response = search_retriever(
                 state.settings,
                 search_request,
                 client=state.search_http_client,
@@ -243,7 +242,7 @@ async def build_library_page(
     return PageResult("library.html", context, response_status)
 
 
-async def build_collection_page(
+def build_collection_page(
     state: WebRequestState,
     db: Session,
     *,
@@ -295,7 +294,7 @@ async def build_collection_page(
                 page=page,
                 page_size=PAGE_SIZE,
             )
-            search_response = await search_retriever(
+            search_response = search_retriever(
                 state.settings,
                 search_request,
                 client=state.search_http_client,
@@ -467,7 +466,7 @@ def build_queue_page(
     return PageResult("queue.html", context)
 
 
-async def build_upload_page(
+def build_upload_page(
     state: WebRequestState,
     *,
     collection: str,
@@ -476,8 +475,7 @@ async def build_upload_page(
     """Build upload limits, collection choices, and scanner readiness context."""
 
     settings = state.settings
-    scanner_available = await asyncio.to_thread(
-        scanner_ping,
+    scanner_available = scanner_ping(
         host=settings.clamd_host,
         port=settings.clamd_port,
         timeout=min(settings.clamd_timeout, 1.0),

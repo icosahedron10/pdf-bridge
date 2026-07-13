@@ -77,13 +77,6 @@ def get_session_factory() -> sessionmaker[Session]:
     return build_session_factory(get_engine())
 
 
-def get_db() -> Iterator[Session]:
-    """Request dependency; commit and rollback are deliberately manager-owned."""
-
-    with get_session_factory()() as session:
-        yield session
-
-
 @contextmanager
 def session_scope(
     factory: sessionmaker[Session] | None = None,

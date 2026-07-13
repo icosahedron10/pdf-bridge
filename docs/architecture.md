@@ -8,8 +8,7 @@ lifecycle. The downstream pipeline owns derived artifacts and retrieval indexes.
 
 ```mermaid
 flowchart LR
-    O["Operator browser"] -->|"upload, browse, retry, delete"| B["PDF Bridge"]
-    C["Chatbot or API client"] -->|"grouped search"| B
+    O["Operator browser"] -->|"upload, browse, search, retry, delete"| B["PDF Bridge"]
     B --> D[("Catalog")]
     B --> S["Canonical PDF storage"]
     B --> V["ClamAV"]
@@ -21,7 +20,12 @@ flowchart LR
     B -->|"correlated grouped request"| R["Retrieval service"]
     R --> Q
     R -->|"document UUID hits"| B
+    C["External chatbot"] -->|"authorized retrieval outside PDF Bridge"| R
 ```
+
+Bridge search is an operator workspace feature. The external chatbot reaches the retrieval service
+directly: its end-user authorization and answer generation happen outside PDF Bridge, which never
+proxies or authenticates chatbot traffic.
 
 The interfaces remain under `/api/v1`. Batch manifests, batch report files, and historical import
 manifests remain version 2. Their version numbers are stable even though this disposable POC reset
@@ -31,7 +35,7 @@ changes the version 2 shapes atomically.
 
 | Component | Owns | Does not own |
 |---|---|---|
-| PDF Bridge | UUID, collection, hash, canonical bytes, lifecycle, queue, audit history, retrieval authorization | Parsing, derived artifacts, retrieval ranking |
+| PDF Bridge | UUID, collection, hash, canonical bytes, lifecycle, queue, audit history, retrieval eligibility | Parsing, derived artifacts, retrieval ranking, chatbot end-user authorization |
 | ClamAV | Malware verdict for uploaded bytes | Document lifecycle or downstream ingestion |
 | Jenkins client | Leasing, verified staging, pipeline invocation, complete result reporting | Catalog mutation outside the job API |
 | Parser/RAG pipeline | PDF source copy, Markdown, chunks, BM25, dense/Qdrant data, downstream deletion | UUID or collection assignment |
@@ -42,9 +46,10 @@ are display metadata and never determine routing or identity.
 
 ## Application structure
 
-Controllers translate HTTP and CLI requests. Managers coordinate use cases. Services implement
-storage, lifecycle, staging, and retrieval rules. Pydantic contracts validate every public or job
-boundary. SQLAlchemy models and repositories persist the catalog.
+Controllers translate HTTP and CLI requests. Managers coordinate use cases and own transaction
+boundaries. Services implement storage, lifecycle, staging, and retrieval rules. Pydantic contracts
+validate every public or job boundary. SQLAlchemy models in the persistence layer map the catalog;
+there is no separate repository layer.
 
 Dependencies point inward:
 
@@ -125,9 +130,12 @@ cleanup; no alternate resolution workflow mutates document placement.
 ## Upload and duplicate handling
 
 1. The operator chooses a configured collection and uploads a PDF.
-2. The bridge validates request bounds, streams to quarantine, hashes the bytes, checks PDF shape,
-   and invokes ClamAV.
-3. A clean PDF is promoted to canonical storage and receives an ingest operation.
+2. The framework spools each multipart file part to bounded temporary storage while parsing the
+   request. The bridge validates request bounds, copies the part into a private `quarantine/`
+   staging file under the storage root while hashing the bytes and checking PDF shape, and invokes
+   ClamAV on the quarantined copy. `temporary/` is reserved for historical import staging.
+3. A clean PDF is promoted atomically from quarantine to canonical storage and receives an ingest
+   operation.
 4. Exact active duplicates return the existing document identity and collection without creating
    another operation.
 5. Rejected or infected bytes never become available content.
@@ -152,8 +160,9 @@ idempotent replays, and cleanup recovery remain explicit states.
 
 ## Retrieval boundary
 
-API and web search use the same catalog predicate: the document must be in an eligible lifecycle
-state and belong to the requested collection. Eligible documents are `INGESTED`, `DELETE_QUEUED`,
+Search through PDF Bridge is operator-only: the operator API and web search use the same catalog
+predicate — the document must be in an eligible lifecycle state and belong to the requested
+collection. Chatbot authorization and generation remain outside the bridge. Eligible documents are `INGESTED`, `DELETE_QUEUED`,
 `DELETE_CLAIMED`, and `DELETE_FAILED`; cleanup and tombstone states are excluded.
 
 The bridge sends grouped requests to retrieval and validates the complete response before exposing

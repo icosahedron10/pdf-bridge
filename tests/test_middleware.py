@@ -37,7 +37,7 @@ def test_chunked_upload_is_stopped_at_litestar_request_limit(
 
     with TestClient(
         application,
-        base_url="http://testserver",
+        base_url="http://testserver.local",
         raise_server_exceptions=True,
     ) as client:
         page = client.get("/upload")

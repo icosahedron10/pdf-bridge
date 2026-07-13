@@ -18,7 +18,8 @@ from litestar.openapi.plugins import JsonRenderPlugin, SwaggerRenderPlugin
 from litestar.plugins.jinja import JinjaTemplateEngine
 from litestar.static_files import create_static_files_router
 from litestar.template.config import TemplateConfig
-from sqlalchemy.orm import Session
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge import __version__
 from pdf_bridge.controllers.api import create_api_routers
@@ -28,7 +29,7 @@ from pdf_bridge.core.config import Settings, get_settings
 from pdf_bridge.core.logging_config import configure_logging
 from pdf_bridge.http.middleware import PortAwareTrustedHostMiddleware, RequestContextMiddleware
 from pdf_bridge.http.problems import exception_handlers
-from pdf_bridge.persistence.db import build_engine, build_session_factory, get_db
+from pdf_bridge.persistence.db import build_engine, build_session_factory
 from pdf_bridge.services.lifecycle import validate_collection_references
 from pdf_bridge.services.scanner import Scanner, scanner_from_settings
 
@@ -39,6 +40,14 @@ UPLOAD_REQUEST_OVERHEAD_BYTES = 1_048_576
 def _session_key(settings: Settings) -> bytes:
     secret = settings.session_secret.get_secret_value().encode("utf-8")
     return hashlib.sha256(b"pdf-bridge/session/v1\0" + secret).digest()
+
+
+def _db_from_state(state: State) -> Iterator[Session]:
+    """Yield a request session from the lifespan-owned session factory."""
+
+    factory: sessionmaker[Session] = state.db_session_factory
+    with factory() as session:
+        yield session
 
 
 def _normalize_openapi_not_found(response: Response) -> Response:
@@ -84,30 +93,47 @@ def create_app(
     settings: Settings | None = None,
     *,
     scanner: Scanner | None = None,
-    search_http_client: httpx.AsyncClient | None = None,
+    search_http_client: httpx.Client | None = None,
     db_provider: DBProvider | None = None,
 ) -> Litestar:
     """Assemble and configure the PDF Bridge Litestar application."""
 
     active_settings = settings or get_settings()
+    if db_provider is not None and active_settings.app_env != "test":
+        raise RuntimeError("custom database providers are supported only in test mode")
     configure_logging()
 
     @asynccontextmanager
-    async def lifespan(_application: Litestar):
-        """Validate persisted collection references before accepting requests."""
+    async def lifespan(application: Litestar):
+        """Own the engine, session factory, and retrieval client for the app.
 
-        if active_settings.app_env != "test":
-            engine = build_engine(active_settings.database_url)
-            try:
+        Owned resources are built from the settings given to ``create_app`` so
+        the validated database is the served database, and they are always
+        released — including when startup validation fails. Injected resources
+        remain caller-owned and are never closed here.
+        """
+
+        engine: Engine | None = None
+        owned_search_client: httpx.Client | None = None
+        try:
+            if db_provider is None:
+                engine = build_engine(active_settings.database_url)
                 factory = build_session_factory(engine)
                 with factory() as session:
                     validate_collection_references(
                         session,
                         {collection.key for collection in active_settings.collections},
                     )
-            finally:
+                application.state.db_session_factory = factory
+            if search_http_client is None:
+                owned_search_client = httpx.Client(timeout=active_settings.search_api_timeout)
+                application.state.search_http_client = owned_search_client
+            yield
+        finally:
+            if owned_search_client is not None:
+                owned_search_client.close()
+            if engine is not None:
                 engine.dispose()
-        yield
 
     state_values: dict[str, object] = {
         "settings": active_settings,
@@ -143,7 +169,7 @@ def create_app(
         dependencies={
             # Litestar manages generator dependency cleanup itself; its
             # sync_to_thread flag intentionally has no effect on generators.
-            "db": Provide(db_provider or get_db),
+            "db": Provide(db_provider or _db_from_state),
         },
         exception_handlers=exception_handlers,
         lifespan=[lifespan],

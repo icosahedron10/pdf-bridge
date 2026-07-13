@@ -236,8 +236,9 @@ def upload_preflight(
     dependencies=_CSRF_ACTOR_DEPENDENCIES,
     status_code=201,
     responses=problem_responses(),
+    sync_to_thread=True,
 )
-async def upload_document(
+def upload_document(
     request: Request,
     data: MultipartBody[UploadForm],
     actor: NamedDependency[Actor],
@@ -247,12 +248,14 @@ async def upload_document(
     """Scan, register, and queue a multipart PDF upload."""
 
     try:
-        return await document.upload_document(
+        # Litestar rewinds the spooled multipart part before the handler runs,
+        # so its plain synchronous file object streams from the beginning.
+        return document.upload_document(
             db,
             settings=request.app.state.settings,
             scanner=request.app.state.scanner,
             transition_lock=request.app.state.transition_lock,
-            file=data.file,
+            file=data.file.file,
             filename=data.file.filename or "",
             content_type=data.file.content_type,
             collection_key=data.collection_key,
@@ -281,7 +284,7 @@ async def upload_document(
     except ServiceError as exc:
         raise _service_problem(exc) from exc
     finally:
-        await data.file.close()
+        data.file.file.close()
 
 
 @get(
@@ -408,22 +411,27 @@ def request_document_deletion(
     dependencies=_CSRF_CHECK_DEPENDENCIES,
     status_code=200,
     responses=problem_responses(),
+    sync_to_thread=True,
 )
-async def search_documents(
+def search_documents(
     request: Request,
     data: JSONBody[SearchRequest],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> SearchResponse:
-    """Search configured collections through the external retrieval service."""
+    """Search configured collections through the external retrieval service.
+
+    Bridge search is an operator workspace feature; chatbot authorization and
+    answer generation happen outside PDF Bridge against retrieval directly.
+    """
 
     try:
-        return await search.search_documents(
+        return search.search_documents(
             db,
             settings=request.app.state.settings,
             definitions=request.app.state.settings.collections,
             request=data,
-            client=getattr(request.app.state, "search_http_client", None),
+            client=request.app.state.search_http_client,
         )
     except ServiceError as exc:
         raise _service_problem(exc) from exc

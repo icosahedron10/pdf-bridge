@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -39,7 +38,7 @@ from pdf_bridge.services.lifecycle import (
 )
 from pdf_bridge.services.scanner import Scanner, ScanResult
 from pdf_bridge.services.storage import (
-    AsyncReadable,
+    BinaryReadable,
     InvalidFilenameError,
     StagedFile,
     StorageLayout,
@@ -125,11 +124,11 @@ def preflight_upload(
     )
 
 
-async def prepare_upload(
+def prepare_upload(
     *,
     settings: Settings,
     scanner: Scanner,
-    file: AsyncReadable,
+    file: BinaryReadable,
     filename: str,
     content_type: str | None,
     collection_key: str,
@@ -158,14 +157,14 @@ async def prepare_upload(
         )
 
     layout = StorageLayout.from_root(settings.storage_root)
-    staged = await stream_upload(
+    staged = stream_upload(
         file,
         layout,
         max_bytes=settings.max_upload_bytes,
         chunk_bytes=settings.upload_chunk_bytes,
     )
     try:
-        scan_result = await asyncio.to_thread(scanner, staged.path)
+        scan_result = scanner(staged.path)
     except Exception:
         staged.path.unlink(missing_ok=True)
         raise
@@ -201,6 +200,18 @@ def register_upload(
         scan_result=prepared.scan_result,
         allow_possible_duplicate=possible_duplicate_confirmed,
     )
+
+
+def discard_promoted_upload(registration: UploadRegistration | None) -> None:
+    """Remove canonical bytes promoted by an upload whose transaction failed.
+
+    Removal failures propagate so an orphaned canonical object is never
+    silently left behind; the transaction failure remains chained as context.
+    """
+
+    if registration is None or registration.promoted is None:
+        return
+    registration.promoted.path.unlink(missing_ok=True)
 
 
 def resolve_idempotency_conflict(

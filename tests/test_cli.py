@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from typer.testing import CliRunner
 
@@ -19,10 +20,13 @@ from pdf_bridge.controllers.admin_cli import app as admin_app
 from pdf_bridge.controllers.job_cli import (
     app as job_app,
 )
-from pdf_bridge.persistence.models import BatchState, OperationType
+from pdf_bridge.managers import importing
+from pdf_bridge.managers.importing import HistoricalImportCommitError, run_manifest_import
+from pdf_bridge.persistence.models import AuditEvent, BatchState, Document, OperationType
 from pdf_bridge.services.job_http import _problem_message
 from pdf_bridge.services.job_staging import _local_manifest, _stage_new_batch
-from tests.conftest import PDF_A, clean_scanner
+from pdf_bridge.services.storage import StorageLayout
+from tests.conftest import PDF_A, PDF_B, clean_scanner
 
 runner = CliRunner()
 
@@ -443,6 +447,129 @@ def test_job_stages_delete_metadata_without_downloading(tmp_path: Path) -> None:
     staged = json.loads((final_directory / "manifest.json").read_text(encoding="utf-8"))
     assert staged["operations"][0]["relative_path"] == relative_path
     assert not (final_directory / Path(relative_path)).exists()
+
+
+def _two_document_manifest(tmp_path: Path) -> tuple[Path, Path]:
+    """Write two distinct source PDFs plus a two-entry apply-mode manifest."""
+
+    source_root = tmp_path / "approved-sources"
+    source_root.mkdir()
+    (source_root / "first.pdf").write_bytes(PDF_A)
+    (source_root / "second.pdf").write_bytes(PDF_B)
+    manifest = tmp_path / "two-documents.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "documents": [
+                    {
+                        "path": "first.pdf",
+                        "filename": "First.pdf",
+                        "collection_key": "internal",
+                    },
+                    {
+                        "path": "second.pdf",
+                        "filename": "Second.pdf",
+                        "collection_key": "customer",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest, source_root
+
+
+@contextmanager
+def _commit_failing_scope(session_factory: sessionmaker[Session]):
+    """Session scope whose commit step fails after the import body succeeds."""
+
+    with session_factory() as session:
+        yield session
+        raise RuntimeError("simulated commit failure")
+
+
+def test_import_commit_failure_removes_every_promoted_object(
+    tmp_path: Path,
+    settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    manifest, source_root = _two_document_manifest(tmp_path)
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        run_manifest_import(
+            manifest_path=manifest,
+            source_root=source_root,
+            dry_run=False,
+            actor_id="import-commit-test",
+            settings_provider=lambda: settings,
+            scanner_factory=lambda _settings: clean_scanner,
+            session_scope_factory=lambda: _commit_failing_scope(session_factory),
+        )
+
+    layout = StorageLayout.from_root(settings.storage_root)
+    assert list(layout.objects.rglob("*.pdf")) == []
+    assert list(layout.temporary.iterdir()) == []
+    with session_factory() as session:
+        assert session.scalars(select(Document)).all() == []
+        assert session.scalars(select(AuditEvent)).all() == []
+
+
+def test_import_cleanup_failure_is_reported_alongside_commit_failure(
+    tmp_path: Path,
+    settings,
+    session_factory: sessionmaker[Session],
+    monkeypatch,
+) -> None:
+    manifest, source_root = _two_document_manifest(tmp_path)
+
+    attempted_keys: list[str] = []
+
+    def refusing_remove(_layout, storage_key: str, *, missing_ok: bool = False) -> None:
+        attempted_keys.append(storage_key)
+        raise OSError("canonical storage unavailable")
+
+    monkeypatch.setattr(importing, "remove_storage_key", refusing_remove)
+    with pytest.raises(HistoricalImportCommitError, match="could not be removed") as failure:
+        run_manifest_import(
+            manifest_path=manifest,
+            source_root=source_root,
+            dry_run=False,
+            actor_id="import-cleanup-test",
+            settings_provider=lambda: settings,
+            scanner_factory=lambda _settings: clean_scanner,
+            session_scope_factory=lambda: _commit_failing_scope(session_factory),
+        )
+
+    # Every removal was attempted, both failures are reported together, and
+    # the transaction failure remains the chained cause.
+    assert len(attempted_keys) == 2
+    for storage_key in attempted_keys:
+        assert storage_key in str(failure.value)
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    layout = StorageLayout.from_root(settings.storage_root)
+    assert len(list(layout.objects.rglob("*.pdf"))) == 2
+
+
+def test_import_dry_run_commit_failure_needs_no_compensation(
+    tmp_path: Path,
+    settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    manifest, source_root = _two_document_manifest(tmp_path)
+    with pytest.raises(RuntimeError, match="simulated commit failure"):
+        run_manifest_import(
+            manifest_path=manifest,
+            source_root=source_root,
+            dry_run=True,
+            actor_id="import-dry-run-test",
+            settings_provider=lambda: settings,
+            scanner_factory=lambda _settings: clean_scanner,
+            session_scope_factory=lambda: _commit_failing_scope(session_factory),
+        )
+
+    layout = StorageLayout.from_root(settings.storage_root)
+    assert list(layout.objects.rglob("*.pdf")) == []
+    assert list(layout.temporary.iterdir()) == []
 
 
 def test_admin_import_manifest_dry_run(

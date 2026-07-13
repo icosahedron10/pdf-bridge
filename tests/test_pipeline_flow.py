@@ -181,7 +181,7 @@ def test_end_to_end_ingest_search_and_delete(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(search_handler))
     app.state.search_http_client = search_client
     try:
         for mode in ("keyword", "semantic", "hybrid"):
@@ -205,9 +205,7 @@ def test_end_to_end_ingest_search_and_delete(
         assert collection.status_code == 200
         assert "Quarterly retention policy" in collection.text
     finally:
-        import asyncio
-
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
     deletion = client.post(f"/api/v1/documents/{document_id}/deletion", headers=csrf_headers)
     assert deletion.status_code == 200
@@ -241,7 +239,7 @@ def test_end_to_end_ingest_search_and_delete(
     assert client.get(f"/api/v1/documents/{document_id}/content").status_code == 409
     assert qdrant_points == {}
 
-    post_delete_search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+    post_delete_search_client = httpx.Client(transport=httpx.MockTransport(search_handler))
     app.state.search_http_client = post_delete_search_client
     try:
         post_delete_search = client.post(
@@ -260,9 +258,7 @@ def test_end_to_end_ingest_search_and_delete(
             {"collection_key": "customer", "total": 0, "hits": []}
         ]
     finally:
-        import asyncio
-
-        asyncio.run(post_delete_search_client.aclose())
+        post_delete_search_client.close()
 
     reuploaded = upload_pdf(filename="handbook.pdf", key="pipeline-key-2")
     assert reuploaded.status_code == 201
@@ -521,7 +517,7 @@ def test_concurrent_claims_never_overlap(
     def claim(request_id: str) -> dict:
         worker = TestClient(
             app,
-            base_url="http://testserver",
+            base_url="http://testserver.local",
             raise_server_exceptions=True,
         )
         response = worker.post(

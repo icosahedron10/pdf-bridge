@@ -14,13 +14,17 @@ from pdf_bridge.services.errors import ServiceError
 MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
-async def search_retrieval(
+def search_retrieval(
     settings: Settings,
     request: SearchRequest,
     *,
-    client: httpx.AsyncClient | None = None,
+    client: httpx.Client,
 ) -> SearchResponse:
-    """Call retrieval and strictly correlate its bounded response to the request."""
+    """Call retrieval and strictly correlate its bounded response to the request.
+
+    The client is owned by the caller: the application lifespan provides one
+    shared instance, and tests may inject their own.
+    """
 
     configured = {collection.key for collection in settings.collections}
     unknown = [key for key in request.collections if key not in configured]
@@ -43,10 +47,8 @@ async def search_retrieval(
     if settings.search_api_token:
         headers["Authorization"] = f"Bearer {settings.search_api_token.get_secret_value()}"
 
-    owns_client = client is None
-    active_client = client or httpx.AsyncClient(timeout=settings.search_api_timeout)
     try:
-        async with active_client.stream(
+        with client.stream(
             "POST",
             f"{settings.search_api_url.rstrip('/')}/search",
             json=request.model_dump(mode="json"),
@@ -54,7 +56,7 @@ async def search_retrieval(
         ) as response:
             response.raise_for_status()
             body = bytearray()
-            async for chunk in response.aiter_bytes():
+            for chunk in response.iter_bytes():
                 body.extend(chunk)
                 if len(body) > MAX_SEARCH_RESPONSE_BYTES:
                     raise ValueError("retrieval response exceeded the configured limit")
@@ -99,6 +101,3 @@ async def search_retrieval(
             code="search-invalid-response",
             title="Search response was invalid",
         ) from exc
-    finally:
-        if owns_client:
-            await active_client.aclose()

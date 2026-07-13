@@ -28,6 +28,26 @@ def test_compose_health_uses_readiness_and_larger_ephemeral_tmp() -> None:
     assert "/tmp:size=256m,mode=1777" in compose
 
 
+def test_compose_forwards_every_documented_operator_tunable() -> None:
+    compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    env_example = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    for variable in (
+        "PDF_BRIDGE_MAX_UPLOAD_BYTES",
+        "PDF_BRIDGE_MAX_UPLOAD_FILES",
+        "PDF_BRIDGE_UPLOAD_CHUNK_BYTES",
+        "PDF_BRIDGE_CLAMD_TIMEOUT",
+        "PDF_BRIDGE_CLAMD_STREAM_MAX_BYTES",
+        "PDF_BRIDGE_CLAIM_LEASE_MINUTES",
+        "PDF_BRIDGE_SEARCH_API_URL",
+        "PDF_BRIDGE_SEARCH_API_TOKEN",
+        "PDF_BRIDGE_SEARCH_API_TIMEOUT",
+    ):
+        assert f"{variable}:" in compose, variable
+        assert f"${{{variable}" in compose, variable
+        assert f"{variable}=" in env_example, variable
+
+
 def test_compose_forwards_deployment_theme_settings() -> None:
     compose = (REPOSITORY_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     env_example = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")

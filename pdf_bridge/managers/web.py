@@ -30,7 +30,7 @@ def get_index_location() -> str:
     return web_page.index_location()
 
 
-async def get_library_page(
+def get_library_page(
     state: WebRequestState,
     db: Session,
     *,
@@ -40,7 +40,7 @@ async def get_library_page(
 ) -> PageResult:
     """Build the collection library page context."""
 
-    return await web_page.build_library_page(
+    return web_page.build_library_page(
         state,
         db,
         query_value=query_value,
@@ -49,7 +49,7 @@ async def get_library_page(
     )
 
 
-async def get_collection_page(
+def get_collection_page(
     state: WebRequestState,
     db: Session,
     *,
@@ -61,7 +61,7 @@ async def get_collection_page(
 ) -> PageResult:
     """Build one collection page with optional retrieval results."""
 
-    return await web_page.build_collection_page(
+    return web_page.build_collection_page(
         state,
         db,
         collection_key=collection_key,
@@ -95,7 +95,7 @@ def get_queue_page(
     )
 
 
-async def get_upload_page(
+def get_upload_page(
     state: WebRequestState,
     *,
     collection: str,
@@ -103,7 +103,7 @@ async def get_upload_page(
 ) -> PageResult:
     """Build upload page context including scanner readiness."""
 
-    return await web_page.build_upload_page(
+    return web_page.build_upload_page(
         state,
         collection=collection,
         scanner_ping=scanner_ping,

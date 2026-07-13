@@ -31,7 +31,7 @@ def dependency_checks(
         logger.exception("readiness database check failed")
         checks["database"] = "error"
     root = Path(settings.storage_root)
-    storage_directories = (root, root / "objects", root / "temporary")
+    storage_directories = (root, root / "objects", root / "temporary", root / "quarantine")
     checks["storage"] = (
         "ok"
         if all(path.is_dir() and os.access(path, os.W_OK) for path in storage_directories)
