@@ -47,6 +47,8 @@ class CollectionDefinition(BaseModel):
     @field_validator("key")
     @classmethod
     def validate_key(cls, value: str) -> str:
+        """Require a stable lowercase collection identifier."""
+
         if not COLLECTION_KEY.fullmatch(value):
             raise ValueError(
                 "collection key must contain only lowercase letters, numbers, hyphens, "
@@ -57,6 +59,8 @@ class CollectionDefinition(BaseModel):
     @field_validator("display_name", "description")
     @classmethod
     def validate_text(cls, value: str) -> str:
+        """Trim collection copy and reject blank display text."""
+
         stripped = value.strip()
         if not stripped:
             raise ValueError("collection display name and description cannot be blank")
@@ -118,12 +122,16 @@ class Settings(BaseSettings):
     )
     @classmethod
     def validate_brand_color(cls, value: object) -> str:
+        """Require brand colors in six-digit hexadecimal notation."""
+
         if not isinstance(value, str) or not BRAND_COLOR.fullmatch(value):
             raise ValueError("brand colors must use strict six-digit #RRGGBB hexadecimal values")
         return value
 
     @model_validator(mode="after")
     def validate_and_prepare(self) -> Settings:
+        """Validate cross-field security constraints and prepare storage directories."""
+
         collection_keys = [collection.key for collection in self.collections]
         if len(collection_keys) != len(set(collection_keys)):
             raise ValueError("collection keys must be unique")

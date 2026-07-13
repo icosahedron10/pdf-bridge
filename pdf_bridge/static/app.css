@@ -1740,7 +1740,7 @@ input[type="checkbox"] {
   flex-wrap: wrap;
 }
 
-/* Collection boundaries and multilingual catalog */
+/* Collection boundaries and catalog */
 .audience-boundary {
   display: inline-flex;
   align-items: center;
@@ -1761,35 +1761,6 @@ input[type="checkbox"] {
 }
 
 .audience-boundary--internal {
-  color: var(--color-warning);
-}
-
-.language-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--color-text-subtle);
-  font-size: 0.8rem;
-  white-space: nowrap;
-}
-
-.language-label > span {
-  min-width: 27px;
-  padding: 2px 4px;
-  background: var(--color-neutral-soft);
-  border: 1px solid var(--color-neutral-border);
-  border-radius: 4px;
-  color: var(--color-text-subtle);
-  font-family: var(--font-mono);
-  font-size: 0.64rem;
-  font-weight: 760;
-  text-align: center;
-}
-
-.language-label--und > span,
-.language-label--review-required > span {
-  background: var(--color-warning-soft);
-  border-color: var(--color-warning-border);
   color: var(--color-warning);
 }
 
@@ -1877,7 +1848,7 @@ input[type="checkbox"] {
 .collection-entry__counts {
   margin: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(72px, 1fr));
+  grid-template-columns: repeat(2, minmax(72px, 1fr));
   gap: 0;
 }
 
@@ -1959,35 +1930,6 @@ input[type="checkbox"] {
 
 .collection-entry:has(.collection-entry__search-count) {
   grid-template-columns: minmax(230px, 1.2fr) auto minmax(330px, 1fr) auto;
-}
-
-.corpus-boundary {
-  margin: -7px 0 20px;
-  padding: 12px 15px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background: transparent;
-  border-left: 3px solid var(--color-accent);
-  color: var(--color-text-subtle);
-  font-size: 0.83rem;
-}
-
-.corpus-boundary > strong {
-  flex: 0 0 auto;
-  color: var(--color-text);
-}
-
-.corpus-boundary--internal {
-  border-left-color: var(--color-warning);
-}
-
-.corpus-boundary--review {
-  border-left-color: var(--color-danger);
-}
-
-.corpus-boundary code {
-  color: var(--color-text);
 }
 
 .collection-selector {
@@ -2098,166 +2040,11 @@ input[type="checkbox"] {
   border-color: var(--color-border);
 }
 
-.review-register {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-.review-entry {
-  padding: 20px;
-  border-bottom: 1px solid var(--color-border-strong);
-}
-
-.review-entry:last-child {
-  border-bottom: 0;
-}
-
-.review-entry__header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
-}
-
-.review-entry__header h3 {
-  margin-bottom: 3px;
-}
-
-.review-entry__header h3 a {
-  color: var(--color-text);
-}
-
-.review-entry__header p {
-  margin: 0;
-  color: var(--color-text-muted);
-  font-size: 0.77rem;
-}
-
-.review-entry__boundary {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.unassigned-label {
-  padding: 4px 7px;
-  background: var(--color-danger-soft);
-  border: 1px solid var(--color-danger-border);
-  border-radius: 4px;
-  color: var(--color-danger);
-  font-size: 0.72rem;
-}
-
-.review-entry__finding {
-  margin: 14px 0;
-  padding: 10px 0;
-  display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  align-items: start;
-  border-top: 1px solid var(--color-border);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.review-entry__finding dl {
-  margin: 0;
-  display: grid;
-  grid-template-columns: minmax(180px, 2fr) minmax(100px, 1fr) minmax(100px, 1fr);
-  gap: 12px;
-}
-
-.review-entry__finding dl div {
-  min-width: 0;
-}
-
-.review-entry__finding dt {
-  color: var(--color-text-muted);
-  font-size: 0.7rem;
-}
-
-.review-entry__finding dd {
-  margin: 2px 0 0;
-  overflow-wrap: anywhere;
-  color: var(--color-text-subtle);
-  font-size: 0.8rem;
-}
-
-.review-entry__actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.review-entry__actions--single {
-  grid-template-columns: 1fr;
-}
-
-.review-action-form {
-  min-width: 0;
-  padding: 15px;
-  display: grid;
-  grid-template-columns: minmax(130px, 0.8fr) minmax(150px, 1fr) auto;
-  align-items: end;
-  gap: 10px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-}
-
-.review-action-form > div:first-of-type {
-  align-self: center;
-}
-
-.review-action-form h3,
-.review-action-form h4 {
-  margin: 0 0 3px;
-  color: var(--color-text);
-  font-size: 0.88rem;
-}
-
-.review-action-form p {
-  margin: 0;
-  color: var(--color-text-muted);
-  font-size: 0.74rem;
-}
-
-.review-action-form__reason {
-  grid-column: 1 / -2;
-}
-
-.review-action-form .form-error {
-  grid-column: 1 / -1;
-}
-
-.review-remove-form {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-}
-
-.classification-workspace {
-  margin-bottom: 24px;
-  padding: 16px;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-}
-
 .document-title__context {
   display: flex;
   align-items: center;
   gap: 7px;
   flex-wrap: wrap;
-}
-
-.status--review-required,
-.status--classification-review,
-.language-label--review-required > span {
-  background: var(--color-warning-soft);
-  border-color: var(--color-warning-border);
-  color: var(--color-warning);
 }
 
 @keyframes spin {
@@ -2291,13 +2078,6 @@ input[type="checkbox"] {
     grid-template-columns: 1fr;
   }
 
-  .review-entry__actions {
-    grid-template-columns: 1fr;
-  }
-
-  .review-remove-form {
-    grid-column: 1;
-  }
 }
 
 @media (max-width: 760px) {
@@ -2529,17 +2309,11 @@ input[type="checkbox"] {
   }
 
   .collection-entry__counts {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .collection-entry__action .button {
     width: 100%;
-  }
-
-  .corpus-boundary {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 4px;
   }
 
   .collection-selector__options {
@@ -2548,34 +2322,6 @@ input[type="checkbox"] {
 
   .collection-choice {
     min-height: 64px;
-  }
-
-  .review-entry__header,
-  .review-entry__finding {
-    grid-template-columns: 1fr;
-  }
-
-  .review-entry__header {
-    flex-direction: column;
-  }
-
-  .review-entry__finding {
-    gap: 10px;
-  }
-
-  .review-entry__finding dl {
-    grid-template-columns: 1fr;
-    gap: 8px;
-  }
-
-  .review-action-form {
-    grid-template-columns: 1fr;
-    align-items: stretch;
-  }
-
-  .review-action-form__reason,
-  .review-action-form .form-error {
-    grid-column: 1;
   }
 
   .drop-zone {
@@ -2658,11 +2404,7 @@ input[type="checkbox"] {
   }
 
   .collection-entry__counts {
-    grid-template-columns: repeat(3, 1fr);
-  }
-
-  .review-entry {
-    padding: 14px 12px;
+    grid-template-columns: repeat(2, 1fr);
   }
 
   .upload-item__icon {
@@ -2781,9 +2523,7 @@ input[type="checkbox"] {
     grid-template-columns: 1fr;
   }
 
-  .collection-ledger,
-  .review-register,
-  .corpus-boundary {
+  .collection-ledger {
     print-color-adjust: exact;
   }
 }

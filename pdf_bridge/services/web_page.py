@@ -19,8 +19,6 @@ from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
     JobBatch,
-    LanguageCode,
-    LanguageStatus,
     QueueOperation,
 )
 from pdf_bridge.presentation.view_models import (
@@ -29,6 +27,7 @@ from pdf_bridge.presentation.view_models import (
     document_view,
     operation_view,
 )
+from pdf_bridge.services import catalog
 from pdf_bridge.services.errors import ServiceError
 from pdf_bridge.services.lifecycle import ACTIVE_DOCUMENT_STATES
 
@@ -39,14 +38,6 @@ LIBRARY_STATES = (
     DocumentState.DELETE_CLEANUP,
     DocumentState.DELETE_FAILED,
 )
-RETRIEVAL_STATES = (
-    DocumentState.INGESTED,
-    DocumentState.DELETE_QUEUED,
-    DocumentState.DELETE_CLAIMED,
-    DocumentState.DELETE_FAILED,
-)
-RETRIEVAL_LANGUAGES = (LanguageCode.EN, LanguageCode.FR)
-RETRIEVAL_LANGUAGE_STATUSES = (LanguageStatus.DETECTED, LanguageStatus.OVERRIDDEN)
 QUEUE_STATES = (
     DocumentState.QUEUED,
     DocumentState.CLAIMED,
@@ -61,9 +52,8 @@ QUEUE_STATES = (
 PROCESSING_STATES = tuple(
     state
     for state in ACTIVE_DOCUMENT_STATES
-    if state not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+    if state != DocumentState.INGESTED
 )
-LANGUAGE_FILTERS = frozenset({"all", "en", "fr", "und"})
 PAGE_SIZE = 25
 
 SearchRetriever = Callable[..., Awaitable[SearchResponse]]
@@ -94,6 +84,8 @@ class PageResult:
 
 
 def collection_view(definition: Any) -> dict[str, Any]:
+    """Convert a configured collection definition to template data."""
+
     return {
         "key": definition.key,
         "display_name": definition.display_name,
@@ -103,83 +95,45 @@ def collection_view(definition: Any) -> dict[str, Any]:
 
 
 def configured_collections(settings: Settings) -> list[dict[str, Any]]:
+    """Return template mappings for every configured collection."""
+
     return [collection_view(item) for item in settings.collections]
 
 
-def normalized_language(value: str, *, allow_undetermined: bool = False) -> str:
-    normalized = value.strip().lower()
-    if normalized not in LANGUAGE_FILTERS:
-        return "all"
-    if normalized == "und" and not allow_undetermined:
-        return "all"
-    return normalized
+def collection_counts(db: Session) -> dict[str, dict[str, int]]:
+    """Aggregate collection availability and processing counts."""
 
-
-def language_value(value: str) -> LanguageCode | None:
-    return None if value == "all" else LanguageCode(value)
-
-
-def collection_counts(db: Session) -> dict[str | None, dict[str, int]]:
-    counts: dict[str | None, dict[str, int]] = {}
+    counts: dict[str, dict[str, int]] = {}
     rows = db.execute(
         select(
             Document.collection_key,
             Document.state,
-            Document.language,
-            Document.language_status,
             func.count(),
         ).group_by(
             Document.collection_key,
             Document.state,
-            Document.language,
-            Document.language_status,
         )
     ).all()
-    for collection_key, state, language, language_status, count in rows:
+    # One grouped query feeds every collection card using the same lifecycle
+    # boundary as retrieval rather than raw document totals.
+    for collection_key, state, count in rows:
         item = counts.setdefault(
             collection_key,
             {
                 "available": 0,
                 "processing": 0,
-                "review_required": 0,
-                "english": 0,
-                "french": 0,
-                "undetermined": 0,
             },
         )
-        language_code = getattr(language, "value", language)
-        if (
-            state in RETRIEVAL_STATES
-            and language_code in {"en", "fr"}
-            and language_status in RETRIEVAL_LANGUAGE_STATUSES
-        ):
+        if state in catalog.RETRIEVAL_STATES:
             item["available"] += count
-            if language_code == "en":
-                item["english"] += count
-            else:
-                item["french"] += count
         if state in PROCESSING_STATES:
             item["processing"] += count
-        if state == DocumentState.CLASSIFICATION_REVIEW:
-            item["review_required"] += count
     return counts
 
 
-def available_document_count(
-    db: Session, *, collection_key: str, language: LanguageCode | None
-) -> int:
-    filters = [
-        Document.collection_key == collection_key,
-        Document.state.in_(RETRIEVAL_STATES),
-        Document.language.in_(RETRIEVAL_LANGUAGES),
-        Document.language_status.in_(RETRIEVAL_LANGUAGE_STATUSES),
-    ]
-    if language is not None:
-        filters.append(Document.language == language)
-    return db.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
-
-
 def base_context(state: WebRequestState, *, active_page: str) -> dict[str, Any]:
+    """Build template context shared by every browser page."""
+
     return {
         "request": state.request,
         "active_page": active_page,
@@ -196,16 +150,22 @@ def base_context(state: WebRequestState, *, active_page: str) -> dict[str, Any]:
 
 
 def error_page(state: WebRequestState, *, status_code: int, title: str, message: str) -> PageResult:
+    """Build a framework-neutral error page response."""
+
     context = base_context(state, active_page="")
     context.update({"status_code": status_code, "title": title, "message": message})
     return PageResult("error.html", context, status_code)
 
 
 def render_theme_stylesheet(settings: Settings, *, renderer: ThemeRenderer) -> str:
+    """Render theme CSS through the injected presentation function."""
+
     return renderer(settings)
 
 
 def index_location() -> str:
+    """Return the canonical browser landing path."""
+
     return "/library"
 
 
@@ -215,22 +175,18 @@ async def build_library_page(
     *,
     query_value: str,
     mode: SearchMode,
-    language: str,
     search_retriever: SearchRetriever,
 ) -> PageResult:
+    """Build collection cards and optional correlated search totals."""
+
     response_status = 200
     query = query_value.strip()
-    selected_language = normalized_language(language)
     collections = configured_collections(state.settings)
     counts_by_collection = collection_counts(db)
     for collection in collections:
         collection.update(counts_by_collection.get(collection["key"], {}))
         collection.setdefault("available", 0)
         collection.setdefault("processing", 0)
-        collection.setdefault("review_required", 0)
-        collection.setdefault("english", 0)
-        collection.setdefault("french", 0)
-        collection.setdefault("undetermined", 0)
         collection["search_total"] = None
         collection["href"] = "/library/" + collection["key"]
 
@@ -240,24 +196,22 @@ async def build_library_page(
             "collections": collections,
             "search_query": query,
             "search_mode": mode.value,
-            "language_filter": selected_language,
-            "unassigned_review_count": counts_by_collection.get(None, {}).get("review_required", 0),
         }
     )
 
     if query:
         try:
+            search_request = SearchRequest(
+                query=query,
+                mode=mode,
+                collections=[item["key"] for item in collections],
+                include_hits=False,
+                page=1,
+                page_size=1,
+            )
             search_response = await search_retriever(
                 state.settings,
-                SearchRequest(
-                    query=query,
-                    mode=mode,
-                    collections=[item["key"] for item in collections],
-                    language=language_value(selected_language),
-                    include_hits=False,
-                    page=1,
-                    page_size=1,
-                ),
+                search_request,
                 client=state.search_http_client,
             )
             groups = {group.collection_key: group for group in search_response.groups}
@@ -272,34 +226,16 @@ async def build_library_page(
                     code="search-invalid-response",
                     title="Search returned incomplete collection counts",
                 )
-            validated_totals: dict[str, int] = {}
-            for collection in collections:
-                group_total = groups[collection["key"]].total
-                if group_total > available_document_count(
-                    db,
-                    collection_key=collection["key"],
-                    language=language_value(selected_language),
-                ):
-                    raise ServiceError(
-                        (
-                            "The retrieval service returned a collection total larger than the "
-                            "active PDF Bridge catalog. No partial counts were shown."
-                        ),
-                        status=502,
-                        code="search-catalog-mismatch",
-                        title="Search count exceeded the catalog",
-                    )
-                validated_totals[collection["key"]] = group_total
+            catalog.validate_search_response(db, search_request, search_response)
 
             query_string = urlencode(
                 {
                     "q": query,
                     "mode": mode.value,
-                    **({"language": selected_language} if selected_language != "all" else {}),
                 }
             )
             for collection in collections:
-                collection["search_total"] = validated_totals[collection["key"]]
+                collection["search_total"] = groups[collection["key"]].total
                 collection["href"] = f"/library/{collection['key']}?{query_string}"
         except ServiceError as exc:
             context["search_error"] = str(exc)
@@ -314,10 +250,11 @@ async def build_collection_page(
     collection_key: str,
     query_value: str,
     mode: SearchMode,
-    language: str,
     page: int,
     search_retriever: SearchRetriever,
 ) -> PageResult:
+    """Build one collection page from browsing or external retrieval results."""
+
     collection_map = {item["key"]: item for item in configured_collections(state.settings)}
     collection = collection_map.get(collection_key)
     if collection is None:
@@ -329,7 +266,6 @@ async def build_collection_page(
         )
 
     query = query_value.strip()
-    selected_language = normalized_language(language)
     context = base_context(state, active_page="library")
     response_status = 200
     context.update(
@@ -337,31 +273,31 @@ async def build_collection_page(
             "collection": collection,
             "search_query": query,
             "search_mode": mode.value,
-            "language_filter": selected_language,
             "page": page,
             "total_pages": 1,
             "pagination_query": urlencode(
                 {
                     **({"q": query, "mode": mode.value} if query else {}),
-                    **({"language": selected_language} if selected_language != "all" else {}),
                 }
             ),
         }
     )
 
+    # Search hits are correlated back to eligible catalog rows; an empty query
+    # stays entirely local and uses deterministic catalog pagination.
     try:
         if query:
+            search_request = SearchRequest(
+                query=query,
+                mode=mode,
+                collections=[collection_key],
+                include_hits=True,
+                page=page,
+                page_size=PAGE_SIZE,
+            )
             search_response = await search_retriever(
                 state.settings,
-                SearchRequest(
-                    query=query,
-                    mode=mode,
-                    collections=[collection_key],
-                    language=language_value(selected_language),
-                    include_hits=True,
-                    page=page,
-                    page_size=PAGE_SIZE,
-                ),
+                search_request,
                 client=state.search_http_client,
             )
             if (
@@ -378,38 +314,19 @@ async def build_collection_page(
                     title="Search returned the wrong collection",
                 )
             group = search_response.groups[0]
-            if group.total > available_document_count(
-                db,
-                collection_key=collection_key,
-                language=language_value(selected_language),
-            ):
-                raise ServiceError(
-                    (
-                        "The retrieval service returned a total larger than this collection's "
-                        "active catalog. No partial results were shown."
-                    ),
-                    status=502,
-                    code="search-catalog-mismatch",
-                    title="Search count exceeded the catalog",
-                )
+            catalog.validate_search_response(db, search_request, search_response)
             hit_ids = [hit.document_id for hit in group.hits]
             statement = select(Document).where(
                 Document.id.in_(hit_ids),
-                Document.collection_key == collection_key,
-                Document.state.in_(RETRIEVAL_STATES),
-                Document.language.in_(RETRIEVAL_LANGUAGES),
-                Document.language_status.in_(RETRIEVAL_LANGUAGE_STATUSES),
+                *catalog.retrieval_catalog_filters(collection_key=collection_key),
             )
-            selected_language_value = language_value(selected_language)
-            if selected_language_value is not None:
-                statement = statement.where(Document.language == selected_language_value)
             documents = db.scalars(statement).all() if hit_ids else []
             documents_by_id = {document.id: document for document in documents}
             if any(document_id not in documents_by_id for document_id in hit_ids):
                 raise ServiceError(
                     (
                         "The retrieval service returned an inactive document or a document from "
-                        "another collection or language. No partial results were shown."
+                        "another collection. No partial results were shown."
                     ),
                     status=502,
                     code="search-catalog-mismatch",
@@ -432,15 +349,7 @@ async def build_collection_page(
                 }
             )
         else:
-            filters = [
-                Document.collection_key == collection_key,
-                Document.state.in_(RETRIEVAL_STATES),
-                Document.language.in_(RETRIEVAL_LANGUAGES),
-                Document.language_status.in_(RETRIEVAL_LANGUAGE_STATUSES),
-            ]
-            selected_language_value = language_value(selected_language)
-            if selected_language_value is not None:
-                filters.append(Document.language == selected_language_value)
+            filters = catalog.retrieval_catalog_filters(collection_key=collection_key)
             total = db.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
             documents = db.scalars(
                 select(Document)
@@ -474,11 +383,12 @@ def build_queue_page(
     *,
     status: str,
     collection: str,
-    language: str,
     sort: str,
     order: str,
     page: int,
 ) -> PageResult:
+    """Build the current queue view with filters, sorting, and pagination."""
+
     operations = db.scalars(
         select(QueueOperation)
         .join(QueueOperation.document)
@@ -486,6 +396,8 @@ def build_queue_page(
         .where(Document.state.in_(QUEUE_STATES))
     ).all()
 
+    # Retries leave historical attempts in the ledger, while the queue presents
+    # only the latest operation for each active document.
     latest_by_document: dict[UUID, QueueOperation] = {}
     for operation_item in operations:
         current = latest_by_document.get(operation_item.document_id)
@@ -509,14 +421,6 @@ def build_queue_page(
             item
             for item in current_operations
             if item.document.collection_key == selected_collection
-        ]
-
-    selected_language = normalized_language(language, allow_undetermined=True)
-    if selected_language != "all":
-        current_operations = [
-            item
-            for item in current_operations
-            if getattr(item.document.language, "value", item.document.language) == selected_language
         ]
 
     reverse = order == "desc"
@@ -544,7 +448,6 @@ def build_queue_page(
             "operation_count": total,
             "status_filter": status,
             "collection_filter": selected_collection,
-            "language_filter": selected_language,
             "collections": configured_collections(state.settings),
             "sort": sort,
             "order": order,
@@ -554,7 +457,6 @@ def build_queue_page(
                 {
                     "status": status,
                     "collection": selected_collection,
-                    "language": selected_language,
                     "sort": sort,
                     "order": order,
                 }
@@ -565,60 +467,14 @@ def build_queue_page(
     return PageResult("queue.html", context)
 
 
-def build_review_page(
-    state: WebRequestState,
-    db: Session,
-    *,
-    collection: str,
-    page: int,
-) -> PageResult:
-    configured = configured_collections(state.settings)
-    collection_keys = {item["key"] for item in configured}
-    selected_collection = (
-        collection if collection in collection_keys or collection == "unassigned" else "all"
-    )
-    filters = [Document.state == DocumentState.CLASSIFICATION_REVIEW]
-    if selected_collection == "unassigned":
-        filters.append(Document.collection_key.is_(None))
-    elif selected_collection != "all":
-        filters.append(Document.collection_key == selected_collection)
-
-    total = db.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
-    documents = db.scalars(
-        select(Document)
-        .where(*filters)
-        .order_by(Document.uploaded_at.asc())
-        .offset((page - 1) * PAGE_SIZE)
-        .limit(PAGE_SIZE)
-    ).all()
-    collection_map = {item["key"]: item for item in configured}
-    views = []
-    for document in documents:
-        item = document_view(document)
-        item["collection"] = collection_map.get(document.collection_key)
-        views.append(item)
-
-    context = base_context(state, active_page="review")
-    context.update(
-        {
-            "documents": views,
-            "review_count": total,
-            "collections": configured,
-            "collection_filter": selected_collection,
-            "page": page,
-            "total_pages": max(1, ceil(total / PAGE_SIZE)),
-            "pagination_query": urlencode({"collection": selected_collection}),
-        }
-    )
-    return PageResult("review.html", context)
-
-
 async def build_upload_page(
     state: WebRequestState,
     *,
     collection: str,
     scanner_ping: ScannerPing,
 ) -> PageResult:
+    """Build upload limits, collection choices, and scanner readiness context."""
+
     settings = state.settings
     scanner_available = await asyncio.to_thread(
         scanner_ping,
@@ -647,6 +503,8 @@ def build_document_page(
     *,
     document_id: UUID,
 ) -> PageResult:
+    """Build a document detail page with its latest operation and audit timeline."""
+
     document = (
         db.execute(
             select(Document)
@@ -669,9 +527,7 @@ def build_document_page(
         key=lambda item: (item.created_at, item.attempt),
         default=None,
     )
-    if document.state == DocumentState.CLASSIFICATION_REVIEW:
-        active_page = "review"
-    elif document.state in LIBRARY_STATES:
+    if document.state in LIBRARY_STATES:
         active_page = "library"
     else:
         active_page = "queue"

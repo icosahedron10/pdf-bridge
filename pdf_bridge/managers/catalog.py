@@ -15,13 +15,15 @@ from pdf_bridge.contracts.schemas import (
     QueueListResponse,
 )
 from pdf_bridge.core.config import CollectionDefinition
-from pdf_bridge.persistence.models import DocumentState, LanguageCode
+from pdf_bridge.persistence.models import DocumentState
 from pdf_bridge.services import catalog
 
 
 def list_collections(
     session: Session, definitions: Sequence[CollectionDefinition]
 ) -> CollectionListResponse:
+    """Return configured collections enriched with catalog counts."""
+
     return catalog.collection_list(session, definitions)
 
 
@@ -29,26 +31,28 @@ def list_documents(
     session: Session,
     *,
     definitions: Sequence[CollectionDefinition],
-    document_scope: Literal["library", "queue", "review", "all"],
+    document_scope: Literal["library", "queue", "all"],
     document_state: DocumentState | None,
     collection_key: str | None,
-    language: LanguageCode | None,
     page: int,
     page_size: int,
 ) -> DocumentListResponse:
+    """Return a validated, filtered page of catalog documents."""
+
     return catalog.document_list(
         session,
         definitions=definitions,
         document_scope=document_scope,
         document_state=document_state,
         collection_key=collection_key,
-        language=language,
         page=page,
         page_size=page_size,
     )
 
 
 def get_document(session: Session, document_id: UUID) -> DocumentDetail:
+    """Return detailed catalog data for one document."""
+
     return catalog.document_detail(session, document_id)
 
 
@@ -57,15 +61,15 @@ def list_queue(
     *,
     definitions: Sequence[CollectionDefinition],
     collection_key: str | None,
-    language: LanguageCode | None,
     page: int,
     page_size: int,
 ) -> QueueListResponse:
+    """Return a filtered page of the current operation queue."""
+
     return catalog.queue_list(
         session,
         definitions=definitions,
         collection_key=collection_key,
-        language=language,
         page=page,
         page_size=page_size,
     )

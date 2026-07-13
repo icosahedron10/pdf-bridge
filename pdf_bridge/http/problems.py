@@ -68,6 +68,8 @@ def problem_response(
     detail: str,
     extra: dict[str, Any] | None = None,
 ) -> Response[dict[str, Any]]:
+    """Build an RFC 9457-style response with request correlation metadata."""
+
     request_id = ensure_request_id(request.scope)
     body: dict[str, Any] = {
         "type": f"https://pdf-bridge.invalid/problems/{code}",
@@ -96,6 +98,8 @@ def problem_response(
 def handle_problem(
     request: Request, exc: ProblemError
 ) -> Response[dict[str, Any]]:
+    """Convert a deliberate application failure to a problem response."""
+
     return problem_response(
         request=request,
         status=exc.status,

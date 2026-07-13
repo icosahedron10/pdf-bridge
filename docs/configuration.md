@@ -53,8 +53,8 @@ immutable once queued; move it only through downstream-confirmed deletion and re
 The audience makes **Customer-facing** versus **Internal only** visible in PDF Bridge, but it is not
 chatbot authorization. The chatbot manager must derive its allowlist from authenticated server-side
 policy and intersect every requested collection list before retrieval. PDF Bridge refuses startup
-when an active catalog row references an unconfigured key or is unassigned outside the Needs Review
-state.
+when an active catalog row references an unconfigured key. Every catalog row, including a deleted
+or cancelled tombstone, must retain its collection key.
 
 ## Application and identity
 
@@ -131,9 +131,9 @@ To use PostgreSQL later, set a PostgreSQL SQLAlchemy URL, install the approved d
 migrations, and test transaction/locking behavior before cutover. Merely changing the URL is not a
 production migration plan.
 
-Canonical bridge objects remain under UUID-derived `objects/` keys regardless of collection or
-language. The version 2 Jenkins handoff and downstream RAG store—not the canonical store—use
-`pdfs/{language}/{collection_key}/{document_id}.pdf`.
+Canonical bridge objects remain under UUID-derived `objects/` keys regardless of collection. The
+version 2 Jenkins handoff and downstream RAG store—not the canonical store—use
+`pdfs/{collection_key}/{document_id}.pdf`.
 
 ## Malware scanner
 
@@ -157,15 +157,11 @@ timeouts, protocol errors, and malware findings all prevent canonical promotion.
 | `PDF_BRIDGE_SEARCH_API_TIMEOUT` | `10` | retrieval request timeout in seconds |
 
 The configured service receives `POST {PDF_BRIDGE_SEARCH_API_URL}/search`. Count-only requests may
-span configured collections; hit-producing requests contain exactly one collection and may filter
-to `en` or `fr`. Responses must echo the query/mode/language and return exactly one group, with an
-exact total, for every requested key—including zero totals. PDF Bridge rejects malformed,
-missing/extra-group, cross-collection, wrong-language, inactive-document, or impossible-total
-responses in full. It never falls back to catalog filename search.
-
-There is no bridge-side language detector setting. Clean uploads begin as `und` and the existing
-downstream PDF parser classifies extracted content asynchronously as `en`, `fr`, or
-`review_required`. Do not install Node, V8, PDF.js, or `franc` in PDF Bridge for this purpose.
+span configured collections; hit-producing requests contain exactly one collection. Responses must
+echo the query and mode and return exactly one group, with an exact total, for every requested
+key—including zero totals. PDF Bridge rejects malformed, missing/extra-group, cross-collection,
+inactive-document, duplicate-hit, pagination-mismatch, or impossible-total responses in full. It
+never falls back to catalog filename search.
 
 The Jenkins client separately reads:
 

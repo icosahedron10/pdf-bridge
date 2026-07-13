@@ -24,17 +24,6 @@
   </span>
 {%- endmacro %}
 
-{% macro language_label(language, status=none) -%}
-  {% set code = language|default('und', true)|lower %}
-  {% if code == 'en' %}{% set label = 'English' %}
-  {% elif code == 'fr' %}{% set label = 'Français' %}
-  {% else %}{% set label = 'Undetermined' %}{% endif %}
-  <span class="language-label language-label--{{ code }}{% if status %} language-label--{{ status|lower|replace('_', '-') }}{% endif %}">
-    <span aria-hidden="true">{{ code|upper }}</span>
-    {{ label }}
-  </span>
-{%- endmacro %}
-
 {% macro value_or_missing(value, missing='Not reported') -%}
   {% if value is not none and value != '' %}
     {{ value }}

@@ -22,11 +22,9 @@ from litestar.params import (
     QueryParameter,
 )
 from litestar.response import File, Response
-from pydantic import RootModel
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
-    ClassificationRequest,
     CollectionListResponse,
     DeleteDocumentRequest,
     DocumentDetail,
@@ -43,7 +41,7 @@ from pdf_bridge.contracts.schemas import (
 from pdf_bridge.http.problems import ProblemError, problem_responses
 from pdf_bridge.http.security import Actor, get_actor, require_csrf
 from pdf_bridge.managers import catalog, document, health, search
-from pdf_bridge.persistence.models import DocumentState, LanguageCode
+from pdf_bridge.persistence.models import DocumentState
 from pdf_bridge.services.document import duplicate_error_extra
 from pdf_bridge.services.errors import ServiceError
 from pdf_bridge.services.lifecycle import LifecycleError
@@ -63,10 +61,6 @@ class UploadForm:
     collection_key: str
     possible_duplicate_confirmed: bool = False
     idempotency_key: str | None = None
-
-
-class ClassificationBody(RootModel[ClassificationRequest]):
-    """Single Pydantic body model around the discriminated request union."""
 
 
 @dataclass
@@ -114,6 +108,8 @@ def list_collections(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> CollectionListResponse:
+    """List configured collections with live catalog counts."""
+
     return catalog.list_collections(
         db,
         request.app.state.settings.collections,
@@ -131,14 +127,15 @@ def list_documents(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
     document_scope: Annotated[
-        Literal["library", "queue", "review", "all"], QueryParameter(name="scope")
+        Literal["library", "queue", "all"], QueryParameter(name="scope")
     ] = "all",
     document_state: Annotated[DocumentState | None, QueryParameter(name="state")] = None,
     collection_key: FromQuery[str | None] = None,
-    language: FromQuery[LanguageCode | None] = None,
     page: Annotated[int, QueryParameter(ge=1)] = 1,
     page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
 ) -> DocumentListResponse:
+    """List documents filtered by lifecycle scope and collection."""
+
     try:
         return catalog.list_documents(
             db,
@@ -146,7 +143,6 @@ def list_documents(
             document_scope=document_scope,
             document_state=document_state,
             collection_key=collection_key,
-            language=language,
             page=page,
             page_size=page_size,
         )
@@ -165,6 +161,8 @@ def get_document(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> DocumentDetail:
+    """Return one document with its operation and audit history."""
+
     try:
         return catalog.get_document(db, document_id)
     except ServiceError as exc:
@@ -184,6 +182,8 @@ def document_content(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> File:
+    """Serve a clean, available PDF inline from canonical storage."""
+
     try:
         result = document.content(
             db,
@@ -217,6 +217,8 @@ def upload_preflight(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> UploadPreflightResponse:
+    """Validate upload metadata and surface possible duplicates."""
+
     try:
         return document.preflight_upload(
             db,
@@ -242,6 +244,8 @@ async def upload_document(
     db: NamedDependency[Session],
     header_idempotency_key: Annotated[str | None, HeaderParameter(name="Idempotency-Key")] = None,
 ) -> UploadResponse:
+    """Scan, register, and queue a multipart PDF upload."""
+
     try:
         return await document.upload_document(
             db,
@@ -291,16 +295,16 @@ def list_queue(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
     collection_key: FromQuery[str | None] = None,
-    language: FromQuery[LanguageCode | None] = None,
     page: Annotated[int, QueryParameter(ge=1)] = 1,
     page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
 ) -> QueueListResponse:
+    """List current queue operations by collection."""
+
     try:
         return catalog.list_queue(
             db,
             definitions=request.app.state.settings.collections,
             collection_key=collection_key,
-            language=language,
             page=page,
             page_size=page_size,
         )
@@ -321,6 +325,8 @@ def cancel_queue_item(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
+    """Cancel a queued operation and clean up its stored PDF."""
+
     try:
         return document.cancel_queue_item(
             db,
@@ -350,6 +356,8 @@ def retry_queue_item(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
+    """Queue a new attempt for a retryable failed operation."""
+
     try:
         return document.retry_queue_item(
             db,
@@ -360,41 +368,6 @@ def retry_queue_item(
         )
     except LifecycleError as exc:
         raise _lifecycle_problem(exc) from exc
-
-
-@post(
-    "/documents/{document_id:uuid}/classification",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=200,
-    responses=problem_responses(),
-    sync_to_thread=True,
-)
-def resolve_document_classification(
-    request: Request,
-    document_id: FromPath[UUID],
-    data: JSONBody[ClassificationBody],
-    actor: NamedDependency[Actor],
-    db: NamedDependency[Session],
-) -> DocumentMutationResponse:
-    payload = data.root
-    language = payload.language if payload.action == "override" else None
-    reason = payload.reason if payload.action == "override" else None
-    try:
-        return document.resolve_classification(
-            db,
-            definitions=request.app.state.settings.collections,
-            transition_lock=request.app.state.transition_lock,
-            document_id=document_id,
-            collection_key=payload.collection_key,
-            language=language,
-            reason=reason,
-            actor_type=actor.kind,
-            actor_id=actor.identifier,
-        )
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
 
 
 @post(
@@ -415,6 +388,8 @@ def request_document_deletion(
         Body(media_type=RequestEncodingType.JSON),
     ] = None,
 ) -> DocumentMutationResponse:
+    """Queue deletion of an eligible catalog document."""
+
     try:
         return document.request_deletion(
             db,
@@ -440,6 +415,8 @@ async def search_documents(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> SearchResponse:
+    """Search configured collections through the external retrieval service."""
+
     try:
         return await search.search_documents(
             db,
@@ -458,6 +435,8 @@ async def search_documents(
     sync_to_thread=False,
 )
 def live() -> HealthResponse:
+    """Report that the application process is running."""
+
     return HealthResponse(status="ok", checks={"process": "ok"})
 
 
@@ -496,6 +475,8 @@ def _health_responses(description: str) -> dict[int, ResponseSpec]:
     sync_to_thread=True,
 )
 def ready(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
+    """Report whether dependencies are ready to serve application traffic."""
+
     return _health_response(_dependency_checks(request, db))
 
 
@@ -505,6 +486,8 @@ def ready(request: Request, db: NamedDependency[Session]) -> Response[HealthResp
     sync_to_thread=True,
 )
 def dependencies(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
+    """Report detailed availability for each required dependency."""
+
     return _health_response(_dependency_checks(request, db))
 
 
@@ -517,7 +500,6 @@ _API_ROUTE_HANDLERS = (
     list_queue,
     cancel_queue_item,
     retry_queue_item,
-    resolve_document_classification,
     request_document_deletion,
     search_documents,
     live,

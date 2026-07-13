@@ -15,11 +15,15 @@ from pdf_bridge.http.problems import ProblemError
 
 @dataclass(frozen=True, slots=True)
 class Actor:
+    """Authenticated request identity recorded in audit events."""
+
     identifier: str
     kind: str
 
 
 def ensure_browser_session(request: Request) -> None:
+    """Initialize the anonymous session and CSRF identifiers when absent."""
+
     session = dict(request.session)
     changed = False
     if "session_id" not in session:
@@ -33,6 +37,8 @@ def ensure_browser_session(request: Request) -> None:
 
 
 def csrf_token(request: Request) -> str:
+    """Return the stable CSRF token for the current browser session."""
+
     ensure_browser_session(request)
     return str(request.session["csrf_token"])
 
@@ -48,6 +54,8 @@ def _proxy_is_trusted(host: str | None, cidrs: list[str] | tuple[str, ...]) -> b
 
 
 def get_actor(request: Request) -> Actor:
+    """Resolve the browser actor using the configured authentication mode."""
+
     settings = request.app.state.settings
     ensure_browser_session(request)
     if settings.auth_mode == "anonymous-poc":
@@ -83,6 +91,8 @@ def _same_origin(request: Request) -> bool:
 
 
 async def require_csrf(request: Request) -> Actor:
+    """Authorize a same-origin mutation and return its browser actor."""
+
     if not _same_origin(request):
         raise ProblemError(
             status=403,
@@ -104,6 +114,8 @@ async def require_csrf(request: Request) -> Actor:
 
 
 def require_job_token(request: Request) -> Actor:
+    """Authenticate a Jenkins request with the configured bearer token."""
+
     settings = request.app.state.settings
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")

@@ -83,9 +83,7 @@ def test_job_pull_streams_verifies_and_atomically_stages(tmp_path: Path, monkeyp
                         "size_bytes": len(PDF_A),
                         "sha256": sha256,
                         "collection_key": "customer",
-                        "language": "und",
-                        "classification_required": True,
-                        "relative_path": f"pdfs/und/customer/{document_id}.pdf",
+                        "relative_path": f"pdfs/customer/{document_id}.pdf",
                         "download_url": (
                             f"/api/v1/jobs/batches/{batch_id}/operations/{operation_id}/content"
                         ),
@@ -133,10 +131,10 @@ def test_job_pull_streams_verifies_and_atomically_stages(tmp_path: Path, monkeyp
     staged_manifest = json.loads((batch_directory / "manifest.json").read_text(encoding="utf-8"))
     assert staged_manifest["version"] == 2
     assert staged_manifest["operations"][0]["relative_path"] == (
-        f"pdfs/und/customer/{document_id}.pdf"
+        f"pdfs/customer/{document_id}.pdf"
     )
     assert (
-        batch_directory / "pdfs" / "und" / "customer" / f"{document_id}.pdf"
+        batch_directory / "pdfs" / "customer" / f"{document_id}.pdf"
     ).read_bytes() == PDF_A
     assert json.loads(result_path.read_text(encoding="utf-8"))["operation_count"] == 1
 
@@ -156,19 +154,13 @@ def test_job_report_validates_and_submits_results(tmp_path: Path, monkeypatch) -
                 "results": [
                     {
                         "operation_id": str(operation_id),
-                        "outcome": "succeeded",
+                        "success": True,
                         "chunk_count": 3,
                         "components": {
                             "pdf_source": "succeeded",
                             "markdown": "succeeded",
                             "bm25": "succeeded",
                             "dense": "succeeded",
-                        },
-                        "classification": {
-                            "language": "en",
-                            "status": "detected",
-                            "method": "test-parser",
-                            "confidence": 0.99,
                         },
                     }
                 ],
@@ -200,7 +192,6 @@ def test_job_report_validates_and_submits_results(tmp_path: Path, monkeypatch) -
                 "completed_at": now.isoformat(),
                 "succeeded": 1,
                 "failed": 0,
-                "review_required": 0,
                 "idempotent_replay": False,
             },
         )
@@ -263,19 +254,13 @@ def test_job_report_rejects_batch_mismatch_before_request(tmp_path: Path, monkey
                 "results": [
                     {
                         "operation_id": str(operation_id),
-                        "outcome": "succeeded",
+                        "success": True,
                         "chunk_count": 1,
                         "components": {
                             "pdf_source": "succeeded",
                             "markdown": "succeeded",
                             "bm25": "succeeded",
                             "dense": "succeeded",
-                        },
-                        "classification": {
-                            "language": "en",
-                            "status": "detected",
-                            "method": "test-parser",
-                            "confidence": 0.99,
                         },
                     }
                 ],
@@ -341,9 +326,7 @@ def test_job_staging_removes_partial_batch_after_checksum_failure(tmp_path: Path
                 size_bytes=len(PDF_A),
                 sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
                 collection_key="customer",
-                language="und",
-                classification_required=True,
-                relative_path=f"pdfs/und/customer/{document_id}.pdf",
+                relative_path=f"pdfs/customer/{document_id}.pdf",
                 download_url=f"/operations/{operation_id}/content",
             )
         ],
@@ -374,12 +357,12 @@ def test_job_staging_removes_partial_batch_after_checksum_failure(tmp_path: Path
 @pytest.mark.parametrize(
     "unsafe_path_template",
     [
-        "/pdfs/und/customer/{document_id}.pdf",
-        "../pdfs/und/customer/{document_id}.pdf",
-        "pdfs/und/customer/../customer/{document_id}.pdf",
-        r"pdfs\und\customer\{document_id}.pdf",
-        "pdfs/und/internal/{document_id}.pdf",
-        "C:/pdfs/und/customer/{document_id}.pdf",
+        "/pdfs/customer/{document_id}.pdf",
+        "../pdfs/customer/{document_id}.pdf",
+        "pdfs/customer/../customer/{document_id}.pdf",
+        r"pdfs\customer\{document_id}.pdf",
+        "pdfs/internal/{document_id}.pdf",
+        "C:/pdfs/customer/{document_id}.pdf",
     ],
 )
 def test_job_client_rejects_server_supplied_unsafe_relative_path(
@@ -395,9 +378,7 @@ def test_job_client_rejects_server_supplied_unsafe_relative_path(
         size_bytes=len(PDF_A),
         sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
         collection_key="customer",
-        language="und",
-        classification_required=True,
-        relative_path=f"pdfs/und/customer/{document_id}.pdf",
+        relative_path=f"pdfs/customer/{document_id}.pdf",
         download_url="/content",
     )
     object.__setattr__(operation, "relative_path", unsafe_path)
@@ -425,7 +406,7 @@ def test_job_client_requires_manifest_version_two() -> None:
 def test_job_stages_delete_metadata_without_downloading(tmp_path: Path) -> None:
     batch_id = uuid.uuid4()
     document_id = uuid.uuid4()
-    relative_path = f"pdfs/fr/internal/{document_id}.pdf"
+    relative_path = f"pdfs/internal/{document_id}.pdf"
     now = datetime.now(UTC)
     remote = BatchManifestResponse(
         version=2,
@@ -443,8 +424,6 @@ def test_job_stages_delete_metadata_without_downloading(tmp_path: Path) -> None:
                 size_bytes=len(PDF_A),
                 sha256=__import__("hashlib").sha256(PDF_A).hexdigest(),
                 collection_key="internal",
-                language="fr",
-                classification_required=False,
                 relative_path=relative_path,
                 download_url=None,
             )
@@ -485,7 +464,6 @@ def test_admin_import_manifest_dry_run(
                             "path": "existing.pdf",
                             "filename": "Existing.pdf",
                             "collection_key": "internal",
-                            "language": "fr",
                         }
                     ],
                 }

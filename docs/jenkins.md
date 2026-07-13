@@ -1,274 +1,225 @@
-# Jenkins handoff guide
+# Jenkins and downstream pipeline integration
 
-Jenkins should run the bridge handoff immediately before the existing daily ingestion. The
-provided client is intentionally small: `pull` produces a fully verified immutable directory;
-`report` validates the pipeline's result document and submits it. It does not invoke the RAG
-pipeline itself.
+Jenkins is the only supported batch consumer. Use the released `pdf-bridge-job` client from the
+pipeline repository rather than reproducing claim, download, checksum, staging, or report logic in
+Groovy. The client validates the strict version 2 contracts before changing catalog state.
 
-## Agent setup
+`Jenkinsfile.example` is a starting point. Review its trusted constants and credential IDs before
+copying it into the pipeline repository.
 
-1. Use a controlled Linux agent with Python 3.12, a POSIX shell, and network access to the internal
-   bridge URL. Windows and macOS agents are not supported.
-2. Allocate a durable handoff root outside the Jenkins workspace, Git checkout, and synchronized
-   directories; `/srv/rag/pdf-bridge-handoff` is the example location.
-3. Store the bridge job token as a Jenkins secret-text credential.
-4. Publish the exact released `pdf-bridge` wheel and its dependencies to an approved internal
-   package index. Install an exact version with `--only-binary=:all:`; never install `.` from the
-   mutable Jenkins checkout.
-5. Keep the bridge URL and its separate allowed-host pin as SCM-reviewed pipeline constants, not
-   build parameters. A trigger must not be able to redirect the bearer token.
-6. Use an HTTPS URL trusted by the agent. For a private CA, provision a PEM and pass `--ca-bundle`.
+## Required configuration
 
-The token can claim and download canonical PDFs and mutate lifecycle state. Do not put it in job
-parameters, source control, console arguments, or report files. The CLI reads
-`PDF_BRIDGE_JOB_TOKEN` or an explicit `--token-file`.
+The Jenkins agent needs Python 3.12, durable handoff storage, access to PDF Bridge, and a short-lived
+or centrally rotated job token.
 
-The example starts by deleting and checking out a clean workspace, removes current-run marker/result
-files before claiming, and deletes the workspace after archiving. This prevents an old `report.json`
-or `pull-result.json` from a prior build/stage retry being submitted. The durable handoff root is
-outside the workspace and is intentionally not deleted.
+| Setting | Purpose |
+|---|---|
+| `PDF_BRIDGE_URL` | Base URL of PDF Bridge |
+| `PDF_BRIDGE_JOB_ALLOWED_HOST` | Exact host allowed to receive the bearer token |
+| `PDF_BRIDGE_JOB_TOKEN` | Jenkins secret-text credential exposed only around client calls |
+| `HANDOFF_ROOT` | Durable root for immutable batch directories |
+| `INGEST_COMMAND` | Parser/RAG entry point that reads a bridge manifest and writes a report |
+| `PDF_BRIDGE_CLIENT_VERSION` | Exact released client version installed by the job |
 
-Configure these values as trusted constants in the reviewed Jenkinsfile:
+Use HTTPS and keep certificate verification enabled. For an internal CA, pass `--ca-bundle`.
+`--allow-http` and `--insecure-skip-tls-verify` exist only for local diagnosis and should not appear
+in production pipeline code.
+
+## End-to-end job sequence
+
+1. Install an exact `pdf-bridge` wheel from an approved package index.
+2. Run `pdf-bridge-job pull` with the stable Jenkins build ID as `--request-id`.
+3. If `operation_count` is zero, finish without invoking the pipeline.
+4. Give the emitted batch `manifest.json` to the parser/RAG pipeline.
+5. Require the pipeline to write a nonempty version 2 report file.
+6. Run `pdf-bridge-job report` with that report and the original pull summary.
+7. Archive the pull summary and report, then remove the Jenkins workspace. Keep the durable handoff
+   directory according to the approved retention policy.
+
+The client performs this API sequence:
 
 ```text
-PDF_BRIDGE_URL=https://pdf-bridge.internal
-PDF_BRIDGE_JOB_ALLOWED_HOST=pdf-bridge.internal
-PDF_BRIDGE_PACKAGE_INDEX=https://python-packages.internal/simple
-PDF_BRIDGE_CLIENT_VERSION=0.1.0
+POST /api/v1/jobs/batches/claim
+GET  /api/v1/jobs/batches/{batch_id}/manifest
+GET  /api/v1/jobs/batches/{batch_id}/operations/{operation_id}/content  # ingest only
+POST /api/v1/jobs/batches/{batch_id}/staged
+POST /api/v1/jobs/batches/{batch_id}/results
 ```
 
-The package-index URL must not embed credentials; use the agent's approved pip credential/config
-mechanism. The example verifies the installed distribution version after installation.
+Claim and report requests are idempotent. Reuse the same request ID when retrying the same Jenkins
+run. Do not generate a fresh ID merely because a network response was lost.
 
-## Pull a batch
+## Pull and staging
 
-```text
+Example:
+
+```bash
 pdf-bridge-job pull \
-  --base-url https://pdf-bridge.internal \
   --allowed-host pdf-bridge.internal \
   --destination /srv/rag/pdf-bridge-handoff \
   --request-id "$BUILD_TAG" \
-  --limit 100 \
   --result-file pull-result.json
 ```
 
-`request_id` must be 8–128 characters using letters, digits, `.`, `_`, `:`, or `-`. It identifies
-the logical handoff, not an individual command attempt. Keep it unchanged when Jenkins retries the
-same build; use a new value for the next scheduled build.
+The client creates an immutable directory named for the batch, writes `manifest.json` atomically,
+downloads each ingest PDF, verifies byte size and SHA-256, and acknowledges staging only after every
+operation is durable. Any mismatch fails the pull and leaves the batch unreported.
 
-`--allowed-host` is required even when `--base-url` comes from `PDF_BRIDGE_URL`. It accepts only a
-hostname (no scheme, port, path, credentials, query, or fragment), and the CLI validates the URL
-against it before reading/sending the bearer token. Redirect following is disabled. For Jenkins,
-both values must be immutable SCM-reviewed constants.
+The local pull summary is a client file with version 1. It correlates the later report to the batch
+and records the manifest hash; it is not the pipeline manifest.
 
-The result file is versioned and contains no credential:
+## Version 2 manifest
 
-```json
-{
-  "version": 1,
-  "batch_id": "b6eab35c-d552-4894-8d43-2c0b7ef9f513",
-  "request_id": "jenkins-pdf-ingest-412",
-  "operation_count": 2,
-  "batch_directory": "/srv/rag/pdf-bridge-handoff/b6eab35c-d552-4894-8d43-2c0b7ef9f513",
-  "manifest_sha256": "7f1b2da0c83f77f832f6126f1ddda5f14f978de09043245e33f63a85c001d45b",
-  "idempotent_replay": false
-}
-```
-
-When there is no work, `operation_count` is zero and the directory/checksum values are null.
-
-## Staged manifest contract
-
-The batch directory is promoted only after every ingest PDF passes byte-count and SHA-256 checks.
-Its `manifest.json` is:
+The manifest contains one item per operation:
 
 ```json
 {
   "version": 2,
-  "batch_id": "b6eab35c-d552-4894-8d43-2c0b7ef9f513",
-  "request_id": "jenkins-pdf-ingest-412",
-  "claimed_at": "2026-07-10T05:55:00+00:00",
-  "lease_expires_at": "2026-07-10T06:25:00+00:00",
+  "batch_id": "6c519b68-5fc4-42ea-a388-106ac88841bd",
+  "request_id": "jenkins-pdf-bridge-1842",
+  "state": "CLAIMED",
+  "claimed_at": "2026-07-12T15:30:00Z",
+  "lease_expires_at": "2026-07-12T16:00:00Z",
   "operations": [
     {
-      "operation_id": "dbcc76d3-6338-4f09-9f3a-2b66d8095f82",
-      "document_id": "d8fb31ea-bda8-4355-b52e-97c30bcbe35b",
+      "operation_id": "3e07f69c-4c54-4a8f-a649-72b7ab6db2c3",
+      "document_id": "aa1327a6-68ec-4268-a538-c0f54d48d474",
       "operation_type": "INGEST",
-      "filename": "Safety handbook.pdf",
-      "size_bytes": 348121,
-      "sha256": "c5ac957ff6a8adf6bde68b0f2d9858f72091c1a0383ac673be163a7b528af02f",
-      "collection_key": "customer",
-      "language": "und",
-      "classification_required": true,
-      "relative_path": "pdfs/und/customer/d8fb31ea-bda8-4355-b52e-97c30bcbe35b.pdf"
-    },
-    {
-      "operation_id": "5e7cfbf5-962b-441d-95c3-f15546c98985",
-      "document_id": "0df9842d-7860-4d24-9839-78adf1e6c517",
-      "operation_type": "DELETE",
-      "filename": "Retired policy.pdf",
-      "size_bytes": 92215,
-      "sha256": "9d9766d70f6e3f1416bc44bab063b37c552e9a71cf08869f219019de4229af4a",
-      "collection_key": "internal",
-      "language": "fr",
-      "classification_required": false,
-      "relative_path": "pdfs/fr/internal/0df9842d-7860-4d24-9839-78adf1e6c517.pdf"
+      "filename": "handbook.pdf",
+      "size_bytes": 48122,
+      "sha256": "b05d9a41fd15b6a3e8f0ac22a130a2bb9cf7118f28ea759d4f31235a36f61d7a",
+      "collection_key": "employee-handbook",
+      "relative_path": "pdfs/employee-handbook/aa1327a6-68ec-4268-a538-c0f54d48d474.pdf",
+      "download_url": "/api/v1/jobs/batches/6c519b68-5fc4-42ea-a388-106ac88841bd/operations/3e07f69c-4c54-4a8f-a649-72b7ab6db2c3/content"
     }
   ]
 }
 ```
 
-Treat `filename` as display metadata. Read the server-issued `relative_path`; never derive paths
-from the filename. The client independently verifies that it is exactly
-`pdfs/{language}/{collection_key}/{document_id}.pdf` and rejects absolute, traversal, noncanonical,
-or metadata-mismatched paths before writing anything. An `INGEST` item has a file at that path
-below the batch directory. A `DELETE` item carries the same routing metadata but has no downloaded
-file or download URL; use its collection, language, and `document_id` to remove the PDF source,
-markdown, BM25 chunks, and dense chunks. Every Qdrant chunk must retain the bridge UUID,
-`collection_key`, and language in its payload.
+Every item has exactly these fields: operation and document IDs, operation type, filename, size,
+checksum, collection key, exact relative path, and optional download URL. Unknown fields are
+rejected.
 
-`collection_key` is the configured cross-system identity: it must equal the target Qdrant
-collection name and the value understood by chatbot-manager `allowed_collections`. The ingestion
-pipeline treats it as authoritative routing data, not user-controlled metadata.
+The only valid handoff path is:
 
-New uploads arrive as `language: "und"` with `classification_required: true`. The downstream PDF
-parser already used for extraction must classify them as English or French before indexing, then
-place the durable RAG PDF source at the same path with `und` replaced by the detected language; it
-must never index an undetermined document. Do not add V8, Node, PDF.js, or `franc` to PDF Bridge for
-this inspection. An operator override arrives as `en` or `fr` with classification disabled.
-Collection placement is authoritative in either case; the pipeline must never infer or change it.
+```text
+pdfs/{collection_key}/{document_id}.pdf
+```
 
-Use the batch directory read-only and write markdown/results elsewhere. That preserves the ability
-to verify a replay. The pull algorithm is:
+The client rejects absolute paths, traversal, noncanonical separators, unexpected suffixes, or any
+path whose collection or UUID disagrees with the manifest item. An ingest has a download URL. A
+delete may omit it; downstream deletion uses the supplied UUID and collection to remove PDF source,
+Markdown, BM25, and dense/Qdrant data.
 
-1. create `.<batch-id>.tmp-<random>` below the destination;
-2. stream each generated operation path with exclusive creation;
-3. check exact length and SHA-256 while streaming;
-4. durably write the local manifest;
-5. atomically rename the temporary directory to `<batch-id>`;
-6. acknowledge the complete operation ID set.
+## Downstream processing rules
 
-An interrupted temporary directory is never considered staged. It can be removed after confirming
-that no client process is active. If the final batch directory already exists, `pull` validates its
-manifest and every referenced file before re-acknowledging it. Any mismatch stops the job.
+For an ingest operation, the pipeline must:
 
-## Report contract
+1. Parse the staged PDF and produce the durable downstream PDF source and Markdown.
+2. Write BM25 and dense/Qdrant content under the supplied collection and bridge UUID.
+3. Put `document_id` and `collection_key` in every Qdrant payload used by retrieval correlation.
+4. Report all four components as succeeded only after their writes are durable.
 
-The pipeline must emit exactly one result for every manifest operation:
+The pipeline must not infer collection placement from a filename or directory outside the manifest.
+Encrypted PDFs, OCR-only PDFs, empty text, parser errors, timeouts, and any failed component are
+ordinary ingestion failures. Do not partially advertise such a document as searchable.
+
+For a delete operation, remove all four downstream components using the supplied identity. Report
+success only after deletion is complete or the targets are already absent, so replay remains safe.
+
+## Version 2 report file
+
+The pipeline writes one result for every staged operation:
 
 ```json
 {
   "version": 2,
-  "batch_id": "b6eab35c-d552-4894-8d43-2c0b7ef9f513",
-  "pipeline_run_id": "rag-nightly-2026-07-10-412",
+  "batch_id": "6c519b68-5fc4-42ea-a388-106ac88841bd",
+  "pipeline_run_id": "rag-ingest-1842",
   "results": [
     {
-      "operation_id": "dbcc76d3-6338-4f09-9f3a-2b66d8095f82",
-      "outcome": "succeeded",
-      "chunk_count": 84,
+      "operation_id": "3e07f69c-4c54-4a8f-a649-72b7ab6db2c3",
+      "success": true,
+      "chunk_count": 17,
       "components": {
         "pdf_source": "succeeded",
         "markdown": "succeeded",
         "bm25": "succeeded",
         "dense": "succeeded"
-      },
-      "classification": {
-        "language": "fr",
-        "status": "detected",
-        "method": "downstream_pdf_parser",
-        "confidence": 0.98
       }
-    },
-    {
-      "operation_id": "5e7cfbf5-962b-441d-95c3-f15546c98985",
-      "outcome": "failed",
-      "chunk_count": null,
-      "components": {
-        "pdf_source": "succeeded",
-        "markdown": "succeeded",
-        "bm25": "failed",
-        "dense": "succeeded"
-      },
-      "error": "BM25 removal timed out after the configured retry limit"
     }
   ]
 }
 ```
 
-Component values are `succeeded`, `failed`, or `not_applicable`; operation outcomes are
-`succeeded`, `failed`, or `review_required`. A successful ingest must report a `detected` or
-`overridden` `en`/`fr` classification and cannot contain a failed component. A delete omits
-classification. A failed operation represents an operational/parser failure, remains retryable,
-and requires bounded error text (maximum 4,000 characters) suitable for the coworker's lifecycle
-view; exclude stack dumps, secrets, paths, and document contents. Deletion is finalized only when
-all four components are `succeeded`.
-
-When text inspection cannot safely choose English or French, report `review_required` with
-classification language `und`, status `review_required`, and one bounded reason: `no_text`,
-`ocr_required`, `encrypted`, `bilingual`, `unsupported`, or `low_confidence`. BM25 and dense must
-both be `not_applicable`, and the pipeline must not write either index. This is a content decision,
-not an operational failure; do not use it for parser crashes, timeouts, or unavailable services.
-
-A review result has this operation shape:
+A failed result is explicit:
 
 ```json
 {
-  "operation_id": "dbcc76d3-6338-4f09-9f3a-2b66d8095f82",
-  "outcome": "review_required",
-  "chunk_count": null,
+  "operation_id": "3e07f69c-4c54-4a8f-a649-72b7ab6db2c3",
+  "success": false,
   "components": {
     "pdf_source": "succeeded",
-    "markdown": "succeeded",
+    "markdown": "failed",
     "bm25": "not_applicable",
     "dense": "not_applicable"
   },
-  "classification": {
-    "language": "und",
-    "status": "review_required",
-    "method": "downstream_pdf_parser",
-    "confidence": null,
-    "reason": "low_confidence"
-  }
+  "error": "PDF contains no extractable text"
 }
 ```
 
-The ingestion wrapper should write a complete report even when one operation fails. It may then
-exit nonzero; the example uses Jenkins `catchError` so the report stage still runs while the build
-remains failed for operator visibility. A crash before a complete report leaves the batch staged
-for controlled retry and must not fabricate success rows.
+Component values are `succeeded`, `failed`, or `not_applicable`. The report validator enforces:
 
-Submit it with:
+- a successful result has all four components `succeeded` and no error;
+- a failed result has a nonblank error;
+- operation IDs are unique and match the staged batch exactly;
+- the report has no unknown fields.
 
-```text
+`chunk_count` is optional and nonnegative. Use it for a successful ingest when available; it is not
+a substitute for component confirmation.
+
+Submit with:
+
+```bash
 pdf-bridge-job report report.json \
   --pull-result pull-result.json \
-  --base-url https://pdf-bridge.internal \
   --allowed-host pdf-bridge.internal
 ```
 
-Before contacting the service, `report` strictly parses both files and requires their `batch_id`
-values to match. A no-work pull result cannot authorize a report. The pipeline should write its
-report atomically (temporary file followed by same-directory rename) so the reporter never reads a
-partially written document.
+The batch response aggregates only successful and failed operations.
 
-Reporting is idempotent when the same pipeline run and results are replayed. A conflicting replay
-fails. Archive the pull/result JSON as normal Jenkins artifacts, but apply your data-retention rules
-because filenames and operational errors may be sensitive.
+## Failure and replay behavior
 
-## Failure and retry behavior
-
-| Failure | Correct action |
+| Condition | Required action |
 |---|---|
-| Bridge unavailable before claim | retry the same build/request ID |
-| Download interrupted or checksum mismatch | retain evidence, rerun `pull` with the same request ID |
-| Lease expires before staging | start a new claim with a new request/build ID after requeue |
-| Staging acknowledged but ingestion never ran | rerun the same staged batch; do not make a new claim |
-| Some pipeline operations fail | report every result; retry failed items later from the UI |
-| Language cannot be determined safely | report `review_required`; do not write retrieval indexes or retry as an operational failure |
-| Result response is lost | resubmit the identical report |
-| Pull/report batch IDs differ | stop; remove stale workspace artifacts and investigate the producer |
-| Existing batch verification fails | stop; investigate disk tampering/corruption before changing files |
+| Queue empty | Finish successfully without a report |
+| Download, size, checksum, or durable-write failure | Fail before staging; retry the same request ID |
+| Lease expires before staging | Start a new scheduled claim after the bridge recovers the lease |
+| Parser or component failure | Report `success: false` with a nonblank error; operator may retry ingestion |
+| Report response is lost | Replay the same report against the same pull summary |
+| Canonical cleanup fails after downstream delete | Replay the same report after storage recovers |
+| Contract validation fails | Fix the pipeline/report producer; do not edit the archived artifact by hand |
 
-Set the bridge claim lease above the worst expected download duration, not above the ingestion
-duration: the lease protects claiming only until staging acknowledgement. Disable concurrent builds
-for a single bridge instance, as shown in [Jenkinsfile.example](../Jenkinsfile.example).
+Never manufacture a successful report to drain the queue. A failed operation remains visible and
+retryable, while a malformed report is rejected without partially applying results.
+
+## Security and observability
+
+- Scope the job token to `/api/v1/jobs/*` and store it only in Jenkins credentials.
+- Pin the bridge client exactly and install only from a trusted internal index.
+- Restrict the allowed host before attaching the bearer token.
+- Keep manifest, pull summary, and report artifacts for correlation, but do not archive downloaded
+  PDFs in the Jenkins workspace.
+- Alert on repeated lease expiry, checksum mismatch, report rejection, and component failure.
+- Do not log bearer tokens, download responses, or source PDF contents.
+
+## Coordinated deployment and smoke test
+
+The bridge, client, parser/RAG pipeline, and retrieval implementation must deploy together. Stop old
+consumers before clearing the disposable catalog, canonical and handoff storage, and Qdrant corpus.
+After reingestion, select one item and prove all of the following:
+
+1. Its downstream PDF is at `pdfs/{collection_key}/{document_id}.pdf`.
+2. Its Qdrant payload contains matching `document_id` and `collection_key`.
+3. Collection-scoped search returns it through the bridge.
+4. Normal bridge deletion removes it from downstream storage, BM25, Qdrant, and subsequent search.

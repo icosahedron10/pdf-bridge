@@ -23,6 +23,8 @@ NAMING_CONVENTION = {
 
 
 class Base(DeclarativeBase):
+    """Declarative base using deterministic cross-database constraint names."""
+
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
@@ -41,6 +43,8 @@ def build_engine(database_url: str, *, echo: bool = False) -> Engine:
 
         @event.listens_for(engine, "connect")
         def configure_sqlite(dbapi_connection: object, _connection_record: object) -> None:
+            """Enable integrity, contention, and durability settings per connection."""
+
             cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
             try:
                 cursor.execute("PRAGMA foreign_keys=ON")
@@ -61,11 +65,15 @@ def build_session_factory(engine: Engine) -> sessionmaker[Session]:
 
 @lru_cache(maxsize=1)
 def get_engine() -> Engine:
+    """Return the cached engine for the active application settings."""
+
     return build_engine(get_settings().database_url)
 
 
 @lru_cache(maxsize=1)
 def get_session_factory() -> sessionmaker[Session]:
+    """Return the cached session factory for the active engine."""
+
     return build_session_factory(get_engine())
 
 

@@ -19,10 +19,14 @@ from pdf_bridge.services.web_page import (
 
 
 def get_theme_stylesheet(settings: Settings, *, renderer: ThemeRenderer) -> str:
+    """Render the deployment theme through the presentation adapter."""
+
     return web_page.render_theme_stylesheet(settings, renderer=renderer)
 
 
 def get_index_location() -> str:
+    """Return the canonical browser landing location."""
+
     return web_page.index_location()
 
 
@@ -32,15 +36,15 @@ async def get_library_page(
     *,
     query_value: str,
     mode: SearchMode,
-    language: str,
     search_retriever: SearchRetriever,
 ) -> PageResult:
+    """Build the collection library page context."""
+
     return await web_page.build_library_page(
         state,
         db,
         query_value=query_value,
         mode=mode,
-        language=language,
         search_retriever=search_retriever,
     )
 
@@ -52,17 +56,17 @@ async def get_collection_page(
     collection_key: str,
     query_value: str,
     mode: SearchMode,
-    language: str,
     page: int,
     search_retriever: SearchRetriever,
 ) -> PageResult:
+    """Build one collection page with optional retrieval results."""
+
     return await web_page.build_collection_page(
         state,
         db,
         collection_key=collection_key,
         query_value=query_value,
         mode=mode,
-        language=language,
         page=page,
         search_retriever=search_retriever,
     )
@@ -74,34 +78,19 @@ def get_queue_page(
     *,
     status: str,
     collection: str,
-    language: str,
     sort: str,
     order: str,
     page: int,
 ) -> PageResult:
+    """Build the filtered and sorted queue page context."""
+
     return web_page.build_queue_page(
         state,
         db,
         status=status,
         collection=collection,
-        language=language,
         sort=sort,
         order=order,
-        page=page,
-    )
-
-
-def get_review_page(
-    state: WebRequestState,
-    db: Session,
-    *,
-    collection: str,
-    page: int,
-) -> PageResult:
-    return web_page.build_review_page(
-        state,
-        db,
-        collection=collection,
         page=page,
     )
 
@@ -112,6 +101,8 @@ async def get_upload_page(
     collection: str,
     scanner_ping: ScannerPing,
 ) -> PageResult:
+    """Build upload page context including scanner readiness."""
+
     return await web_page.build_upload_page(
         state,
         collection=collection,
@@ -125,6 +116,8 @@ def get_document_page(
     *,
     document_id: UUID,
 ) -> PageResult:
+    """Build the detail page context for a catalog document."""
+
     return web_page.build_document_page(
         state,
         db,

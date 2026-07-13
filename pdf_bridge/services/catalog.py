@@ -10,7 +10,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
 from pdf_bridge.contracts.schemas import (
-    CollectionLanguageCounts,
     CollectionListResponse,
     CollectionSummary,
     DocumentDetail,
@@ -24,8 +23,6 @@ from pdf_bridge.core.config import CollectionDefinition
 from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
-    LanguageCode,
-    LanguageStatus,
     QueueOperation,
 )
 from pdf_bridge.presentation.api_serializers import document_summary
@@ -44,10 +41,6 @@ RETRIEVAL_STATES = (
     DocumentState.DELETE_CLAIMED,
     DocumentState.DELETE_FAILED,
 )
-RETRIEVAL_LANGUAGES = (LanguageCode.EN, LanguageCode.FR)
-RETRIEVAL_LANGUAGE_STATUSES = (LanguageStatus.DETECTED, LanguageStatus.OVERRIDDEN)
-
-
 def _active_document_states() -> tuple[DocumentState, ...]:
     # Import lazily so catalog initialization stays independent of lifecycle setup.
     from pdf_bridge.services.lifecycle import ACTIVE_DOCUMENT_STATES
@@ -55,20 +48,12 @@ def _active_document_states() -> tuple[DocumentState, ...]:
     return ACTIVE_DOCUMENT_STATES
 
 
-def retrieval_catalog_filters(
-    *, collection_key: str | None = None, language: LanguageCode | None = None
-) -> list:
+def retrieval_catalog_filters(*, collection_key: str | None = None) -> list:
     """Build the common retrieval-eligibility SQL predicates."""
 
-    filters = [
-        Document.state.in_(RETRIEVAL_STATES),
-        Document.language.in_(RETRIEVAL_LANGUAGES),
-        Document.language_status.in_(RETRIEVAL_LANGUAGE_STATUSES),
-    ]
+    filters = [Document.state.in_(RETRIEVAL_STATES)]
     if collection_key is not None:
         filters.append(Document.collection_key == collection_key)
-    if language is not None:
-        filters.append(Document.language == language)
     return filters
 
 
@@ -96,7 +81,7 @@ def collection_list(
     processing_states = tuple(
         state
         for state in _active_document_states()
-        if state not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+        if state != DocumentState.INGESTED
     )
     items: list[CollectionSummary] = []
     for definition in definitions:
@@ -119,33 +104,6 @@ def collection_list(
             )
             or 0
         )
-        review = (
-            session.scalar(
-                select(func.count())
-                .select_from(Document)
-                .where(
-                    Document.collection_key == definition.key,
-                    Document.state == DocumentState.CLASSIFICATION_REVIEW,
-                )
-            )
-            or 0
-        )
-        language_counts = {
-            language.value: (
-                session.scalar(
-                    select(func.count())
-                    .select_from(Document)
-                    .where(
-                        *retrieval_catalog_filters(
-                            collection_key=definition.key,
-                            language=language,
-                        )
-                    )
-                )
-                or 0
-            )
-            for language in LanguageCode
-        }
         items.append(
             CollectionSummary(
                 key=definition.key,
@@ -154,8 +112,6 @@ def collection_list(
                 audience=definition.audience,
                 available_documents=available,
                 processing_documents=processing,
-                review_documents=review,
-                languages=CollectionLanguageCounts(**language_counts),
                 detail_url=f"/library/{definition.key}",
             )
         )
@@ -166,10 +122,9 @@ def document_list(
     session: Session,
     *,
     definitions: Sequence[CollectionDefinition],
-    document_scope: Literal["library", "queue", "review", "all"],
+    document_scope: Literal["library", "queue", "all"],
     document_state: DocumentState | None,
     collection_key: str | None,
-    language: LanguageCode | None,
     page: int,
     page_size: int,
 ) -> DocumentListResponse:
@@ -179,8 +134,6 @@ def document_list(
     if collection_key is not None:
         configured_collection(definitions, collection_key)
         filters.append(Document.collection_key == collection_key)
-    if language is not None:
-        filters.append(Document.language == language)
     if document_state is not None:
         filters.append(Document.state == document_state)
     elif document_scope == "library":
@@ -191,12 +144,10 @@ def document_list(
                 tuple(
                     item
                     for item in _active_document_states()
-                    if item not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+                    if item != DocumentState.INGESTED
                 )
             )
         )
-    elif document_scope == "review":
-        filters.append(Document.state == DocumentState.CLASSIFICATION_REVIEW)
 
     total = session.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
     documents = session.scalars(
@@ -237,6 +188,8 @@ def document_detail_record(session: Session, document_id: UUID) -> Document:
 
 
 def document_detail(session: Session, document_id: UUID) -> DocumentDetail:
+    """Return the public detailed representation of one catalog document."""
+
     document = document_detail_record(session, document_id)
     return DocumentDetail.model_validate(document).model_copy(
         update={"detail_url": f"/documents/{document.id}"}
@@ -248,7 +201,6 @@ def queue_list(
     *,
     definitions: Sequence[CollectionDefinition],
     collection_key: str | None,
-    language: LanguageCode | None,
     page: int,
     page_size: int,
 ) -> QueueListResponse:
@@ -259,15 +211,13 @@ def queue_list(
             tuple(
                 item
                 for item in _active_document_states()
-                if item not in {DocumentState.INGESTED, DocumentState.CLASSIFICATION_REVIEW}
+                if item != DocumentState.INGESTED
             )
         )
     ]
     if collection_key is not None:
         configured_collection(definitions, collection_key)
         filters.append(Document.collection_key == collection_key)
-    if language is not None:
-        filters.append(Document.language == language)
     query = (
         select(QueueOperation)
         .join(QueueOperation.document)
@@ -298,18 +248,15 @@ def queue_list(
     )
 
 
-def available_document_count(
-    session: Session, *, collection_key: str, language: LanguageCode | None
-) -> int:
+def available_document_count(session: Session, *, collection_key: str) -> int:
+    """Count retrieval-eligible documents in a collection."""
+
     return (
         session.scalar(
             select(func.count())
             .select_from(Document)
             .where(
-                *retrieval_catalog_filters(
-                    collection_key=collection_key,
-                    language=language,
-                )
+                *retrieval_catalog_filters(collection_key=collection_key)
             )
         )
         or 0
@@ -337,16 +284,11 @@ def validate_search_response(
         invalid_hit = any(
             document_id not in documents_by_id
             or documents_by_id[document_id].collection_key != group.collection_key
-            or (
-                request.language is not None
-                and documents_by_id[document_id].language != request.language
-            )
             for document_id in ids
         )
         catalog_total = available_document_count(
             session,
             collection_key=group.collection_key,
-            language=request.language,
         )
         if invalid_hit or group.total > catalog_total:
             raise ServiceError(
@@ -363,5 +305,7 @@ def validate_search_response(
 def validate_configured_collections(
     definitions: Sequence[CollectionDefinition], collection_keys: Iterable[str]
 ) -> None:
+    """Require every supplied collection key to be configured."""
+
     for collection_key in collection_keys:
         configured_collection(definitions, collection_key)

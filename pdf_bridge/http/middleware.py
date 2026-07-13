@@ -32,6 +32,8 @@ def ensure_request_id(scope: Scope) -> str:
 
 
 class RequestContextMiddleware:
+    """Attach request tracing and browser security headers to HTTP responses."""
+
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
@@ -43,6 +45,8 @@ class RequestContextMiddleware:
         request_id = ensure_request_id(scope)
 
         async def send_with_headers(message: Message) -> None:
+            """Decorate the response-start message before forwarding it."""
+
             if message["type"] == "http.response.start":
                 response_headers = MutableScopeHeaders.from_message(message)
                 response_headers["X-Request-ID"] = request_id

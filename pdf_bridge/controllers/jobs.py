@@ -77,6 +77,8 @@ def claim_job_batch(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> BatchClaimResponse | Response[None]:
+    """Lease queued operations to an idempotent Jenkins batch request."""
+
     try:
         result = claim_batch_request(
             db,
@@ -114,6 +116,8 @@ def get_batch_manifest(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> BatchManifestResponse:
+    """Return the validated staging manifest for a claimed batch."""
+
     configured_collection_keys = {
         collection.key for collection in request.app.state.settings.collections
     }
@@ -141,6 +145,8 @@ def download_batch_operation(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> File:
+    """Download canonical PDF content for an operation in the claimed batch."""
+
     try:
         content = batch_operation_content(
             db,
@@ -173,6 +179,8 @@ def stage_job_batch(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> BatchStageResponse:
+    """Acknowledge that every operation in a batch was durably staged."""
+
     try:
         result = stage_batch_request(
             db,
@@ -206,6 +214,8 @@ def report_job_batch(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> BatchResultsResponse:
+    """Record correlated pipeline results and finalize the batch."""
+
     try:
         result = report_batch_request(
             db,
@@ -238,7 +248,6 @@ def report_job_batch(
         completed_at=result.batch.completed_at,
         succeeded=result.succeeded,
         failed=result.failed,
-        review_required=result.review_required,
         idempotent_replay=result.idempotent_replay,
     )
 

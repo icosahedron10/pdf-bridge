@@ -1,9 +1,8 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import status_label, language_label, document_icon, external_icon, empty_state, pagination %}
+{% from "macros/ui.html" import status_label, document_icon, external_icon, empty_state, pagination %}
 
 {% set selected_status = status_filter|default('all', true)|lower %}
 {% set selected_collection = collection_filter|default('all', true) %}
-{% set selected_language = language_filter|default('all', true) %}
 {% set selected_sort = sort|default('created_at', true) %}
 {% set selected_order = order|default('asc', true) %}
 {% set queue_items = operations|default([], true) %}
@@ -51,15 +50,6 @@
           {% for item in collections %}<option value="{{ item.key }}" {% if selected_collection == item.key %}selected{% endif %}>{{ item.display_name }}</option>{% endfor %}
         </select>
       </div>
-      <div class="field field--inline">
-        <label for="queue-language">Language</label>
-        <select id="queue-language" name="language">
-          <option value="all" {% if selected_language == 'all' %}selected{% endif %}>All languages</option>
-          <option value="en" {% if selected_language == 'en' %}selected{% endif %}>English</option>
-          <option value="fr" {% if selected_language == 'fr' %}selected{% endif %}>Français</option>
-          <option value="und" {% if selected_language == 'und' %}selected{% endif %}>Undetermined</option>
-        </select>
-      </div>
       <details class="filter-more" {% if selected_sort != 'created_at' or selected_order != 'asc' %}open{% endif %}>
         <summary>Sort</summary>
         <div class="filter-more__fields">
@@ -81,7 +71,7 @@
         </div>
       </details>
       <button class="button button--quiet" type="submit">Apply</button>
-      {% if selected_status != 'all' or selected_collection != 'all' or selected_language != 'all' or selected_sort != 'created_at' or selected_order != 'asc' %}<a class="button button--text" href="/queue">Reset</a>{% endif %}
+      {% if selected_status != 'all' or selected_collection != 'all' or selected_sort != 'created_at' or selected_order != 'asc' %}<a class="button button--text" href="/queue">Reset</a>{% endif %}
     </form>
 
     <div class="section-heading section-heading--queue">
@@ -100,7 +90,6 @@
             <tr>
               <th scope="col">Document</th>
               <th scope="col">Operation</th>
-              <th scope="col">Language</th>
               <th scope="col">Status</th>
               <th scope="col">Added</th>
               <th scope="col">Batch</th>
@@ -133,7 +122,6 @@
                   {% endif %}
                 </td>
                 <td data-label="Operation">{{ operation_type|replace('_', ' ')|title }}</td>
-                <td data-label="Language">{{ language_label(doc.language, doc.language_status) }}</td>
                 <td data-label="Status">{{ status_label(operation_status) }}</td>
                 <td data-label="Added">{{ operation.created_at_display|default(operation.created_at, true)|default('Not reported', true) }}</td>
                 <td class="mobile-hide" data-label="Batch">
@@ -176,7 +164,7 @@
       </div>
       {{ pagination(page|default(1, true), total_pages|default(1, true), '/queue', pagination_query|default('', true)) }}
     {% else %}
-      {% if selected_status != 'all' or selected_collection != 'all' or selected_language != 'all' %}
+      {% if selected_status != 'all' or selected_collection != 'all' %}
         {{ empty_state('No operations match this filter', 'Choose another status or reset the filters.') }}
       {% else %}
         {{ empty_state('The queue is clear', 'New uploads and deletion requests will appear here.', '/upload', 'Upload') }}

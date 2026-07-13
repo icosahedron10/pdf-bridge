@@ -1,211 +1,193 @@
 # Architecture and lifecycle
 
-PDF Bridge is intentionally a boundary, not another retrieval system. It keeps the PDF catalog and
-canonical clean bytes, exposes a small human UI, and hands explicit work to the existing scheduled
-pipeline. Markdown, chunking, BM25, sentence-transformer embeddings, and Qdrant remain downstream.
+PDF Bridge is the catalog and control plane between operators, durable source storage, Jenkins, the
+existing parser/RAG pipeline, and grouped retrieval. The bridge owns document identity and
+lifecycle. The downstream pipeline owns derived artifacts and retrieval indexes.
+
+## System boundary
 
 ```mermaid
 flowchart LR
-    U["Trusted coworker"] -->|"choose collection; upload and review"| B["PDF Bridge\nLitestar + SQLite"]
-    B -->|"INSTREAM scan"| C["ClamAV clamd"]
-    B -->|"opaque UUID canonical object"| V["External data volume"]
-    J["Jenkins scheduled job"] -->|"claim, download, acknowledge"| B
-    J -->|"v2 collection/language manifest"| R["Existing parser and RAG ingestion"]
-    R -->|"classification and operation outcomes"| J
-    R --> M["pdfs/language/collection/id.pdf\nMarkdown and chunks"]
-    R --> Q["Separate Qdrant collections\nBM25 + dense"]
-    J -->|"per-operation results"| B
-    B -->|"collection-scoped grouped search"| S["Retrieval search API"]
-    S --> Q
-    A["Chatbot manager"] -->|"authenticated allowed intersection"| Q
+    O["Operator browser"] -->|"upload, browse, retry, delete"| B["PDF Bridge"]
+    C["Chatbot or API client"] -->|"grouped search"| B
+    B --> D[("Catalog")]
+    B --> S["Canonical PDF storage"]
+    B --> V["ClamAV"]
+    J["Jenkins bridge client"] -->|"claim / stage / report"| B
+    B -->|"version 2 collection manifest"| J
+    J --> H["Handoff storage"]
+    J --> P["Parser and RAG pipeline"]
+    P --> Q[("BM25 and Qdrant")]
+    B -->|"correlated grouped request"| R["Retrieval service"]
+    R --> Q
+    R -->|"document UUID hits"| B
 ```
 
-## Internal application structure
+The interfaces remain under `/api/v1`. Batch manifests, batch report files, and historical import
+manifests remain version 2. Their version numbers are stable even though this disposable POC reset
+changes the version 2 shapes atomically.
 
-The Python application uses one-way internal dependencies:
+## Ownership
 
-```mermaid
-flowchart LR
-    A["app.py\ncomposition root"] --> C["controllers/"]
-    A --> H["http/"]
-    A --> P["persistence/"]
-    A --> O["core/"]
-    C --> M["managers/"]
-    C --> H
-    H --> K["contracts/"]
-    M --> S["services/"]
-    S --> V["presentation/"]
-    S --> K["contracts/"]
-    S --> P
-    V --> K
-    V --> P
-    K --> P
-    P --> O
+| Component | Owns | Does not own |
+|---|---|---|
+| PDF Bridge | UUID, collection, hash, canonical bytes, lifecycle, queue, audit history, retrieval authorization | Parsing, derived artifacts, retrieval ranking |
+| ClamAV | Malware verdict for uploaded bytes | Document lifecycle or downstream ingestion |
+| Jenkins client | Leasing, verified staging, pipeline invocation, complete result reporting | Catalog mutation outside the job API |
+| Parser/RAG pipeline | PDF source copy, Markdown, chunks, BM25, dense/Qdrant data, downstream deletion | UUID or collection assignment |
+| Retrieval service | Grouped ranking and pagination | Deciding which catalog documents are eligible |
+
+Every integration carries the bridge document UUID and immutable `collection_key`. User filenames
+are display metadata and never determine routing or identity.
+
+## Application structure
+
+Controllers translate HTTP and CLI requests. Managers coordinate use cases. Services implement
+storage, lifecycle, staging, and retrieval rules. Pydantic contracts validate every public or job
+boundary. SQLAlchemy models and repositories persist the catalog.
+
+Dependencies point inward:
+
+```text
+controllers -> managers -> services -> persistence
+                   |            |
+                   +--> contracts <--+
 ```
 
-`app.py` is the composition root and the only implementation module at the package root. It
-assembles Litestar, HTTP middleware, persistence providers, and runtime collaborators, then
-registers the controllers. Controller modules also contain the two Typer command adapters.
-Controllers own transport concerns: routes and command declarations, input binding,
-authentication dependencies, response/output construction, and translation of deliberate service
-failures into public errors. They do not construct SQL.
-
-Managers are deliberately thin. They coordinate service calls and own orchestration concerns such
-as locks, transaction commit or rollback sequencing, and multi-step cleanup. Business rules,
-queries, filesystem operations, and external-service implementations belong in services rather
-than managers.
-
-Services own the bulk of application behavior. They enforce lifecycle and catalog rules, execute
-SQL queries, and integrate with ClamAV, retrieval HTTP, and canonical storage. Services may depend
-on `core`, `persistence`, `contracts`, `presentation`, and peer services; they do not depend back on
-managers, controllers, the application composition root, or Litestar transport types.
-
-The foundation packages have narrow technical responsibilities:
-
-- `core/` owns configuration and logging and imports no other application layer.
-- `persistence/` owns SQLAlchemy database setup and ORM models and may depend on `core/`.
-- `contracts/` owns Pydantic API and job-client wire contracts. It may use persistence enums but
-  does not depend on presentation, services, managers, controllers, or HTTP adapters.
-- `http/` owns middleware, request security, and problem responses. It is a transport foundation,
-  not a home for routes or business workflows.
-- `presentation/` owns serializers, themes, and view models. It may format contract and persistence
-  values but does not call services or orchestration layers.
-
-Imports may skip downward across these layers when a lower-level type or helper is needed, but they
-must never point upward. Package initializers do not re-export implementations, and canonical
-module names omit redundant `_controller`, `_manager`, and `_service` suffixes.
-
-The **chatbot manager** shown in the system diagram is an external application responsible for
-end-user retrieval authorization. It is unrelated to the internal `pdf_bridge.managers` package;
-the shared word “manager” does not imply code ownership or a runtime dependency between them.
-
-## Ownership boundaries
-
-PDF Bridge owns:
-
-- uploaded PDF bytes after a clean malware scan;
-- deployment-configured collection definitions and immutable document-to-collection placement;
-- SHA-256, filename, size, language evidence, lifecycle, and pipeline metadata;
-- queue operations, leased Jenkins batches, and audit events;
-- the bridge document UUID that downstream chunks must retain as `document_id`.
-
-The retrieval pipeline owns PDF parsing, English/French detection, markdown, chunking, indexes, and
-search semantics. PDF Bridge does not add a JavaScript runtime or second parser: there is no V8,
-Node, PDF.js, or `franc` dependency in the bridge process. Its canonical object key remains an
-opaque UUID path; only the downstream RAG corpus uses
-`pdfs/{language}/{collection_key}/{document_id}.pdf`.
-
-The chatbot manager owns end-user retrieval authorization. A PDF Bridge `audience` label makes the
-corpus boundary visible to operators but does not grant access. For every authenticated request,
-the manager must intersect the requested collections with its server-side `allowed_collections`
-before retrieval. This repository documents that invariant but does not implement the manager.
-
-## Collection and search boundaries
-
-`PDF_BRIDGE_COLLECTIONS` is the deployment registry. Each stable lowercase key is simultaneously:
-
-- the PDF Bridge collection identifier;
-- the Qdrant collection name; and
-- the value used by chatbot-manager `allowed_collections`.
-
-Every upload requires one configured collection and has no default. The destination is locked once
-the document is queued; moving it requires deletion and re-upload. Startup fails when an active
-catalog record references an unconfigured key, or when an unassigned active record is not held for
-classification review.
-
-The collection overview shows all configured corpora at once: explicit **Customer-facing** or
-**Internal only** boundaries, available and processing totals, review-required totals, and
-`en`/`fr`/`und` available-document counts. These are catalog counts; search-match totals come only
-from the retrieval service.
-
-Root search is count-only and requests every configured collection. The retrieval response must
-contain exactly one group per requested key and an exact accepted-document total, including an
-explicit zero. Entering a collection repeats the query as a hit-producing request scoped to that
-one key. PDF Bridge rejects the whole response when query/mode/language/groups do not correlate,
-when a hit is inactive or belongs to another collection/language, or when a reported total exceeds
-the eligible catalog population. It never mixes partial upstream results with metadata fallback.
-
-## Upload lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> QUEUED: clean upload chooses collection; language is und
-    QUEUED --> CANCEL_CLEANUP: user cancels before claim
-    CANCEL_CLEANUP --> CANCELLED: canonical PDF removed
-    QUEUED --> CLAIMED: Jenkins leases operation
-    CLAIMED --> STAGED: verified batch acknowledged
-    STAGED --> INGESTED: parser reports en/fr and indexes succeed
-    STAGED --> CLASSIFICATION_REVIEW: parser reports safe und/review reason
-    STAGED --> INGEST_FAILED: parser/service fails operationally
-    INGEST_FAILED --> QUEUED: user retries with canonical PDF
-    CLASSIFICATION_REVIEW --> QUEUED: legacy assign-and-detect or audited en/fr override
-    CLASSIFICATION_REVIEW --> DELETE_QUEUED: operator removes document
-```
-
-The upload endpoint streams to a UUID-named temporary file, limits bytes while reading, calculates
-SHA-256, checks the `.pdf` name and PDF signature, then sends the stream to ClamAV. Only a clean
-file is atomically promoted into `objects/`. The bridge never parses it. The clean upload is queued
-with `language=und`, `language_status=pending`, and its selected immutable collection.
-
-After staging, the existing downstream parser inspects extracted text. A confident English or
-French result allows indexing and becomes `detected`. A parser crash, timeout, or dependency outage
-is `failed` and remains retryable. A content outcome such as `no_text`, `ocr_required`, `encrypted`,
-`bilingual`, `unsupported`, or `low_confidence` is `review_required`: the pipeline must not write
-BM25 or dense content. A legacy unassigned record can choose its collection and enter detection, or
-receive an audited `en`/`fr` override. A pipeline-undetermined record retains its collection and
-requires an audited override or removal; it cannot be repeatedly re-detected or moved.
-
-## Deletion lifecycle
-
-```mermaid
-stateDiagram-v2
-    INGESTED --> DELETE_QUEUED: user requests deletion
-    DELETE_QUEUED --> DELETE_CLAIMED: Jenkins leases operation
-    DELETE_CLAIMED --> DELETE_CLEANUP: all downstream removals succeed
-    DELETE_CLEANUP --> DELETED: canonical PDF removed
-    DELETE_CLAIMED --> DELETE_FAILED: any component fails
-    DELETE_FAILED --> DELETE_QUEUED: user retries
-```
-
-Deletion is staged, not optimistic. The final result must confirm removal from the pipeline's PDF
-source, markdown output, BM25 index, and dense index. The bridge then records a recoverable cleanup
-state, removes its retained canonical object, and marks the document `DELETED`. Cancellation uses
-the same two-step cleanup pattern. A failed filesystem removal keeps the key and cleanup state so
-the exact action/report can be retried safely. The audit tombstone remains.
-
-## Batch handoff
-
-1. Jenkins supplies a stable `request_id`; claiming again with it returns the same batch.
-2. The bridge leases up to the requested limit of queued operations in one transaction.
-3. Jenkins fetches the immutable version 2 batch manifest and downloads only `INGEST` items through
-   batch-scoped URLs into the exact safe relative path
-   `pdfs/{language}/{collection_key}/{document_id}.pdf`.
-4. The client writes into a temporary sibling directory, checks declared length and SHA-256, writes
-   its local versioned manifest, and atomically renames the complete directory.
-5. Jenkins acknowledges the exact set of staged operation IDs. A partial set is rejected.
-6. The external pipeline acts on every manifest item and sends one version 2 typed result per
-   operation: `succeeded`, `failed`, or `review_required`, including classification where required.
-
-Claim leases recover work when a job dies before staging. Staging and result calls are idempotent;
-conflicting replays are rejected rather than silently changing history.
+Lifecycle mutation stays in the lifecycle service so web, API, CLI, and Jenkins paths cannot invent
+different transitions.
 
 ## Persistence
 
-SQLite is appropriate only for this single-process POC. SQLAlchemy models and migrations avoid
-SQLite-specific types so PostgreSQL remains a straightforward enterprise migration. The official
-Compose topology uses one Uvicorn worker and one Docker-managed `bridge_data` volume. Running two
-application processes against SQLite is unsupported.
+The `documents` table stores:
 
-Runtime storage contains:
+- the bridge UUID, display filename, SHA-256, byte size, and canonical storage key;
+- required immutable `collection_key`, including for deleted and cancelled tombstones;
+- scan and lifecycle state, uploader identity, timestamps, errors, chunk count, and pipeline metadata.
+
+The catalog also stores queue operations, batches and leases, component result rows, and audit
+events. `ix_documents_collection_state` supports collection-scoped lifecycle queries. There are no
+additional routing dimensions in the document schema.
+
+Migration `0002_collection_partitioning` intentionally upgrades only an empty version-1 catalog.
+If any version-1 document exists, the migration fails with a reset-required error instead of
+guessing a collection. This is a disposable-catalog cutover, not a compatibility migration.
+
+At startup, every document row must have a collection. Active documents must reference a configured
+collection; historical tombstones keep their required collection even if that collection is later
+removed from active configuration.
+
+## Identity and storage
+
+The bridge derives its canonical object key from the UUID, not from user input. Jenkins stages each
+manifest item at exactly:
 
 ```text
-<storage-root>/
-  catalog.sqlite3       metadata and audit events
-  objects/              UUID-derived canonical PDFs
-  temporary/            incomplete uploads/import copies
-  quarantine/           reserved controlled quarantine location
+pdfs/{collection_key}/{document_id}.pdf
 ```
 
-Original filenames are display metadata only and never become storage paths.
-The `pdfs/{language}/{collection}/{document_id}.pdf` tree belongs to the downstream handoff/RAG
-store, not canonical bridge storage.
+The staged path must be relative, canonical, free of traversal, and consistent with both manifest
+fields. The handoff tree and downstream corpus are independently disposable; they are not the
+bridge's canonical storage.
+
+## Document lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED: clean upload
+    QUEUED --> CLAIMED: batch claim
+    CLAIMED --> STAGED: verified handoff
+    STAGED --> INGESTED: successful result
+    STAGED --> INGEST_FAILED: failed result
+    INGEST_FAILED --> QUEUED: retry
+    QUEUED --> CANCEL_CLEANUP: remove before ingestion
+    CLAIMED --> CANCEL_CLEANUP: cancel claimed work
+    STAGED --> CANCEL_CLEANUP: cancel staged work
+    CANCEL_CLEANUP --> CANCELLED: cleanup succeeds
+    INGESTED --> DELETE_QUEUED: remove
+    DELETE_QUEUED --> DELETE_CLAIMED: batch claim
+    DELETE_CLAIMED --> DELETE_CLEANUP: successful downstream delete
+    DELETE_CLAIMED --> DELETE_FAILED: failed downstream delete
+    DELETE_FAILED --> DELETE_QUEUED: retry
+    DELETE_CLEANUP --> DELETED: canonical cleanup succeeds
+```
+
+Ingestion has one binary operation result: success or failure. A successful result requires PDF
+source, Markdown, BM25, and dense components all to be `succeeded`, and it forbids an error. A
+failed result requires a nonblank error and enters `INGEST_FAILED`, where ordinary retry is
+available. Encrypted files, OCR-only files, empty text, parser crashes, and component failures all
+follow that same failure path when they prevent complete ingestion.
+
+Deletion is available only through the normal lifecycle. An ingested document can be queued for
+delete, and a failed downstream delete can be retried. Pre-ingestion removal uses cancellation and
+cleanup; no alternate resolution workflow mutates document placement.
+
+## Upload and duplicate handling
+
+1. The operator chooses a configured collection and uploads a PDF.
+2. The bridge validates request bounds, streams to quarantine, hashes the bytes, checks PDF shape,
+   and invokes ClamAV.
+3. A clean PDF is promoted to canonical storage and receives an ingest operation.
+4. Exact active duplicates return the existing document identity and collection without creating
+   another operation.
+5. Rejected or infected bytes never become available content.
+
+The selected collection is required at creation and never changes.
+
+## Batch handoff protocol
+
+Jenkins claims work with an idempotent request identifier. A version 2 manifest item contains only:
+
+- `operation_id`, `document_id`, `operation_type`;
+- `filename`, `size_bytes`, `sha256`;
+- `collection_key`, exact `relative_path`, and optional `download_url`.
+
+Jenkins verifies staged bytes against size and SHA-256 before acknowledging every operation ID. A
+batch result supplies `pipeline_run_id` plus exactly one entry per staged operation. Each entry has
+`operation_id`, `success`, optional `chunk_count`, the four strict component results, and optional
+`error`. Unknown, missing, duplicate, or extra operation IDs reject the report as a whole.
+
+Batch aggregation contains only `succeeded` and `failed` counts. Empty claims, lease expiry,
+idempotent replays, and cleanup recovery remain explicit states.
+
+## Retrieval boundary
+
+API and web search use the same catalog predicate: the document must be in an eligible lifecycle
+state and belong to the requested collection. Eligible documents are `INGESTED`, `DELETE_QUEUED`,
+`DELETE_CLAIMED`, and `DELETE_FAILED`; cleanup and tombstone states are excluded.
+
+The bridge sends grouped requests to retrieval and validates the complete response before exposing
+any hit:
+
+- query, mode, requested group set, and pagination must correlate;
+- every UUID must exist, be unique in the response, satisfy the shared eligibility predicate, and
+  belong to the group collection;
+- every group total must fit the corresponding eligible catalog population;
+- duplicate hits, inactive or unknown UUIDs, cross-collection hits, missing groups, and impossible
+  totals fail closed.
+
+Qdrant payloads retain only the bridge `document_id` and `collection_key` needed for this
+correlation. Retrieval does not accept or echo another document-routing field.
+
+## Historical import
+
+Historical import version 2 is an explicitly trusted administrative path. Each document declares a
+source path, optional display filename, required collection attestation, and optional ingestion
+metadata. The bridge validates the source, hashes it, creates the catalog record, and preserves the
+same UUID/collection identity expected downstream. The manifest is strict: obsolete or unknown
+fields are rejected.
+
+## Atomic reset and cutover
+
+The coordinated reset is performed in this order:
+
+1. Confirm all source PDFs required for reingestion are available.
+2. Stop bridge traffic and every job or handoff consumer.
+3. Clear the disposable catalog, canonical storage, handoff storage, and Qdrant corpus.
+4. Deploy the bridge, Jenkins client, parser/RAG pipeline, retrieval service, and UI contracts
+   together.
+5. Reingest the source set into configured collections using collection-only handoff paths.
+6. Prove one ingested Qdrant item is searchable within its collection and deletable end to end.
+
+Do not run old and new version 2 participants concurrently. There is deliberately no compatibility
+shim.

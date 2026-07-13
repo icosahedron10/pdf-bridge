@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "macros/ui.html" import status_label, audience_label, language_label, value_or_missing, document_icon, external_icon %}
+{% from "macros/ui.html" import status_label, audience_label, value_or_missing, document_icon, external_icon %}
 
 {% set doc = document %}
 {% set document_id = doc.id|default(doc.document_id, true) %}
@@ -7,16 +7,13 @@
 {% set document_status = doc.status|default('UNKNOWN', true)|upper %}
 {% set operation = active_operation|default(none, true) %}
 {% set operation_id = operation.id|default(operation.operation_id, true) if operation else none %}
-{% set is_review = document_status == 'CLASSIFICATION_REVIEW' %}
 {% set is_queue = document_status in ['QUEUED', 'CLAIMED', 'STAGED', 'INGEST_FAILED', 'DELETE_QUEUED', 'DELETE_CLAIMED', 'DELETE_CLEANUP', 'DELETE_FAILED', 'CANCEL_CLEANUP'] %}
 
 {% block title %}{{ filename }} · PDF Bridge{% endblock %}
 
 {% block breadcrumbs %}
   <nav class="breadcrumbs" aria-label="Breadcrumb">
-    {% if is_review %}
-      <a href="/review">Needs review</a>
-    {% elif is_queue %}
+    {% if is_queue %}
       <a href="/queue">Queue</a>
     {% elif collection %}
       <a href="/library">Collections</a><span aria-hidden="true">/</span><a href="/library/{{ collection.key }}">{{ collection.display_name }}</a>
@@ -37,7 +34,7 @@
           <h1>{{ filename }}</h1>
           {{ status_label(document_status) }}
         </div>
-        <p class="document-title__context"><span class="mono">{{ document_id }}</span> · {{ language_label(doc.language, doc.language_status) }}{% if collection %} · {{ audience_label(collection.audience) }}{% endif %}</p>
+        <p class="document-title__context"><span class="mono">{{ document_id }}</span>{% if collection %} · {{ audience_label(collection.audience) }}{% endif %}</p>
       </div>
     </div>
     <div class="page-heading__actions">
@@ -74,56 +71,6 @@
 {% endblock %}
 
 {% block content %}
-  {% if not collection %}
-    <div class="corpus-boundary corpus-boundary--review" role="alert">
-      <strong>No collection assigned</strong>
-      <span>This document cannot be exposed to retrieval until a destination is selected.</span>
-    </div>
-  {% endif %}
-
-  {% if is_review %}
-    <div class="notice notice--warning" role="status">
-      <div>
-        <strong>Language classification needs a decision</strong>
-        <p>{% if doc.language_reason %}{{ doc.language_reason|replace('_', ' ')|title }}.{% else %}The downstream parser could not classify this PDF as English or French.{% endif %} No BM25 or dense-index content is available.</p>
-      </div>
-    </div>
-
-    <section class="detail-section classification-workspace" aria-labelledby="classification-actions-title">
-      <div class="section-heading"><div><h2 id="classification-actions-title">Resolve classification</h2></div></div>
-      <div class="review-entry__actions{% if doc.collection_key %} review-entry__actions--single{% endif %}">
-        {% if not doc.collection_key %}
-          <form class="review-action-form" action="/api/v1/documents/{{ document_id }}/classification" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-            <input type="hidden" name="action" value="detect">
-            <div><h3>Assign and detect</h3></div>
-            <div class="field"><label for="detail-detect-collection">Collection</label><select id="detail-detect-collection" name="collection_key" required><option value="">Choose a collection</option>{% for item in collections %}<option value="{{ item.key }}">{{ item.display_name }} — {% if item.audience == 'customer' %}customer-facing{% else %}internal only{% endif %}</option>{% endfor %}</select></div>
-            <button class="button button--primary" type="submit">Queue detection</button>
-            <p class="form-error" data-form-error hidden></p>
-          </form>
-        {% endif %}
-        <form class="review-action-form" action="/api/v1/documents/{{ document_id }}/classification" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-          <input type="hidden" name="action" value="override">
-          {% if doc.collection_key %}<input type="hidden" name="collection_key" value="{{ doc.collection_key }}">{% endif %}
-          <div><h3>Set language</h3></div>
-          {% if not doc.collection_key %}<div class="field"><label for="detail-override-collection">Collection</label><select id="detail-override-collection" name="collection_key" required><option value="">Choose a collection</option>{% for item in collections %}<option value="{{ item.key }}">{{ item.display_name }} — {% if item.audience == 'customer' %}customer-facing{% else %}internal only{% endif %}</option>{% endfor %}</select></div>{% endif %}
-          <div class="field"><label for="detail-override-language">Language</label><select id="detail-override-language" name="language" required><option value="">Choose a language</option><option value="en">English</option><option value="fr">Français</option></select></div>
-          <div class="field review-action-form__reason"><label for="detail-override-reason">Audit reason</label><input id="detail-override-reason" name="reason" type="text" maxlength="500" required placeholder="How was the language verified?"></div>
-          <button class="button button--quiet" type="submit">Save language</button>
-          <p class="form-error" data-form-error hidden></p>
-        </form>
-        {% if doc.collection_key %}
-          <form class="review-remove-form" action="/api/v1/documents/{{ document_id }}/deletion" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}" data-confirm="Remove {{ filename }} rather than classify it? The pipeline will remove every scoped downstream copy." data-confirm-label="Request removal">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-            <button class="button button--danger-text button--small" type="submit">Request removal</button>
-            <p class="form-error" data-form-error hidden></p>
-          </form>
-        {% endif %}
-      </div>
-    </section>
-  {% endif %}
-
   {% if document_status in ['DELETE_QUEUED', 'DELETE_CLAIMED'] %}
     <div class="notice notice--warning" role="status">
       <div>
@@ -244,14 +191,8 @@
     <aside class="metadata-panel" aria-labelledby="metadata-title">
       <div class="metadata-panel__heading"><h2 id="metadata-title">Document record</h2></div>
       <dl class="metadata-list">
-        <div><dt>Collection</dt><dd>{% if collection %}<a href="/library/{{ collection.key }}">{{ collection.display_name }}</a><br><code>{{ collection.key }}</code>{% else %}<span class="missing-value">Unassigned</span>{% endif %}</dd></div>
+        <div><dt>Collection</dt><dd>{% if collection %}<a href="/library/{{ collection.key }}">{{ collection.display_name }}</a><br>{% endif %}<code>{{ doc.collection_key }}</code></dd></div>
         <div><dt>Audience</dt><dd>{% if collection %}{{ audience_label(collection.audience) }}{% else %}<span class="missing-value">Not assigned</span>{% endif %}</dd></div>
-        <div><dt>Language</dt><dd>{{ language_label(doc.language, doc.language_status) }}</dd></div>
-        <div><dt>Classification status</dt><dd>{{ status_label(doc.language_status|default('pending', true)) }}</dd></div>
-        <div><dt>Classification method</dt><dd>{{ doc.language_method|default('Not reported', true) }}</dd></div>
-        <div><dt>Confidence</dt><dd>{{ doc.language_confidence_display|default('Not reported', true) }}</dd></div>
-        {% if doc.language_reason|default(false) %}<div><dt>Classification reason</dt><dd>{{ doc.language_reason|replace('_', ' ')|title }}</dd></div>{% endif %}
-        <div><dt>Language recorded</dt><dd>{{ doc.language_detected_at_display|default('Not reported', true) }}</dd></div>
         <div><dt>Original filename</dt><dd>{{ filename }}</dd></div>
         <div><dt>Size</dt><dd>{{ doc.size_display|default(doc.size_bytes_display, true)|default(doc.size_bytes, true)|default('Not reported', true) }}</dd></div>
         <div><dt>Media type</dt><dd>{{ doc.media_type|default('application/pdf', true) }}</dd></div>

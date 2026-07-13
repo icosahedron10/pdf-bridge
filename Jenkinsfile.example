@@ -108,7 +108,7 @@ PY
             }
         }
 
-        stage('Report outcomes') {
+        stage('Report results') {
             when {
                 expression { fileExists(env.PIPELINE_REPORT) }
             }

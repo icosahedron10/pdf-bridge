@@ -10,8 +10,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
-    LanguageCode,
-    LanguageStatus,
     OperationState,
     OperationType,
     QueueOperation,
@@ -33,8 +31,6 @@ def _cleanup_document(*, state: DocumentState, filename: str) -> Document:
         idempotency_key=f"cleanup-test:{document_id}",
         state=state,
         collection_key="customer",
-        language=LanguageCode.EN,
-        language_status=LanguageStatus.DETECTED,
         scan_state=ScanState.CLEAN,
         scan_engine="test-clamd",
         scanned_at=utc_now(),

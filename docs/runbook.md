@@ -1,224 +1,234 @@
-# Operations and troubleshooting
+# Operations runbook
 
-This runbook assumes the Docker Compose POC on Linux. Direct installations are also Linux-only and
-use `systemd` for process supervision; translate the Compose operations to the corresponding
-`systemctl` and `journalctl` commands for that installation.
+This runbook covers routine operation, recovery, and the coordinated disposable-POC reset. Commands
+assume the service environment and storage paths have been reviewed against
+[`configuration.md`](configuration.md).
 
-## Normal start and health
+## Daily checks
 
-```text
-docker compose up -d --build
-docker compose ps
-docker compose logs --tail=100 app clamav
+Check the process and dependency endpoints:
+
+```bash
+curl --fail https://pdf-bridge.internal/health/live
+curl --fail https://pdf-bridge.internal/health/ready
 ```
 
-The health endpoints have deliberately different meanings:
+Readiness verifies catalog access, canonical storage, ClamAV, configured collections, and startup
+catalog invariants. Treat a readiness failure as an operational fault; do not route new uploads or
+job traffic until the failed dependency is understood.
 
-- `GET /api/v1/health/live`: the application process can answer HTTP. Use for restart/liveness.
-- `GET /api/v1/health/ready`: required local dependencies, including database/storage/scanner, are
-  usable. Use before admitting traffic or running Jenkins.
-- `GET /api/v1/health/dependencies`: detailed dependency state for operators; restrict it to the
-  internal network.
+Monitor at least:
 
-Do not restart on every transient retrieval outage: search can be unavailable while uploads and
-queue transparency remain useful. Surface that dependency failure to the user.
+- upload rejection, malware scan errors, and canonical promotion failures;
+- queued age, claim lease expiry, staging failures, and report rejection;
+- ingestion and deletion failure counts by collection;
+- retrieval correlation failures and downstream latency;
+- canonical, handoff, database, and Qdrant capacity.
 
-## First ClamAV start is slow
+The library collection cards show available and processing counts. The queue is the single operator
+workspace for pending and failed work.
 
-The pinned image initializes/updates the named signature volume and FreshClam may need several
-minutes. Compose gives the health check a three-minute start period, but a slow or proxied network
-can take longer.
+## Upload investigation
 
-```text
-docker compose logs -f clamav
-docker compose exec clamav clamdscan --ping=10
-```
+### Upload is rejected
 
-If updates fail, check DNS, outbound HTTPS/proxy rules, time synchronization, volume capacity, and
-the FreshClam message. Do not bypass the dependency. Restart after fixing the cause and wait for a
-healthy state.
+Use the problem response code and request ID to correlate logs.
 
-## Common failures
+| Symptom | Check |
+|---|---|
+| Request too large | Reverse-proxy and bridge upload limits |
+| Invalid PDF | Signature, extension, MIME shape, and parser-independent structural checks |
+| Malware or scanner error | ClamAV daemon health, signature age, socket permissions, and scan limits |
+| Duplicate response | Existing active document UUID and collection returned by the API |
+| Promotion failure | Quarantine and canonical filesystem ownership, free space, and atomic rename support |
 
-### Upload says scanner unavailable
+Do not copy quarantined bytes into canonical storage manually. Correct the dependency and upload the
+source again through the bridge.
 
-1. Check `docker compose ps` and ClamAV logs.
-2. Confirm the app uses host `clamav`, port `3310`, and both services share the Compose network.
-3. Check memory pressure; signature loading may require more than 2 GiB.
-4. Check signature update state.
-5. Retry the upload only after readiness is healthy. Failed temporary uploads should have been
-   removed; investigate accumulating files under `temporary/` before deleting them.
+### Collection is rejected
 
-### Jenkins gets 401
+The upload must name a configured collection key. Compare the submitted key with
+`PDF_BRIDGE_COLLECTIONS`. Collection assignment is immutable, so moving a document means deleting
+and reingesting it under the intended collection.
 
-Confirm Jenkins and the service use the same current `PDF_BRIDGE_JOB_TOKEN`. Inspect credential
-binding without printing the secret. Check that the Authorization header is not stripped by the
-reverse proxy. A rotation must update both ends in one change window.
+## Queue and batch recovery
 
-### Jenkins checksum or existing-batch verification fails
+### Work remains queued
 
-Stop the job. Record the batch/operation IDs and preserve the batch directory. Compare the server
-manifest, disk/volume health, proxy behavior, and any security event. Do not edit `manifest.json`,
-rename files, or pass a flag to skip verification. After the cause is resolved, remove only a known
-incomplete temporary sibling and rerun with the same request ID.
+1. Confirm a Jenkins schedule is running and can reach `/api/v1/jobs/*`.
+2. Check the job-token credential and exact allowed host.
+3. Inspect the archived `pull-result.json` for zero work, batch ID, and request ID.
+4. Check for a prior active lease. Let the configured lease expire or recover it through normal job
+   execution; do not edit queue rows.
 
-### Claim lease expired
+### Claim or staging fails
 
-A claim is expected to be staged within `PDF_BRIDGE_CLAIM_LEASE_MINUTES`; ingestion can take longer
-after staging. Check Jenkins/download performance, increase the setting within the 1–1440 minute
-range if justified, and let the bridge requeue expired claims. Do not create overlapping manual
-batches. An expired request ID is intentionally retired; the next claim must use a new Jenkins
-request ID (normally a new build ID).
+Re-run the same Jenkins build with the same request ID after fixing the cause. The client creates an
+immutable batch directory and verifies every ingest PDF against manifest size and SHA-256 before
+acknowledging staging. A partially downloaded directory is not valid input to the parser.
 
-### SQLite is locked or readiness fails
+Common causes are canonical storage unavailability, expired lease, insufficient handoff capacity,
+permission errors, or an old client that does not implement the current version 2 shape.
 
-Verify exactly one application process/container is running and Uvicorn has `--workers 1`. Look
-for an admin import or unsupported process holding a long transaction. Check disk space and I/O.
-Do not delete SQLite `-wal` or `-shm` files from a live database. Repeated contention is a signal to
-move to managed PostgreSQL, not to weaken transaction boundaries.
+### Report is rejected
 
-### Library search fails
+Validate the archived file against the current report contract:
 
-Check the configured retrieval URL/token, TLS chain, timeout, and retrieval service logs. Validate
-that every chunk payload contains the bridge UUID, collection key, and language; that the response
-contains exactly one group for every requested collection; and that exact totals include zeroes.
-Root search is count-only across collections, while a collection page is hit-producing and scoped
-to one collection. A forged cross-collection hit, wrong-language hit, inactive ID, missing group, or
-total above the eligible catalog population produces a 502 and no partial results. The bridge
-intentionally will not substitute metadata search.
+- version is 2 and `batch_id` matches the pull summary;
+- there is exactly one unique result per staged operation;
+- each result uses `success`, the four component values, optional `chunk_count`, and optional
+  `error` only;
+- successful results have all components succeeded and no error;
+- failed results contain a nonblank error.
 
-### Startup rejects collection configuration
+Unknown or obsolete fields make the strict report invalid. Fix and redeploy the producer, then run a
+fresh operation or replay a byte-for-byte valid report as appropriate.
 
-Validate that `PDF_BRIDGE_COLLECTIONS` is nonempty JSON, every key is unique lowercase path-safe
-ASCII, and every object has a display name, description, and `customer` or `internal` audience.
-The key must match both the Qdrant collection name and chatbot-manager `allowed_collections` value.
+### Lease expires
 
-Startup also fails when an active catalog document references a removed/renamed key or is
-unassigned outside classification review. Do not rename configuration to get past the guard. Stop
-traffic and follow the collection/language maintenance cutover with a backup and reviewed catalog
-reconciliation.
+Expired claimed or staged work is recovered by the bridge lifecycle rules. Confirm the original job
+is no longer running before allowing a new claim. Repeated expiry usually means the lease is shorter
+than worst-case verified staging and pipeline execution, or the consumer is abandoning batches.
 
-### Documents need language review
+Adjust the lease only after measuring actual duration; extending it also delays recovery from a dead
+consumer.
 
-`review_required` is a safe content outcome, not an operational parser failure. The pipeline must
-not write BM25 or dense content for that document. In **Needs review**, inspect the bounded reason
-(`no_text`, `ocr_required`, `encrypted`, `bilingual`, `unsupported`, or `low_confidence`). For a
-pipeline-undetermined document, record an audited `en` or `fr` override with a nonblank reason or
-request removal; its collection remains locked and automatic detection is not repeated.
+## Ingestion failures
 
-Legacy unassigned rows may instead choose a collection and queue their first classification pass,
-or receive an override with the same explicit collection assignment. A document already assigned
-to a collection cannot be moved; delete it completely and re-upload to the correct destination.
-Parser crashes, timeouts, and service outages belong in ingestion failure/retry, not Needs Review.
+Any condition that prevents all four components from succeeding enters `INGEST_FAILED`. This
+includes encrypted content, required OCR that the pipeline cannot provide, no extractable text,
+parser crashes, downstream timeouts, and index write failures.
 
-### A deletion is stuck or failed
+From the queue:
 
-Use the document ledger and pipeline run ID to identify which of `pdf_source`, `markdown`, `bm25`,
-or `dense` failed. Repair that component, then use the UI retry action. Do not mark the catalog
-deleted manually; canonical bytes are retained until a complete success report.
+1. Open the document ledger and read the operation error and component rows.
+2. Fix the parser, source, storage, or index dependency.
+3. Retry through the normal ingest action.
+4. Confirm the new operation reaches `INGESTED` and search correlation succeeds.
 
-If the status is **Deletion cleanup** or **Cancellation cleanup**, downstream/catalog work already
-finished but the canonical unlink did not. Check volume availability, permissions, and disk errors;
-then replay the identical result report or use **Retry cleanup**. The retained storage key makes
-that retry safe after a crash.
+Do not write catalog state directly or report success for a partial pipeline. If one component
+failed, the pipeline should compensate partial downstream writes or safely overwrite them on retry.
 
-## Safe restart and upgrade
+## Deletion failures
 
-1. Avoid the Jenkins claim window and wait for active uploads to finish.
-2. Back up the bridge volume.
-3. Read application, dependency, Python-base, and ClamAV release notes.
-4. Build and test the exact image revisions in a non-production environment.
-5. Review database migrations. The single-process Compose entrypoint runs `alembic upgrade head`
-   before Uvicorn and fails startup if it cannot migrate; enterprise rollout should run migrations
-   once as a separately controlled deployment step before scaling application replicas.
-6. Start one app process, wait for readiness, then run upload/claim/search smoke tests.
-7. Keep the prior image and compatible backup until acceptance is complete.
+Deletion starts only from an ingested document. A downstream failure enters `DELETE_FAILED` and is
+retryable through the normal lifecycle.
 
-Do not use a moving `latest` image in a controlled environment. Compose pins the ClamAV patch and
-Python patch so upgrades are explicit.
+Verify deletion by UUID and collection across:
 
-## Collection/language maintenance cutover
+- downstream PDF source at `pdfs/{collection_key}/{document_id}.pdf`;
+- Markdown storage;
+- BM25 content;
+- dense/Qdrant points;
+- bridge canonical storage after downstream success;
+- subsequent collection-scoped search.
 
-Introducing or changing corpus partitioning is a maintenance migration, not a rolling UI update.
-Use one approved change window for PDF Bridge, Jenkins, the parser/RAG store, retrieval service,
-Qdrant, and the chatbot manager:
+Targets already absent should be treated as successful downstream deletion so replay is idempotent.
+If downstream deletion succeeded but canonical cleanup failed, restore bridge storage access and
+replay the same report. The catalog intentionally stays in cleanup until canonical removal commits.
 
-1. Publish the final `PDF_BRIDGE_COLLECTIONS` registry and map each stable key to the identically
-   named Qdrant collection and chatbot-manager allowlist value. Record the customer/internal owner
-   and approved placement rules.
-2. Put chatbots and PDF Bridge uploads into maintenance mode. Stop Jenkins scheduling, then drain
-   every version 1 claimed/staged batch and confirm no old result can arrive after the contract
-   switch.
-3. Stop the app and take a verified backup of the complete bridge volume plus approved Qdrant and
-   downstream-corpus snapshots. Record counts and checksums by intended collection.
-4. Deploy the catalog migration and required collection configuration. Legacy active documents are
-   held unassigned in **Needs review** as `und`; deleted/cancelled tombstones remain historical.
-   Do not bypass this hold by editing catalog state.
-5. Using scoped, reviewed Qdrant and filesystem procedures, clear/recreate each configured Qdrant
-   collection and the derived RAG PDF/markdown/chunk outputs. Verify the exact target roots before
-   deletion; never recursively remove a computed or unreviewed path. Canonical bridge `objects/`
-   remain intact.
-6. Deploy the version 2 Jenkins manifest/result client, existing-parser language classification,
-   `pdfs/{language}/{collection_key}/{document_id}.pdf` routing, and grouped retrieval contract.
-   Keep chatbots unavailable while indexes are empty or partially rebuilt.
-7. Resolve every review row: assign its immutable collection and request parser detection, or make
-   an evidence-backed audited English/French override. Use version 2 historical import only after
-   an external record is already rebuilt and its collection/language placement is independently
-   attested; import does not enqueue missing index work.
-8. Run Jenkins until every approved document is classified `en`/`fr` and rebuilt into exactly one
-   Qdrant collection. `und` or review-required documents must have no BM25/dense entries.
-9. Reconcile PDF Bridge available/processing/review and language counts against the downstream PDF
-   tree and Qdrant payload counts for every collection. Investigate every unknown key, duplicate
-   UUID, missing document, and stale cross-collection payload.
-10. Run the isolation acceptance test: an HR-only topic returns internal `1` and customer `0`; a
-    customer-product topic appears only in customer; entering customer sends a customer-only hit
-    request; and a deliberately forged internal hit in a customer response yields a visible 502
-    with no partial results.
-11. Verify the chatbot manager derives its server-side `allowed_collections` from the authenticated
-    user and intersects every requested list before retrieval. Restore chatbots and uploads only
-    after owners sign off on counts, negative tests, and rollback evidence.
+## Retrieval correlation failures
 
-If acceptance fails, keep traffic paused. Restore the coordinated catalog/canonical/Qdrant snapshot
-set or correct and repeat the rebuild; do not mix a pre-cutover catalog with post-cutover indexes.
+PDF Bridge validates the complete grouped response before returning any hit. A single invalid hit
+rejects the response.
 
-## Backup
+Check that:
 
-The complete business dataset is the `bridge_data` volume: SQLite (including any WAL state) plus
-canonical objects. ClamAV signatures can be recreated and need not be in the business backup.
+- query, mode, requested collection set, and page boundaries match the request;
+- every hit has a unique bridge UUID;
+- each Qdrant payload contains the matching `document_id` and `collection_key`;
+- the UUID exists in the bridge, belongs to the group collection, and is in a shared eligible state;
+- a reported group total does not exceed the eligible bridge population.
 
-For a simple consistent POC backup:
+Unknown, inactive, duplicate, cross-collection, missing-group, pagination, or impossible-total data
+is a downstream integrity incident. Do not relax bridge validation to make a response pass. Correct
+the index or retrieval adapter and replay the request.
 
-1. Stop Jenkins scheduling and wait until no upload/import is active.
-2. Stop only the app: `docker compose stop app`.
-3. Snapshot or archive the entire `bridge_data` volume using the organization's approved volume
-   backup mechanism into encrypted storage.
-4. Record application version, backup time, volume name, and checksum/inventory.
-5. Restart and confirm readiness: `docker compose start app`.
+## Startup catalog validation
 
-Do not copy only `catalog.sqlite3` while the app is live, and do not omit canonical `objects/`.
-Test restoration periodically into an isolated network: restore the whole volume, start the same
-app version, verify catalog/object checksums and representative previews, then exercise migration
-to the target version. A backup that has not been restored is unproven.
+Startup fails if any document, including a tombstone, lacks a collection. It also fails if an active
+document references a collection that is no longer configured.
 
-## Retention and cleanup
+Do not rename configuration to bypass the guard. For an accidental configuration omission, restore
+the key. For a deliberate collection retirement, drain and delete its active documents first, then
+deploy the configuration change. Historical tombstones retain their original collection key.
 
-- Browser-cancelled files and fully acknowledged deletions remove canonical PDF bytes; audit
-  tombstones remain according to governance policy.
-- Jenkins batch directories are copies, not the canonical store. Remove them only after the result
-  was accepted and the pipeline's retention/forensic window elapsed.
-- Temporary directories named `.<batch-id>.tmp-*` indicate an interrupted pull. Confirm no job is
-  using them and retain evidence for checksum incidents before cleanup.
-- Never recursively delete a computed storage path. Resolve and verify the exact volume/batch root
-  before any cleanup command, including on Jenkins Linux agents.
+## Backups and restore
 
-## Minimal daily checks
+Back up the catalog and canonical storage as one recovery unit. Record the database revision and
+application version with each backup. The downstream corpus can be rebuilt, but retain source PDFs
+until rebuild is proven.
 
-- App and ClamAV readiness are healthy.
-- FreshClam is updating and signatures are within organizational age limits.
-- Volume capacity has room for uploads and temporary copies.
-- The last Jenkins build reported every operation; no claimed/staged batch is unexpectedly old.
-- Collection available/processing/review and `en`/`fr`/`und` counts reconcile with downstream
-  storage and Qdrant; no review/`und` document is indexed.
-- Retrieval returns expected bridge UUIDs only from their configured collection, and the HR-topic
-  negative test still reports customer `0`.
-- Backups and credential rotations are within policy.
+A restore drill should verify:
+
+1. catalog revision and startup invariants;
+2. canonical object existence and checksum for a sample of active documents;
+3. queue and batch leases are not mistakenly resumed from a stale environment;
+4. downstream rebuild preserves bridge UUID and collection;
+5. collection-scoped search and normal delete succeed for a sample item.
+
+Never merge independently timed database and canonical-storage snapshots without a reconciliation
+plan.
+
+## Routine upgrades
+
+For ordinary releases:
+
+1. Back up catalog and canonical storage.
+2. Stop bridge and job writers.
+3. Apply migrations once.
+4. Deploy all coordinated contract participants.
+5. Start PDF Bridge and confirm readiness.
+6. Start Jenkins consumers and run a small ingest/search/delete smoke test.
+7. Resume operator traffic.
+
+Migration `0002_collection_partitioning` is exceptional: it only upgrades an empty version-1
+catalog. Its reset-required failure is deliberate and must not be bypassed or edited in place.
+
+## Atomic POC reset
+
+Use this sequence for the collection-only version 2 cutover:
+
+1. Inventory and checksum every source PDF that must be reingested. Confirm the source set is
+   readable and mapped to configured collections.
+2. Stop operator traffic, bridge writers, scheduled Jenkins jobs, running pipeline jobs, handoff
+   consumers, and retrieval/index writers.
+3. Confirm no job consumer remains active and archive any evidence needed for incident history.
+4. Clear the disposable catalog and its migration state, bridge canonical storage, downstream
+   handoff/source/Markdown/BM25 data, and the entire Qdrant corpus.
+5. Deploy the rewritten migration and bridge, current `pdf-bridge-job` client, parser/RAG report
+   producer, retrieval adapter, UI, and documentation as one release.
+6. Initialize the empty catalog, start dependencies, and confirm readiness before enabling traffic.
+7. Reingest the source set under `pdfs/{collection_key}/{document_id}.pdf` paths.
+8. Reconcile available catalog UUIDs and collections with downstream storage, BM25, and Qdrant.
+9. Run the downstream smoke test below, then resume normal scheduling and operator traffic.
+
+Do not preserve old catalog rows or old version 2 artifacts as live inputs. There is no compatibility
+shim, and mixed participants can corrupt placement or leave partial indexes.
+
+## Required downstream smoke test
+
+Choose a disposable source PDF with searchable text and a configured collection.
+
+1. Upload it and record its bridge UUID and collection.
+2. Claim and stage the ingest operation; assert the exact collection-only handoff path.
+3. Report a complete successful ingest and inspect Qdrant to confirm its points contain only the
+   bridge identity fields required for correlation: `document_id` and `collection_key`.
+4. Search through PDF Bridge and confirm the UUID appears in the correct collection.
+5. Delete through PDF Bridge, process the delete batch, and report complete success.
+6. Confirm source/Markdown/BM25/Qdrant data are absent and the UUID no longer appears in search.
+
+Archive the manifest, report, search response, and deletion evidence with the release record.
+
+## Incident handling
+
+For possible malware escape, cross-collection exposure, unknown retrieval UUIDs, forged job
+traffic, or unexplained catalog/index drift:
+
+1. Stop uploads, job consumers, and retrieval traffic as needed to contain impact.
+2. Preserve request IDs, batch artifacts, audit events, logs, and relevant hashes.
+3. Revoke or rotate affected credentials.
+4. Identify the authoritative bridge UUID/collection set and quarantine inconsistent downstream
+   data.
+5. Correct the root cause and rebuild the affected corpus from verified source PDFs.
+6. Complete the ingest/search/delete smoke test before reopening traffic.

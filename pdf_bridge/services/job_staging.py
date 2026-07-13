@@ -35,13 +35,6 @@ MAX_REPORT_BYTES = 4 * 1024 * 1024
 MAX_STAGED_MANIFEST_BYTES = 2 * 1024 * 1024
 
 
-def _language_value(language: object) -> str:
-    value = getattr(language, "value", language)
-    if value not in {"und", "en", "fr"}:
-        raise BridgeClientError(f"server returned unsupported document language: {value!r}")
-    return str(value)
-
-
 def _safe_collection_key(collection_key: str) -> str:
     if (
         not collection_key
@@ -61,12 +54,9 @@ def _safe_collection_key(collection_key: str) -> str:
     return collection_key
 
 
-def _expected_relative_path(
-    *, document_id: uuid.UUID, collection_key: str, language: object
-) -> str:
+def _expected_relative_path(*, document_id: uuid.UUID, collection_key: str) -> str:
     safe_collection_key = _safe_collection_key(collection_key)
-    language_code = _language_value(language)
-    return f"pdfs/{language_code}/{safe_collection_key}/{document_id}.pdf"
+    return f"pdfs/{safe_collection_key}/{document_id}.pdf"
 
 
 def _validate_relative_path(
@@ -74,12 +64,10 @@ def _validate_relative_path(
     *,
     document_id: uuid.UUID,
     collection_key: str,
-    language: object,
 ) -> str:
     expected = _expected_relative_path(
         document_id=document_id,
         collection_key=collection_key,
-        language=language,
     )
     if relative_path != expected:
         raise BridgeClientError(
@@ -99,6 +87,8 @@ def _validate_relative_path(
 
 
 class StagedManifestItem(CliModel):
+    """Local manifest entry coupled to a safe canonical relative path."""
+
     operation_id: uuid.UUID
     document_id: uuid.UUID
     operation_type: OperationType
@@ -106,29 +96,23 @@ class StagedManifestItem(CliModel):
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     collection_key: str
-    language: Literal["und", "en", "fr"]
-    classification_required: bool
     relative_path: str
 
     @model_validator(mode="after")
     def validate_handoff_metadata(self) -> StagedManifestItem:
+        """Correlate collection metadata with the operation and staging path."""
+
         _validate_relative_path(
             self.relative_path,
             document_id=self.document_id,
             collection_key=self.collection_key,
-            language=self.language,
         )
-        expected_classification = (
-            self.operation_type == OperationType.INGEST and self.language == "und"
-        )
-        if self.classification_required != expected_classification:
-            raise ValueError(
-                "classification_required must be true only for und INGEST operations"
-            )
         return self
 
 
 class StagedManifest(CliModel):
+    """Versioned local manifest written beside a durably staged batch."""
+
     version: Literal[2] = 2
     batch_id: uuid.UUID
     request_id: str
@@ -142,7 +126,6 @@ def _manifest_item(item: BatchManifestItem) -> StagedManifestItem:
         item.relative_path,
         document_id=item.document_id,
         collection_key=item.collection_key,
-        language=item.language,
     )
     return StagedManifestItem(
         operation_id=item.operation_id,
@@ -152,8 +135,6 @@ def _manifest_item(item: BatchManifestItem) -> StagedManifestItem:
         size_bytes=item.size_bytes,
         sha256=item.sha256,
         collection_key=item.collection_key,
-        language=_language_value(item.language),
-        classification_required=item.classification_required,
         relative_path=relative_path,
     )
 
@@ -238,7 +219,6 @@ def _staged_operation_path(root: Path, operation: StagedManifestItem) -> Path:
         operation.relative_path,
         document_id=operation.document_id,
         collection_key=operation.collection_key,
-        language=operation.language,
     )
     root_resolved = root.resolve(strict=True)
     candidate = root
@@ -390,6 +370,8 @@ def validate_claim_manifest(
     *,
     request_id: str,
 ) -> None:
+    """Correlate a remote manifest with its claim and local request ID."""
+
     if remote.request_id != request_id:
         raise BridgeClientError("claimed batch request_id does not match the request")
     if remote.batch_id != claim.batch_id:
@@ -402,6 +384,8 @@ def prepare_report_submission(
     report_path: Path,
     pull_result_path: Path,
 ) -> tuple[ReportFile, BatchResultsRequest]:
+    """Load and correlate local report artifacts before network submission."""
+
     parsed = _read_report(report_path)
     pull_result = _read_pull_result(pull_result_path)
     if pull_result.batch_id is None or pull_result.operation_count == 0:
@@ -424,5 +408,7 @@ def validate_report_response(
     *,
     expected_batch_id: uuid.UUID,
 ) -> None:
+    """Require the server response to identify the submitted batch."""
+
     if response.batch_id != expected_batch_id:
         raise BridgeClientError("PDF Bridge result response returned the wrong batch_id")

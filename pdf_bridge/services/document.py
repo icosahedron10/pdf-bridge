@@ -20,12 +20,9 @@ from pdf_bridge.contracts.schemas import (
     UploadResponse,
 )
 from pdf_bridge.core.config import CollectionDefinition, Settings
-from pdf_bridge.persistence.models import Document, LanguageCode, OperationType, QueueOperation
+from pdf_bridge.persistence.models import Document, OperationType, QueueOperation
 from pdf_bridge.presentation.api_serializers import document_summary, duplicate_match
-from pdf_bridge.services.catalog import (
-    configured_collection,
-    document_detail_record,
-)
+from pdf_bridge.services.catalog import configured_collection
 from pdf_bridge.services.errors import ServiceError
 from pdf_bridge.services.lifecycle import (
     DuplicateDocumentError,
@@ -36,7 +33,6 @@ from pdf_bridge.services.lifecycle import (
     cancel_queued_document,
     finalize_cancelled_storage,
     find_preflight_duplicates,
-    queue_classification_review,
     queue_document_deletion,
     register_staged_upload,
     retry_failed_document,
@@ -248,6 +244,8 @@ def resolve_idempotency_conflict(
 
 
 def upload_response(registration: UploadRegistration) -> UploadResponse:
+    """Serialize a completed upload registration for the public API."""
+
     return UploadResponse(
         document=document_summary(registration.document),
         operation_id=registration.operation.id,
@@ -256,6 +254,8 @@ def upload_response(registration: UploadRegistration) -> UploadResponse:
 
 
 def content(session: Session, *, document_id: UUID, storage_root: Path) -> DocumentContent:
+    """Resolve clean, retained document content from canonical storage."""
+
     document = session.get(Document, document_id)
     if document is None:
         raise ServiceError(
@@ -348,6 +348,8 @@ def finish_queue_cancellation(
 def mutation_response(
     document: Document, *, operation_id: UUID | None = None
 ) -> DocumentMutationResponse:
+    """Serialize a document and optional operation after a lifecycle mutation."""
+
     return DocumentMutationResponse(
         document=document_summary(document),
         operation_id=operation_id,
@@ -361,42 +363,11 @@ def retry_queue_item(
     actor_type: str,
     actor_id: str,
 ) -> DocumentMutationResponse:
+    """Create and serialize a retry attempt for a failed queue operation."""
+
     operation = retry_failed_document(
         session,
         operation_id=operation_id,
-        actor_type=actor_type,
-        actor_id=actor_id,
-    )
-    return mutation_response(operation.document, operation_id=operation.id)
-
-
-def resolve_classification(
-    session: Session,
-    *,
-    definitions: Sequence[CollectionDefinition],
-    document_id: UUID,
-    collection_key: str | None,
-    language: LanguageCode | None,
-    reason: str | None,
-    actor_type: str,
-    actor_id: str,
-) -> DocumentMutationResponse:
-    existing = document_detail_record(session, document_id)
-    resolved_collection_key = collection_key or existing.collection_key
-    if resolved_collection_key is None:
-        raise ServiceError(
-            "Assign a configured collection before resolving this document.",
-            status=422,
-            code="collection-required",
-            title="Collection is required",
-        )
-    configured_collection(definitions, resolved_collection_key)
-    operation = queue_classification_review(
-        session,
-        document_id=document_id,
-        collection_key=resolved_collection_key,
-        language=language,
-        reason=reason,
         actor_type=actor_type,
         actor_id=actor_id,
     )
@@ -411,6 +382,8 @@ def request_deletion(
     actor_id: str,
     reason: str | None,
 ) -> DocumentMutationResponse:
+    """Queue and serialize deletion of an eligible document."""
+
     operation = queue_document_deletion(
         session,
         document_id=document_id,

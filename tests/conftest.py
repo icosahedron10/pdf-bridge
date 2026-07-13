@@ -44,11 +44,12 @@ def clean_scanner(_path: Path) -> ScanResult:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
+    storage_root = tmp_path / "bridge-data"
     return Settings(
         app_env="test",
         auth_mode="anonymous-poc",
-        storage_root=tmp_path / "bridge-data",
-        database_url="sqlite+pysqlite:///:memory:",
+        storage_root=storage_root,
+        database_url=f"sqlite+pysqlite:///{(storage_root / 'catalog.sqlite3').as_posix()}",
         session_secret=SecretStr("test-session-secret-not-for-production"),
         job_token=SecretStr("test-job-token-not-for-production"),
         search_api_token=SecretStr("test-search-token-not-for-production"),

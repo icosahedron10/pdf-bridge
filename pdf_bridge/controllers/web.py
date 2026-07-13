@@ -47,6 +47,8 @@ def _template_response(result: PageResult) -> Template:
 
 @get("/theme.css", sync_to_thread=False)
 def theme_stylesheet(request: Request) -> Response[str]:
+    """Render deployment brand settings as a no-cache stylesheet."""
+
     settings = request.app.state.settings
     stylesheet = web.get_theme_stylesheet(settings, renderer=render_theme_css)
     return Response(
@@ -58,6 +60,8 @@ def theme_stylesheet(request: Request) -> Response[str]:
 
 @get("/", sync_to_thread=False)
 def index() -> Redirect:
+    """Redirect the browser root to the collection library."""
+
     location = web.get_index_location()
     return Redirect(location, status_code=307)
 
@@ -68,15 +72,15 @@ async def library_page(
     db: NamedDependency[Session],
     q: Annotated[str, QueryParameter(max_length=1000)] = "",
     mode: FromQuery[SearchMode] = SearchMode.HYBRID,
-    language: Annotated[str, QueryParameter(max_length=3)] = "all",
 ) -> Template:
+    """Render the collection library and optional cross-collection search."""
+
     state = _request_state(request)
     result = await web.get_library_page(
         state,
         db,
         query_value=q,
         mode=mode,
-        language=language,
         search_retriever=search_retrieval,
     )
     return _template_response(result)
@@ -89,9 +93,10 @@ async def collection_page(
     db: NamedDependency[Session],
     q: Annotated[str, QueryParameter(max_length=1000)] = "",
     mode: FromQuery[SearchMode] = SearchMode.HYBRID,
-    language: Annotated[str, QueryParameter(max_length=3)] = "all",
     page: Annotated[int, QueryParameter(ge=1)] = 1,
 ) -> Template:
+    """Render one collection with browsed or searched documents."""
+
     state = _request_state(request)
     result = await web.get_collection_page(
         state,
@@ -99,7 +104,6 @@ async def collection_page(
         collection_key=collection_key,
         query_value=q,
         mode=mode,
-        language=language,
         page=page,
         search_retriever=search_retrieval,
     )
@@ -112,37 +116,20 @@ def queue_page(
     db: NamedDependency[Session],
     status: Annotated[str, QueryParameter(max_length=30)] = "all",
     collection: Annotated[str, QueryParameter(max_length=64)] = "all",
-    language: Annotated[str, QueryParameter(max_length=3)] = "all",
     sort: Annotated[str, QueryParameter(pattern="^(created_at|status|filename)$")] = "created_at",
     order: Annotated[str, QueryParameter(pattern="^(asc|desc)$")] = "asc",
     page: Annotated[int, QueryParameter(ge=1)] = 1,
 ) -> Template:
+    """Render the filterable, sortable ingestion queue."""
+
     state = _request_state(request)
     result = web.get_queue_page(
         state,
         db,
         status=status,
         collection=collection,
-        language=language,
         sort=sort,
         order=order,
-        page=page,
-    )
-    return _template_response(result)
-
-
-@get("/review", sync_to_thread=True)
-def review_page(
-    request: Request,
-    db: NamedDependency[Session],
-    collection: Annotated[str, QueryParameter(max_length=64)] = "all",
-    page: Annotated[int, QueryParameter(ge=1)] = 1,
-) -> Template:
-    state = _request_state(request)
-    result = web.get_review_page(
-        state,
-        db,
-        collection=collection,
         page=page,
     )
     return _template_response(result)
@@ -153,6 +140,8 @@ async def upload_page(
     request: Request,
     collection: Annotated[str, QueryParameter(max_length=64)] = "",
 ) -> Template:
+    """Render upload controls with current scanner availability."""
+
     state = _request_state(request)
     result = await web.get_upload_page(
         state,
@@ -168,6 +157,8 @@ def document_page(
     document_id: FromPath[UUID],
     db: NamedDependency[Session],
 ) -> Template:
+    """Render document metadata, processing status, and audit history."""
+
     state = _request_state(request)
     result = web.get_document_page(
         state,
@@ -185,7 +176,6 @@ web_router = Router(
         library_page,
         collection_page,
         queue_page,
-        review_page,
         upload_page,
         document_page,
     ],

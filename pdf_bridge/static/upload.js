@@ -169,7 +169,7 @@
       listItem.append(link);
       const matchStatus = match.status || match.state;
       if (matchStatus) listItem.append(document.createTextNode(" — " + String(matchStatus).replaceAll("_", " ").toLowerCase()));
-      const boundary = [match.collection_key, match.language].filter(Boolean).join(" / ");
+      const boundary = match.collection_key || "";
       if (boundary) listItem.append(document.createTextNode(" · " + boundary));
       matchList.append(listItem);
     });
@@ -351,8 +351,7 @@
   function queuedDocumentLink(item, payload) {
     const documentId = payload.document_id || payload.id || payload.document?.id || "";
     const documentUrl = payload.document_url || payload.document?.detail_url || payload.url || "";
-    const language = payload.document?.language || payload.language || "und";
-    item.statusNode.textContent = "Queued successfully for " + item.collectionName + ". Language " + (language === "und" ? "pending" : language.toUpperCase()) + ". ";
+    item.statusNode.textContent = "Queued successfully for " + item.collectionName + ". ";
     const link = document.createElement("a");
     link.href = safeDocumentPath(documentUrl, documentId);
     link.textContent = "View document";
