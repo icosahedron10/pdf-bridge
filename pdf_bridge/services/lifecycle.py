@@ -305,51 +305,52 @@ def register_staged_upload(
         state=OperationState.QUEUED,
         attempt=1,
     )
-    # Canonical promotion and the catalog flush form one compensating boundary:
-    # remove the promoted object if persistence rejects the new records.
+    # Canonical promotion, the catalog flush, and the audit inserts form one
+    # compensating boundary: remove the promoted object if persistence rejects
+    # any of the new records. The final commit is compensated by the manager.
     promoted: PromotedFile | None = None
     try:
         promoted = promote_staged_file(staged, layout, document.id)
         document.storage_key = promoted.storage_key
         session.add_all([document, operation])
         session.flush()
-    except Exception:
-        if promoted is not None:
-            promoted.path.unlink(missing_ok=True)
-        raise
-
-    _audit(
-        session,
-        event_type="upload_received",
-        actor_type=actor_type,
-        actor_id=actor_id,
-        document=document,
-        operation=operation,
-        details={
-            "status": DocumentState.QUEUED.value,
-            "collection_key": collection_key,
-            "detail": "PDF queued for downstream ingestion.",
-        },
-    )
-    _audit(
-        session,
-        event_type="malware_scan_clean",
-        actor_type="scanner",
-        actor_id=scan_result.engine,
-        document=document,
-        operation=operation,
-        details={"status": scan_result.state.value},
-    )
-    if possible:
         _audit(
             session,
-            event_type="possible_duplicate_confirmed",
+            event_type="upload_received",
             actor_type=actor_type,
             actor_id=actor_id,
             document=document,
             operation=operation,
-            details={"matched_document_ids": [str(item.id) for item in possible]},
+            details={
+                "status": DocumentState.QUEUED.value,
+                "collection_key": collection_key,
+                "detail": "PDF queued for downstream ingestion.",
+            },
         )
+        _audit(
+            session,
+            event_type="malware_scan_clean",
+            actor_type="scanner",
+            actor_id=scan_result.engine,
+            document=document,
+            operation=operation,
+            details={"status": scan_result.state.value},
+        )
+        if possible:
+            _audit(
+                session,
+                event_type="possible_duplicate_confirmed",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                document=document,
+                operation=operation,
+                details={"matched_document_ids": [str(item.id) for item in possible]},
+            )
+        session.flush()
+    except Exception:
+        if promoted is not None:
+            promoted.path.unlink(missing_ok=True)
+        raise
     return UploadRegistration(document, operation, promoted)
 
 
@@ -1090,6 +1091,9 @@ def import_historical_manifest(
                         "collection_key": entry.collection_key,
                     },
                 )
+                # Flush the audit row while promotion compensation is still
+                # active so a rejected insert removes the promoted object.
+                session.flush()
                 results.append(
                     HistoricalImportItemResult(
                         filename=filename,

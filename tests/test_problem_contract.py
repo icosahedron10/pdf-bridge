@@ -66,7 +66,7 @@ def test_unexpected_errors_use_safe_litestar_json(app) -> None:
     app.register(fail_deliberately)
     with TestClient(
         app,
-        base_url="http://testserver",
+        base_url="http://testserver.local",
         raise_server_exceptions=False,
     ) as test_client:
         response = test_client.get("/test-only/unexpected")

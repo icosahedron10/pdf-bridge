@@ -53,7 +53,7 @@ def settings(tmp_path: Path) -> Settings:
         session_secret=SecretStr("test-session-secret-not-for-production"),
         job_token=SecretStr("test-job-token-not-for-production"),
         search_api_token=SecretStr("test-search-token-not-for-production"),
-        allowed_hosts=["testserver", "localhost", "127.0.0.1"],
+        allowed_hosts=["testserver.local", "localhost", "127.0.0.1"],
         clamd_host="127.0.0.1",
         clamd_port=3310,
         clamd_timeout=0.05,
@@ -105,7 +105,7 @@ def app(settings: Settings, session_factory: sessionmaker[Session]):
 def client(app) -> Iterator[TestClient]:
     with TestClient(
         app,
-        base_url="http://testserver",
+        base_url="http://testserver.local",
         raise_server_exceptions=True,
     ) as test_client:
         yield test_client

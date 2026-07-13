@@ -13,17 +13,17 @@ from pdf_bridge.services import catalog
 from pdf_bridge.services.search import search_retrieval
 
 
-async def search_documents(
+def search_documents(
     session: Session,
     *,
     settings: Settings,
     definitions: Sequence[CollectionDefinition],
     request: SearchRequest,
-    client: httpx.AsyncClient | None,
+    client: httpx.Client,
 ) -> SearchResponse:
     """Run retrieval only after validating request and response catalog boundaries."""
 
     catalog.validate_configured_collections(definitions, request.collections)
-    response = await search_retrieval(settings, request, client=client)
+    response = search_retrieval(settings, request, client=client)
     catalog.validate_search_response(session, request, response)
     return response

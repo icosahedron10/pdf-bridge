@@ -92,9 +92,7 @@ class Settings(BaseSettings):
     collections: list[CollectionDefinition] = Field(min_length=1, max_length=50)
 
     session_secret: SecretStr = SecretStr(DEVELOPMENT_SESSION_SECRET)
-    allowed_hosts: list[str] = Field(
-        default_factory=lambda: ["localhost", "127.0.0.1", "testserver"]
-    )
+    allowed_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
     trusted_proxy_cidrs: list[str] = Field(default_factory=list)
     trusted_identity_header: str = "X-Forwarded-User"
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 
@@ -111,7 +110,7 @@ def test_root_search_shows_authoritative_collection_counts_and_preserves_query(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.get("/library?q=employee+benefits&mode=keyword")
@@ -122,7 +121,7 @@ def test_root_search_shows_authoritative_collection_counts_and_preserves_query(
         expected_link = "/library/customer?q=employee+benefits&amp;mode=keyword"
         assert expected_link in response.text
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 def test_collection_page_rejects_cross_collection_search_hits(
@@ -162,7 +161,7 @@ def test_collection_page_rejects_cross_collection_search_hits(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.get("/library/customer?q=benefits")
@@ -171,7 +170,7 @@ def test_collection_page_rejects_cross_collection_search_hits(
         assert internal.original_filename not in response.text
         assert "private HR result" not in response.text
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 def test_root_search_rejects_all_counts_atomically(
@@ -201,7 +200,7 @@ def test_root_search_rejects_all_counts_atomically(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.get("/library?q=employee+policy")
@@ -209,7 +208,7 @@ def test_root_search_rejects_all_counts_atomically(
         assert response.text.count("count unavailable") == 2
         assert "matching document" not in response.text
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 def test_cleanup_record_is_not_retrieval_eligible(
@@ -267,7 +266,7 @@ def test_cleanup_record_is_not_retrieval_eligible(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         search = client.get("/library/customer?q=held")
@@ -275,7 +274,7 @@ def test_cleanup_record_is_not_retrieval_eligible(
         assert held.original_filename not in search.text
         assert "must remain outside retrieval" not in search.text
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 def test_upload_requires_collection_and_review_workspace_is_absent(client: TestClient) -> None:

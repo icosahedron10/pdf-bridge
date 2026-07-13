@@ -33,7 +33,7 @@ def _request_state(request: Request) -> WebRequestState:
         actor_kind=actor.kind,
         actor_identifier=actor.identifier,
         app_version=__version__,
-        search_http_client=getattr(request.app.state, "search_http_client", None),
+        search_http_client=request.app.state.search_http_client,
     )
 
 
@@ -66,8 +66,8 @@ def index() -> Redirect:
     return Redirect(location, status_code=307)
 
 
-@get("/library")
-async def library_page(
+@get("/library", sync_to_thread=True)
+def library_page(
     request: Request,
     db: NamedDependency[Session],
     q: Annotated[str, QueryParameter(max_length=1000)] = "",
@@ -76,7 +76,7 @@ async def library_page(
     """Render the collection library and optional cross-collection search."""
 
     state = _request_state(request)
-    result = await web.get_library_page(
+    result = web.get_library_page(
         state,
         db,
         query_value=q,
@@ -86,8 +86,8 @@ async def library_page(
     return _template_response(result)
 
 
-@get("/library/{collection_key:str}")
-async def collection_page(
+@get("/library/{collection_key:str}", sync_to_thread=True)
+def collection_page(
     request: Request,
     collection_key: FromPath[str],
     db: NamedDependency[Session],
@@ -98,7 +98,7 @@ async def collection_page(
     """Render one collection with browsed or searched documents."""
 
     state = _request_state(request)
-    result = await web.get_collection_page(
+    result = web.get_collection_page(
         state,
         db,
         collection_key=collection_key,
@@ -135,15 +135,15 @@ def queue_page(
     return _template_response(result)
 
 
-@get("/upload")
-async def upload_page(
+@get("/upload", sync_to_thread=True)
+def upload_page(
     request: Request,
     collection: Annotated[str, QueryParameter(max_length=64)] = "",
 ) -> Template:
     """Render upload controls with current scanner availability."""
 
     state = _request_state(request)
-    result = await web.get_upload_page(
+    result = web.get_upload_page(
         state,
         collection=collection,
         scanner_ping=clamd_ping,

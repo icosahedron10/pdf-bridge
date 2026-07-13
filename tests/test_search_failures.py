@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 
 import httpx
@@ -51,7 +50,7 @@ def test_unknown_search_document_fails_visibly(
             ),
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.post(
@@ -62,7 +61,7 @@ def test_unknown_search_document_fails_visibly(
         assert response.status_code == 502
         assert response.json()["code"] == "search-catalog-mismatch"
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 @pytest.mark.parametrize(
@@ -79,7 +78,7 @@ def test_retrieval_outage_never_falls_back(
     def handler(_request: httpx.Request) -> httpx.Response:
         raise failure_type("offline")
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.post(
@@ -93,7 +92,7 @@ def test_retrieval_outage_never_falls_back(
         assert page.status_code == 503
         assert "No fallback search was used" in page.text
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 @pytest.mark.parametrize(
@@ -208,7 +207,7 @@ def test_retrieval_response_must_correlate_strictly(
     response_payload: dict,
     request_payload: dict,
 ) -> None:
-    search_client = httpx.AsyncClient(
+    search_client = httpx.Client(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=response_payload))
     )
     app.state.search_http_client = search_client
@@ -217,4 +216,4 @@ def test_retrieval_response_must_correlate_strictly(
         assert response.status_code == 502
         assert response.json()["code"] == "search-invalid-response"
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()

@@ -1,8 +1,33 @@
 from __future__ import annotations
 
+import pytest
 from litestar.testing import TestClient
 
 from pdf_bridge.controllers import api
+
+
+@pytest.mark.parametrize("directory", ["objects", "temporary", "quarantine"])
+def test_readiness_fails_when_any_storage_directory_is_unavailable(
+    client: TestClient,
+    settings,
+    monkeypatch,
+    directory: str,
+) -> None:
+    monkeypatch.setattr(api, "clamd_ping", lambda **_kwargs: True)
+    target = settings.storage_root / directory
+    moved = settings.storage_root / f"{directory}-unavailable"
+    target.rename(moved)
+    try:
+        degraded = client.get("/api/v1/health/ready")
+        assert degraded.status_code == 503
+        assert degraded.json()["status"] == "degraded"
+        assert degraded.json()["checks"]["storage"] == "error"
+    finally:
+        moved.rename(target)
+
+    restored = client.get("/api/v1/health/ready")
+    assert restored.status_code == 200
+    assert restored.json()["checks"]["storage"] == "ok"
 
 
 def test_health_endpoints_report_dependency_state(client: TestClient, monkeypatch) -> None:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 
@@ -354,7 +353,7 @@ def test_root_search_counts_include_explicit_zero_and_positive_groups(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.get("/library?q=employee+benefits&mode=hybrid")
@@ -368,7 +367,7 @@ def test_root_search_counts_include_explicit_zero_and_positive_groups(
         assert "<strong>0</strong>" in customer_card
         assert "<strong>1</strong>" in internal_card
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()
 
 
 def test_customer_search_rejects_forged_internal_document(
@@ -414,7 +413,7 @@ def test_customer_search_rejects_forged_internal_document(
             },
         )
 
-    search_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    search_client = httpx.Client(transport=httpx.MockTransport(handler))
     app.state.search_http_client = search_client
     try:
         response = client.post(
@@ -432,4 +431,4 @@ def test_customer_search_rejects_forged_internal_document(
         assert response.status_code == 502
         assert response.json()["code"] == "search-catalog-mismatch"
     finally:
-        asyncio.run(search_client.aclose())
+        search_client.close()

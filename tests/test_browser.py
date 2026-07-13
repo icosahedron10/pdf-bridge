@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import socket
@@ -429,7 +428,7 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
                     },
                 )
 
-            search_client = httpx.AsyncClient(transport=httpx.MockTransport(search_handler))
+            search_client = httpx.Client(transport=httpx.MockTransport(search_handler))
             app.state.search_http_client = search_client
             for mode in ("keyword", "semantic", "hybrid"):
                 page.goto(f"{live_server}/library")
@@ -478,4 +477,4 @@ def test_search_modes_and_confirmed_deletion(app, live_server: str) -> None:
             page.goto(f"{live_server}{document_path}")
             expect(page.get_by_text("Deleted", exact=True).first).to_be_visible()
         browser.close()
-    asyncio.run(search_client.aclose())
+    search_client.close()

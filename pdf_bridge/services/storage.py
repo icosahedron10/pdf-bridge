@@ -9,7 +9,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 PDF_HEADER_BYTES = 1024
 DEFAULT_CHUNK_BYTES = 1024 * 1024
@@ -39,10 +39,10 @@ class UnsafePathError(StorageError):
     """Raised when a storage or import path escapes its approved root."""
 
 
-class AsyncReadable(Protocol):
-    """Minimal asynchronous byte reader accepted by upload streaming."""
+class BinaryReadable(Protocol):
+    """Minimal synchronous byte reader accepted by upload streaming."""
 
-    async def read(self, size: int = -1) -> bytes:
+    def read(self, size: int = -1, /) -> bytes:
         """Read up to ``size`` bytes, or all remaining bytes when negative."""
 
         ...
@@ -125,35 +125,48 @@ def has_pdf_signature(header: bytes) -> bool:
     return header[:PDF_HEADER_BYTES].lstrip(b"\x00\t\n\x0c\r ").startswith(b"%PDF-")
 
 
-def _temporary_path(layout: StorageLayout) -> Path:
-    return layout.temporary / f"{uuid.uuid4()}.upload"
+def _staging_path(directory: Path) -> Path:
+    return directory / f"{uuid.uuid4()}.upload"
 
 
-async def stream_upload(
-    upload: AsyncReadable,
+def _open_exclusive_private(path: Path) -> BinaryIO:
+    """Atomically create a staging file that only the service account can read.
+
+    Permission failures propagate: silently staging bytes with a broader mode
+    would defeat the point of the private staging directories.
+    """
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        return os.fdopen(descriptor, "wb")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def stream_upload(
+    upload: BinaryReadable,
     layout: StorageLayout,
     *,
     max_bytes: int,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
 ) -> StagedFile:
-    """Stream an UploadFile-like object to disk while hashing and enforcing size."""
+    """Stream an untrusted upload into quarantine while hashing and enforcing size."""
 
     if max_bytes <= 0 or chunk_bytes <= 0:
         raise ValueError("max_bytes and chunk_bytes must be positive")
 
-    destination = _temporary_path(layout)
+    # Live uploads have not been scanned yet, so their staged copies belong in
+    # quarantine/; temporary/ is reserved for trusted historical import copies.
+    destination = _staging_path(layout.quarantine)
     digest = hashlib.sha256()
     header = bytearray()
     size = 0
     try:
-        with destination.open("xb") as output:
-            try:
-                os.chmod(destination, 0o600)
-            except OSError:
-                # Windows and some mounted filesystems do not implement POSIX modes.
-                pass
+        with _open_exclusive_private(destination) as output:
             while True:
-                chunk = await upload.read(chunk_bytes)
+                chunk = upload.read(chunk_bytes)
                 if not chunk:
                     break
                 if not isinstance(chunk, bytes):
@@ -189,12 +202,12 @@ def copy_source_to_temporary(
 
     if max_bytes <= 0 or chunk_bytes <= 0:
         raise ValueError("max_bytes and chunk_bytes must be positive")
-    destination = _temporary_path(layout)
+    destination = _staging_path(layout.temporary)
     digest = hashlib.sha256()
     header = bytearray()
     size = 0
     try:
-        with source.open("rb") as input_file, destination.open("xb") as output:
+        with source.open("rb") as input_file, _open_exclusive_private(destination) as output:
             while chunk := input_file.read(chunk_bytes):
                 size += len(chunk)
                 if size > max_bytes:
@@ -244,11 +257,8 @@ def promote_staged_file(
     destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if destination.exists():
         raise StorageError("canonical storage key already exists")
+    # The staged file was created with mode 0600 and the rename preserves it.
     os.replace(staged.path, destination)
-    try:
-        os.chmod(destination, 0o600)
-    except OSError:
-        pass
     return PromotedFile(storage_key=key, path=destination)
 
 

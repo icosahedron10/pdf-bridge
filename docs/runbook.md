@@ -9,13 +9,15 @@ assume the service environment and storage paths have been reviewed against
 Check the process and dependency endpoints:
 
 ```bash
-curl --fail https://pdf-bridge.internal/health/live
-curl --fail https://pdf-bridge.internal/health/ready
+curl --fail https://pdf-bridge.internal/api/v1/health/live
+curl --fail https://pdf-bridge.internal/api/v1/health/ready
 ```
 
-Readiness verifies catalog access, canonical storage, ClamAV, configured collections, and startup
-catalog invariants. Treat a readiness failure as an operational fault; do not route new uploads or
-job traffic until the failed dependency is understood.
+Readiness verifies catalog access, every required storage directory (the storage root plus
+`objects/`, `temporary/`, and `quarantine/`), and ClamAV. Configured collections and catalog
+invariants are validated at startup against the same database the application serves. Treat a
+readiness failure as an operational fault; do not route new uploads or job traffic until the failed
+dependency is understood.
 
 Monitor at least:
 
