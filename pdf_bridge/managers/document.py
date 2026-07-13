@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
-from pathlib import Path
 from threading import RLock
 from uuid import UUID
 
@@ -11,33 +9,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
+    DecisionRequest,
     DocumentMutationResponse,
-    UploadPreflightResponse,
-    UploadResponse,
+    UploadAcceptedResponse,
 )
-from pdf_bridge.core.config import CollectionDefinition, Settings
-from pdf_bridge.services import document
+from pdf_bridge.core.config import Settings
+from pdf_bridge.managers.worker import AnalysisWorker
+from pdf_bridge.persistence.models import DecisionAction
+from pdf_bridge.presentation.api_serializers import document_summary
+from pdf_bridge.services import document, intake
 from pdf_bridge.services.scanner import Scanner
 from pdf_bridge.services.storage import BinaryReadable
 
-
-def preflight_upload(
-    session: Session,
-    *,
-    definitions: Sequence[CollectionDefinition],
-    filename: str,
-    size_bytes: int,
-    collection_key: str,
-) -> UploadPreflightResponse:
-    """Validate upload metadata and find possible catalog duplicates."""
-
-    return document.preflight_upload(
-        session,
-        definitions=definitions,
-        filename=filename,
-        size_bytes=size_bytes,
-        collection_key=collection_key,
-    )
+_DECISION_ACTIONS = {
+    "keep": DecisionAction.KEEP,
+    "replace": DecisionAction.REPLACE,
+    "cancel": DecisionAction.CANCEL,
+}
 
 
 def upload_document(
@@ -46,20 +34,18 @@ def upload_document(
     settings: Settings,
     scanner: Scanner,
     transition_lock: RLock,
+    worker: AnalysisWorker | None,
     file: BinaryReadable,
     filename: str,
     content_type: str | None,
     collection_key: str,
-    possible_duplicate_confirmed: bool,
     header_idempotency_key: str | None,
     form_idempotency_key: str | None,
     actor_type: str,
     actor_id: str,
-) -> UploadResponse:
-    """Prepare, scan, register, and commit a document upload atomically."""
+) -> UploadAcceptedResponse:
+    """Stream, scan, register, and queue an upload for immediate analysis."""
 
-    # Expensive streaming and malware scanning happen before the transition lock;
-    # only canonical promotion and catalog mutation need serialization.
     idempotency_key = document.validate_idempotency_key(
         header_value=header_idempotency_key,
         form_value=form_idempotency_key,
@@ -75,13 +61,10 @@ def upload_document(
     registration = None
     try:
         with transition_lock:
-            # Compensation covers registration, audit inserts, and the commit
-            # itself: any transaction failure removes the promoted bytes.
             try:
                 registration = document.register_upload(
                     session,
                     prepared=prepared,
-                    possible_duplicate_confirmed=possible_duplicate_confirmed,
                     idempotency_key=idempotency_key,
                     actor_type=actor_type,
                     actor_id=actor_id,
@@ -107,109 +90,127 @@ def upload_document(
 
     if registration is None:
         raise RuntimeError("upload registration unexpectedly missing")
-    return document.upload_response(registration)
+    if worker is not None:
+        worker.notify()
+    return document.upload_accepted_response(registration)
 
 
-def content(session: Session, *, document_id: UUID, storage_root: Path):
-    """Resolve a document that is eligible to be served from storage."""
+def decide_upload(
+    session: Session,
+    *,
+    transition_lock: RLock,
+    worker: AnalysisWorker | None,
+    upload_id: UUID,
+    request: DecisionRequest,
+    idempotency_key: str,
+    actor_type: str,
+    actor_id: str,
+) -> DocumentMutationResponse:
+    """Record a Keep, Replace, or Cancel decision and queue its work."""
 
-    return document.content(
-        session,
-        document_id=document_id,
-        storage_root=storage_root,
+    validated_key = document.validate_idempotency_key(
+        header_value=idempotency_key, form_value=None
+    )
+    with transition_lock:
+        try:
+            record = intake.get_upload_document(session, upload_id)
+            outcome = intake.record_decision(
+                session,
+                document=record,
+                analysis_revision=request.analysis_revision,
+                action=_DECISION_ACTIONS[request.action],
+                target_document_id=request.target_document_id,
+                idempotency_key=validated_key,
+                actor_type=actor_type,
+                actor_id=actor_id,
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+    if worker is not None:
+        worker.notify()
+    return DocumentMutationResponse(
+        document=document_summary(outcome.document),
+        operation_id=outcome.operation.id if outcome.operation else None,
+        idempotent_replay=outcome.idempotent_replay,
     )
 
 
-def cancel_queue_item(
+def retry_upload(
     session: Session,
     *,
     transition_lock: RLock,
-    storage_root: Path,
-    operation_id: UUID,
+    worker: AnalysisWorker | None,
+    upload_id: UUID,
     actor_type: str,
     actor_id: str,
-    remove_file: Callable[..., None],
 ) -> DocumentMutationResponse:
-    """Cancel a queued ingest and finalize its storage cleanup."""
+    """Queue the next attempt for an upload whose last operation failed."""
 
     with transition_lock:
         try:
-            record, storage_key = document.begin_queue_cancellation(
-                session,
-                operation_id=operation_id,
-                actor_type=actor_type,
-                actor_id=actor_id,
+            record = intake.get_upload_document(session, upload_id)
+            operation = intake.retry_upload(
+                session, document=record, actor_type=actor_type, actor_id=actor_id
             )
             session.commit()
         except Exception:
             session.rollback()
             raise
-
-    if storage_key:
-        document.remove_cancelled_storage(
-            storage_root=storage_root,
-            document_id=record.id,
-            operation_id=operation_id,
-            storage_key=storage_key,
-            remove_file=remove_file,
-        )
-        with transition_lock:
-            try:
-                record = document.finish_queue_cancellation(
-                    session,
-                    document_id=record.id,
-                    storage_key=storage_key,
-                    actor_type=actor_type,
-                    actor_id=actor_id,
-                )
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-    return document.mutation_response(record)
+    if worker is not None:
+        worker.notify()
+    return DocumentMutationResponse(
+        document=document_summary(record), operation_id=operation.id
+    )
 
 
-def retry_queue_item(
+def cancel_upload(
     session: Session,
     *,
     transition_lock: RLock,
-    operation_id: UUID,
+    worker: AnalysisWorker | None,
+    upload_id: UUID,
     actor_type: str,
     actor_id: str,
 ) -> DocumentMutationResponse:
-    """Commit a new queue attempt for a retryable document."""
+    """Cancel unpublished work and queue cleanup of everything retained."""
 
     with transition_lock:
         try:
-            response = document.retry_queue_item(
-                session,
-                operation_id=operation_id,
-                actor_type=actor_type,
-                actor_id=actor_id,
+            record = intake.get_upload_document(session, upload_id)
+            operation = intake.cancel_upload(
+                session, document=record, actor_type=actor_type, actor_id=actor_id
             )
             session.commit()
         except Exception:
             session.rollback()
             raise
-    return response
+    if worker is not None:
+        worker.notify()
+    return DocumentMutationResponse(
+        document=document_summary(record), operation_id=operation.id
+    )
 
 
 def request_deletion(
     session: Session,
     *,
     transition_lock: RLock,
+    worker: AnalysisWorker | None,
     document_id: UUID,
     actor_type: str,
     actor_id: str,
     reason: str | None,
 ) -> DocumentMutationResponse:
-    """Commit a request to delete an eligible document."""
+    """Queue removal of an ingested document from retrieval and storage."""
 
     with transition_lock:
         try:
-            response = document.request_deletion(
+            record = intake.get_upload_document(session, document_id)
+            operation = intake.request_deletion(
                 session,
-                document_id=document_id,
+                document=record,
                 actor_type=actor_type,
                 actor_id=actor_id,
                 reason=reason,
@@ -218,4 +219,8 @@ def request_deletion(
         except Exception:
             session.rollback()
             raise
-    return response
+    if worker is not None:
+        worker.notify()
+    return DocumentMutationResponse(
+        document=document_summary(record), operation_id=operation.id
+    )

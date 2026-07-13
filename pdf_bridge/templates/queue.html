@@ -11,36 +11,28 @@
 
 {% block page_header %}
   <div class="page-heading">
-    <div>
-      <h1>Queue</h1>
-    </div>
-    <a class="button button--primary" href="/upload">Upload</a>
+    <div><h1>Queue</h1></div>
+    <a class="button button--primary" href="/upload">Upload and analyze</a>
   </div>
 {% endblock %}
 
 {% block content %}
-  {% if next_job_at|default(false) %}
-    <div class="run-note" role="status">
-      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10 5.75v4.5l3 1.75" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-      <span>Next scheduled collection: <strong>{{ next_job_at }}</strong></span>
-    </div>
-  {% endif %}
-
   <section aria-labelledby="queue-list-title">
     <form class="filter-toolbar" method="get" action="/queue">
       <div class="field field--inline">
-        <label for="queue-status">Status</label>
+        <label for="queue-status">Document status</label>
         <select id="queue-status" name="status">
           <option value="all" {% if selected_status == 'all' %}selected{% endif %}>All statuses</option>
-          <option value="queued" {% if selected_status == 'queued' %}selected{% endif %}>Queued</option>
-          <option value="claimed" {% if selected_status == 'claimed' %}selected{% endif %}>Claimed</option>
-          <option value="staged" {% if selected_status == 'staged' %}selected{% endif %}>Staged</option>
+          <option value="analyzing" {% if selected_status == 'analyzing' %}selected{% endif %}>Analyzing</option>
+          <option value="review_required" {% if selected_status == 'review_required' %}selected{% endif %}>Review required</option>
+          <option value="ingesting" {% if selected_status == 'ingesting' %}selected{% endif %}>Ingesting</option>
           <option value="ingest_failed" {% if selected_status == 'ingest_failed' %}selected{% endif %}>Ingest failed</option>
-          <option value="delete_queued" {% if selected_status == 'delete_queued' %}selected{% endif %}>Deletion queued</option>
-          <option value="delete_claimed" {% if selected_status == 'delete_claimed' %}selected{% endif %}>Deletion claimed</option>
-          <option value="delete_cleanup" {% if selected_status == 'delete_cleanup' %}selected{% endif %}>Deletion cleanup</option>
-          <option value="delete_failed" {% if selected_status == 'delete_failed' %}selected{% endif %}>Deletion failed</option>
-          <option value="cancel_cleanup" {% if selected_status == 'cancel_cleanup' %}selected{% endif %}>Cancellation cleanup</option>
+          <option value="replacing" {% if selected_status == 'replacing' %}selected{% endif %}>Replacing</option>
+          <option value="replace_failed" {% if selected_status == 'replace_failed' %}selected{% endif %}>Replace failed</option>
+          <option value="deleting" {% if selected_status == 'deleting' %}selected{% endif %}>Deleting</option>
+          <option value="delete_failed" {% if selected_status == 'delete_failed' %}selected{% endif %}>Delete failed</option>
+          <option value="cleanup_pending" {% if selected_status == 'cleanup_pending' %}selected{% endif %}>Cleanup pending</option>
+          <option value="cleanup_failed" {% if selected_status == 'cleanup_failed' %}selected{% endif %}>Cleanup failed</option>
         </select>
       </div>
       <div class="field field--inline">
@@ -76,82 +68,75 @@
 
     <div class="section-heading section-heading--queue">
       <div>
-        <h2 id="queue-list-title">Items</h2>
+        <h2 id="queue-list-title">Current work</h2>
         {% if operation_count is defined %}<p>{{ operation_count }} item{% if operation_count != 1 %}s{% endif %}</p>{% endif %}
       </div>
-      {% if last_claim_at|default(false) %}<p class="section-heading__meta">Last Jenkins claim {{ last_claim_at }}</p>{% endif %}
+      {% if last_worker_activity_at|default(false) %}<p class="section-heading__meta">Worker activity {{ last_worker_activity_at }}</p>{% endif %}
     </div>
 
     {% if queue_items %}
       <div class="table-frame">
         <table class="data-table data-table--queue">
-          <caption class="visually-hidden">Queued ingestion, deletion, and cleanup operations</caption>
+          <caption class="visually-hidden">Durable analysis, ingestion, replacement, deletion, and cleanup operations</caption>
           <thead>
             <tr>
               <th scope="col">Document</th>
-              <th scope="col">Operation</th>
-              <th scope="col">Status</th>
-              <th scope="col">Added</th>
-              <th scope="col">Batch</th>
+              <th scope="col">Work</th>
+              <th scope="col">Phase</th>
+              <th scope="col">Attempt</th>
+              <th scope="col">Updated</th>
               <th scope="col" aria-label="Actions"></th>
             </tr>
           </thead>
           <tbody>
             {% for operation in queue_items %}
-              {% set doc = operation.document if operation.document is defined else operation %}
-              {% set operation_id = operation.id|default(operation.operation_id, true) %}
-              {% set document_id = doc.id|default(doc.document_id, true) %}
-              {% set filename = doc.original_filename|default(doc.filename, true)|default('Untitled PDF', true) %}
-              {% set operation_status = operation.status|default(doc.status, true)|default('QUEUED', true)|upper %}
-              {% set operation_type = operation.operation_type|default(operation.type, true)|default('INGEST', true)|upper %}
+              {% set doc = operation.document %}
+              {% set document_id = doc.id %}
+              {% set filename = doc.original_filename|default('Untitled PDF', true) %}
+              {% set document_status = doc.status|default('ANALYZING', true)|upper %}
+              {% set operation_type = operation.operation_type|default('ANALYZE', true)|upper %}
+              {% set operation_state = operation.operation_status|default(operation.state, true)|default('QUEUED', true)|upper %}
               <tr>
                 <td class="document-cell">
                   <div class="document-cell__main">
                     {{ document_icon() }}
                     <div>
                       <a class="document-link" href="/documents/{{ document_id }}">{{ filename }}</a>
-                      <span class="document-cell__meta">{{ doc.size_display|default(doc.size_bytes_display, true)|default('Size not reported', true) }}</span>
-                      <span class="document-cell__meta">Collection: <code>{{ doc.collection_key|default('unassigned', true) }}</code></span>
-                      {% if operation_status in ['DELETE_CLEANUP', 'CANCEL_CLEANUP'] %}
-                        <span class="document-cell__meta document-cell__meta--warning">Canonical PDF cleanup pending</span>
-                      {% endif %}
+                      <span class="document-cell__meta">{{ doc.size_display }}</span>
+                      <span class="document-cell__meta">Collection: <code>{{ doc.collection_key }}</code></span>
+                      {% if document_status in ['CLEANUP_PENDING', 'CLEANUP_FAILED'] %}<span class="document-cell__meta document-cell__meta--warning">Private content cleanup is not complete</span>{% endif %}
                     </div>
                   </div>
-                  {% if operation.error_message|default(false) %}
-                    <p class="row-error" title="{{ operation.error_message }}">{{ operation.error_message }}</p>
-                  {% endif %}
+                  {% if operation.error_message|default(false) %}<p class="row-error" title="{{ operation.error_message }}">{{ operation.error_message }}</p>{% endif %}
                 </td>
-                <td data-label="Operation">{{ operation_type|replace('_', ' ')|title }}</td>
-                <td data-label="Status">{{ status_label(operation_status) }}</td>
-                <td data-label="Added">{{ operation.created_at_display|default(operation.created_at, true)|default('Not reported', true) }}</td>
-                <td class="mobile-hide" data-label="Batch">
-                  {% if operation.batch_id|default(false) %}
-                    <span class="mono compact-id" title="{{ operation.batch_id }}">{{ operation.batch_id }}</span>
-                  {% else %}
-                    <span class="missing-value">Not claimed</span>
-                  {% endif %}
+                <td data-label="Work">
+                  <span>{{ operation_type|replace('_', ' ')|title }}</span><br>
+                  {{ status_label(operation_state) }}
                 </td>
+                <td data-label="Phase">
+                  {{ status_label(operation.phase|default('QUEUED', true)) }}
+                  <span class="document-cell__meta">{{ status_label(document_status) }}</span>
+                </td>
+                <td data-label="Attempt">{{ operation.attempt|default(1, true) }}</td>
+                <td data-label="Updated">{{ operation.updated_at_display|default(operation.created_at_display, true)|default('Not reported', true) }}</td>
                 <td class="actions-cell">
                   <div class="row-actions">
-                    {% if doc.can_preview|default(false) and operation_status not in ['DELETE_CLEANUP', 'CANCEL_CLEANUP', 'DELETED', 'CANCELLED'] %}
+                    {% if doc.can_preview|default(false) %}
                       <a class="button button--quiet button--small" href="/api/v1/documents/{{ document_id }}/content" target="_blank" rel="noopener" aria-label="Open {{ filename }} in a new tab">Open {{ external_icon() }}</a>
                     {% endif %}
-                    {% if operation_status == 'QUEUED' %}
-                      <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Remove {{ filename }} from the queue? Its stored PDF will be removed and this cannot be undone." data-confirm-label="Remove from queue">
+                    {% if document_status == 'REVIEW_REQUIRED' %}
+                      <a class="button button--primary button--small" href="/upload#upload-{{ document_id }}">Review</a>
+                    {% elif document_status in ['INGEST_FAILED', 'REPLACE_FAILED', 'DELETE_FAILED', 'CLEANUP_FAILED'] and operation.retryable|default(false) %}
+                      <form action="/api/v1/uploads/{{ document_id }}/retry" method="post" data-api-form data-method="POST" data-success-url="/documents/{{ document_id }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-                        <button class="button button--danger-text button--small" type="submit" aria-label="Remove {{ filename }} from the queue">Remove</button>
+                        <button class="button button--quiet button--small" type="submit" aria-label="Retry work for {{ filename }}">Retry</button>
                         <p class="form-error" data-form-error hidden></p>
                       </form>
-                    {% elif operation_status in ['INGEST_FAILED', 'DELETE_FAILED'] %}
-                      <form action="/api/v1/queue/{{ operation_id }}/retry" method="post" data-api-form data-method="POST" data-success-url="/queue">
+                    {% endif %}
+                    {% if document_status in ['ANALYZING', 'REVIEW_REQUIRED', 'INGESTING', 'INGEST_FAILED', 'REPLACING', 'REPLACE_FAILED'] %}
+                      <form action="/api/v1/uploads/{{ document_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Cancel {{ filename }}? Its PDF, analysis artifacts, and private screening points will be removed." data-confirm-label="Cancel upload">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-                        <button class="button button--quiet button--small" type="submit" aria-label="Retry {{ filename }}">Retry</button>
-                        <p class="form-error" data-form-error hidden></p>
-                      </form>
-                    {% elif operation_status == 'CANCEL_CLEANUP' %}
-                      <form action="/api/v1/queue/{{ operation_id }}" method="post" data-api-form data-method="DELETE" data-success-url="/queue" data-confirm="Retry cleanup for {{ filename }}? The bridge will attempt to remove the retained canonical PDF again." data-confirm-label="Retry cleanup">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
-                        <button class="button button--quiet button--small" type="submit" aria-label="Retry cleanup for {{ filename }}">Retry cleanup</button>
+                        <button class="button button--danger-text button--small" type="submit" aria-label="Cancel {{ filename }}">Cancel</button>
                         <p class="form-error" data-form-error hidden></p>
                       </form>
                     {% endif %}
@@ -165,9 +150,9 @@
       {{ pagination(page|default(1, true), total_pages|default(1, true), '/queue', pagination_query|default('', true)) }}
     {% else %}
       {% if selected_status != 'all' or selected_collection != 'all' %}
-        {{ empty_state('No operations match this filter', 'Choose another status or reset the filters.') }}
+        {{ empty_state('No work matches this filter', 'Choose another status or reset the filters.') }}
       {% else %}
-        {{ empty_state('The queue is clear', 'New uploads and deletion requests will appear here.', '/upload', 'Upload') }}
+        {{ empty_state('The queue is clear', 'New analysis, ingestion, replacement, and deletion work will appear here.', '/upload', 'Upload and analyze') }}
       {% endif %}
     {% endif %}
   </section>

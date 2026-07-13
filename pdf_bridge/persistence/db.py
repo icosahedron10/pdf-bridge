@@ -1,4 +1,4 @@
-"""Synchronous SQLAlchemy setup used by the API and scheduled-job clients."""
+"""Synchronous SQLAlchemy setup used by the Bridge process."""
 
 from __future__ import annotations
 

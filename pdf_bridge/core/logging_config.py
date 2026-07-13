@@ -22,7 +22,14 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("request_id", "document_id", "operation_id", "batch_id", "outcome"):
+        for key in (
+            "request_id",
+            "document_id",
+            "analysis_id",
+            "operation_id",
+            "replacement_id",
+            "outcome",
+        ):
             value = getattr(record, key, None)
             if value is not None:
                 event[key] = value

@@ -8,27 +8,22 @@ export const roleNavigation: NavigationItem[] = [
   {
     href: "/roles/library-operator",
     label: "Library operator",
-    description: "Upload, search, follow, retry, and remove documents.",
+    description: "Upload, review, follow, retry, and remove documents.",
   },
   {
-    href: "/roles/jenkins-owner",
-    label: "Jenkins owner",
-    description: "Claim, verify, stage, and submit scheduled work safely.",
-  },
-  {
-    href: "/roles/rag-pipeline-owner",
-    label: "RAG pipeline owner",
-    description: "Parse, index, delete, and produce strict component results.",
+    href: "/roles/semantic-intake-owner",
+    label: "Semantic intake owner",
+    description: "Own analysis, worker recovery, indexing, and safe replacement.",
   },
   {
     href: "/roles/platform-operator",
     label: "Platform operator",
-    description: "Configure, run, monitor, back up, and upgrade the service.",
+    description: "Configure, run, monitor, back up, reset, and upgrade the service.",
   },
   {
     href: "/roles/retrieval-integrator",
     label: "Retrieval service integrator",
-    description: "Implement grouped search and keep responses correlated to the catalog.",
+    description: "Query active aliases and keep responses correlated to the catalog.",
   },
   {
     href: "/roles/chatbot-integrator",
@@ -38,12 +33,12 @@ export const roleNavigation: NavigationItem[] = [
   {
     href: "/roles/security-reviewer",
     label: "Security reviewer",
-    description: "Evaluate the upload boundary, residual risk, and enterprise gates.",
+    description: "Evaluate intake, parser, model, index, and retrieval boundaries.",
   },
   {
     href: "/roles/code-maintainer",
     label: "Code maintainer",
-    description: "Navigate the layers, invariants, tests, and change points.",
+    description: "Navigate the layers, invariants, worker, tests, and change points.",
   },
 ];
 
@@ -51,27 +46,27 @@ export const referenceNavigation: NavigationItem[] = [
   {
     href: "/reference/lifecycle",
     label: "Lifecycle states",
-    description: "Document, operation, and batch transitions.",
+    description: "Document, operation, phase, decision, and replacement transitions.",
   },
   {
-    href: "/reference/batch-contract",
-    label: "Batch contract",
-    description: "Claim, manifest, staging, result, and replay rules.",
+    href: "/reference/intake-api",
+    label: "Intake API",
+    description: "Preflight, upload, polling, evidence, decision, retry, and deletion.",
   },
   {
     href: "/reference/code-map",
     label: "Code map",
-    description: "Layer direction and module responsibilities.",
+    description: "Layer direction, worker flow, and module responsibilities.",
   },
   {
     href: "/reference/configuration",
     label: "Configuration & operations",
-    description: "Settings, health, persistence, backups, and upgrades.",
+    description: "Settings, health, recovery, backups, reset, and upgrades.",
   },
   {
     href: "/reference/search-boundary",
     label: "Search boundary",
-    description: "Request/response correlation and collection isolation.",
+    description: "Active-only retrieval, response correlation, and collection isolation.",
   },
   {
     href: "/reference/oss-review",
@@ -95,17 +90,12 @@ const related = (...hrefs: string[]): NavigationItem[] =>
 
 export const relatedRoleGuides: Record<string, NavigationItem[]> = {
   "library-operator": related(
-    "/roles/jenkins-owner",
+    "/roles/semantic-intake-owner",
     "/reference/lifecycle",
-    "/reference/search-boundary",
+    "/reference/intake-api",
   ),
-  "jenkins-owner": related(
-    "/roles/rag-pipeline-owner",
-    "/reference/batch-contract",
-    "/reference/configuration",
-  ),
-  "rag-pipeline-owner": related(
-    "/roles/jenkins-owner",
+  "semantic-intake-owner": related(
+    "/roles/platform-operator",
     "/reference/lifecycle",
     "/reference/search-boundary",
   ),
@@ -127,12 +117,12 @@ export const relatedRoleGuides: Record<string, NavigationItem[]> = {
   "security-reviewer": related(
     "/reference/oss-review",
     "/reference/configuration",
-    "/roles/chatbot-integrator",
+    "/roles/semantic-intake-owner",
   ),
   "code-maintainer": related(
     "/reference/code-map",
     "/reference/lifecycle",
-    "/reference/batch-contract",
+    "/reference/intake-api",
   ),
 };
 

@@ -1,181 +1,151 @@
-<p align="center">
-  <img src="pdf_bridge/static/favicon.svg" width="84" alt="PDF Bridge document mark">
-</p>
+# PDF Bridge
 
-<h1 align="center">PDF Bridge</h1>
+PDF Bridge is a single-process Litestar service for safe, reviewable PDF intake into a
+collection-partitioned retrieval system. It owns the durable upload, analysis, decision, indexing,
+replacement, deletion, and cleanup lifecycle. There is no Jenkins handoff or batch consumer.
 
-<p align="center">
-  <strong>Safe intake in. Verified RAG handoffs out.</strong><br>
-  A small, auditable control plane between trusted PDF contributors and a scheduled retrieval pipeline.
-</p>
+An upload is synchronously streamed, hashed, structurally checked, and scanned by ClamAV. Clean
+bytes are promoted to canonical storage and returned as `202 Accepted`; a lifespan-owned worker
+then extracts text, compares the document with active and pending content in the selected
+collection, and either publishes it or asks an operator to choose Keep, Replace, or Cancel.
 
-<p align="center">
-  <img alt="Python 3.12+" src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white">
-  <img alt="Litestar 2.24" src="https://img.shields.io/badge/Litestar-2.24-202235">
-  <img alt="ClamAV 1.5.3" src="https://img.shields.io/badge/ClamAV-1.5.3-CC1F2F?logo=clamav&logoColor=white">
-  <img alt="Linux supported" src="https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=111">
-  <img alt="Proof of concept" src="https://img.shields.io/badge/status-proof%20of%20concept-D5A846">
-</p>
+## Safety invariants
 
-PDF Bridge gives trusted operators a collection-aware library, upload queue, search view, and
-lifecycle ledger. It gives Jenkins an idempotent client and typed API for claiming
-work, staging verified files, and reporting outcomes.
+- Exact SHA-256 duplicates are rejected only inside the selected collection. The same bytes may
+  legitimately exist in another collection.
+- Filename, normalized-text, dense, BM25, LLM, contradiction, and provider-outage findings are
+  advisory. A clear, complete analysis publishes automatically; any candidate or incomplete check
+  enters `REVIEW_REQUIRED`.
+- Encrypted, malformed, image-only, empty, text-insufficient, or over-budget PDFs are rejected
+  without an override. OCR is not included.
+- Pending chunks live only in the private screening index. Retrieval may query active aliases only.
+- Replacement prepares the new analysis first, then deletes and verifies the old active points and
+  artifacts, then publishes the new points. A temporary availability gap is accepted; old and new
+  content must never be simultaneously active.
+- Full analysis artifacts remain private for the document lifetime. Cancellation and deletion purge
+  source bytes, analysis artifacts, and index points after recording a content-free manifest hash.
 
-> [!WARNING]
-> This is a network-restricted proof of concept, not an internet-facing upload service. ClamAV
-> lowers risk; it does not make hostile PDFs safe. Before broader use, complete the controls in the
-> [security and enterprise-gates review](docs/security.md).
-
-**[Open the internal documentation wiki (OpenAI Sites)](https://pdf-bridge-field-guide.madsenjake0.chatgpt.site)**
-· [Read the Playwright and ClamAV OSS review](docs/oss-review.md)
-
-## At a glance
-
-| Capability | What it proves |
-|---|---|
-| Operator workspace | Upload, cancel, retry, remove, search, and inspect append-only history |
-| Guarded intake | Stream limits, PDF signature checks, SHA-256, duplicate detection, ClamAV, and atomic promotion |
-| Corpus placement | Every upload selects an explicit collection that becomes immutable once queued |
-| Jenkins handoff | Leased batches, immutable manifests, verified downloads, atomic staging, and replay-safe reports |
-| Strict search | Invalid cross-collection, inactive, unknown, duplicate, or impossible results fail as a whole |
-| Narrow ownership | The bridge keeps clean canonical bytes and catalog state; it never parses PDFs or writes to Qdrant |
-
-## How it fits
+## Runtime shape
 
 ```mermaid
 flowchart LR
-    U["Trusted operator"] -->|"upload · search · remove"| B["PDF Bridge<br/>Litestar + SQLite"]
-    B -->|"INSTREAM scan"| C["ClamAV"]
-    B -->|"canonical UUID objects"| V["Bridge data volume"]
-    J["Jenkins"] -->|"claim · verify · acknowledge"| B
-    J -->|"versioned manifest"| R["Existing parser + RAG pipeline"]
-    R -->|"component results"| J
-    R --> Q["Markdown · BM25 · dense · Qdrant"]
-    B -->|"collection-scoped query"| S["Retrieval search API"]
-    S --> Q
+    O["Operator browser"] -->|"upload · poll · decide"| B["PDF Bridge /api/v1"]
+    B --> S[("SQLite + canonical/analysis storage")]
+    B --> C["ClamAV"]
+    B --> W["Two-slot internal worker"]
+    W --> P["Resource-limited pypdf subprocess"]
+    W --> M["Private embedding + LLM endpoints"]
+    W --> Q[("Qdrant active aliases + private screening")]
+    R["External retrieval service"] -->|"active aliases only"| Q
+    B -->|"stable search request/response"| R
 ```
 
-The workflow is explicit: **choose collection → scan → store → queue → claim → verify → process →
-report**. Ingestion either succeeds or fails. Parser conditions that prevent any required component
-from succeeding are ordinary retryable ingestion failures. Deletion becomes final only after every
-downstream removal is acknowledged and the canonical object is cleaned up.
+The supported topology is SQLite plus exactly one Uvicorn application process. The worker uses two
+threads and process-local collection locks; multiple app processes or replicas are unsupported.
 
-See [Architecture and lifecycle](docs/architecture.md) for state diagrams, ownership boundaries,
-and the internal dependency map.
+## Local container deployment
 
-## Quick start
+1. Copy `.env.example` to `.env` and replace every `CHANGE_ME` value.
+2. Configure private OpenAI-compatible embedding and LLM endpoints, including exact model IDs and
+   embedding dimension.
+3. Start the pinned stack:
 
-PDF Bridge supports a **Linux host only**. You need Docker Engine with Compose and at least 4 GiB
-available for ClamAV.
+   ```bash
+   docker compose up --build
+   ```
 
-```sh
-cp .env.example .env
-# Replace both CHANGE_ME values with different random secrets of at least 32 characters.
-docker compose up --build
-```
+4. Open `http://127.0.0.1:8000` unless the bind address or port was changed.
 
-Open <http://localhost:8000>. The first ClamAV start can take several minutes while signatures
-download; watch readiness with:
+Compose runs Qdrant `1.18.1` on an internal-only network with API-key authentication and JWT RBAC.
+PDF Bridge holds the administrative key because it creates collections, manages aliases, and writes
+both active and screening indexes. External retrieval must receive a separate collection-scoped
+read-only JWT that omits `pdf-bridge-screening-v1`; never give it the administrative key.
 
-```sh
-docker compose ps
-docker compose logs -f app clamav
-curl http://localhost:8000/api/v1/health/ready
-```
+The application container runs one Uvicorn worker as a non-root user with a read-only root
+filesystem. Startup applies the empty-reset Alembic migration before serving traffic.
 
-The app binds to loopback by default. PDF bytes and SQLite stay in the Docker-managed `bridge_data`
-volume, outside the checkout. Development-mode [Swagger UI](http://localhost:8000/api/docs) and the
-[OpenAPI contract](http://localhost:8000/api/openapi.json) start with the app.
+## Intake API
 
-For environment settings or an approved internal demo binding, use the
-[configuration reference](docs/configuration.md). Do not run multiple app processes against SQLite.
+The browser and JSON API share `/api/v1`:
 
-## Jenkins handoff
-
-Install an exact released wheel on a controlled Linux agent, inject the token through the Jenkins
-credentials store, and pin the permitted hostname separately from the URL:
-
-```sh
-export PDF_BRIDGE_JOB_TOKEN="<injected-by-Jenkins>"
-export PDF_BRIDGE_JOB_ALLOWED_HOST="pdf-bridge.internal"
-
-pdf-bridge-job pull \
-  --base-url https://pdf-bridge.internal \
-  --allowed-host "$PDF_BRIDGE_JOB_ALLOWED_HOST" \
-  --destination /srv/rag/pdf-bridge-handoff \
-  --request-id "$BUILD_TAG" \
-  --result-file pull-result.json
-
-# The existing ingestion pipeline reads the staged manifest and writes report.json.
-pdf-bridge-job report report.json \
-  --pull-result pull-result.json \
-  --base-url https://pdf-bridge.internal \
-  --allowed-host "$PDF_BRIDGE_JOB_ALLOWED_HOST"
-```
-
-Retries with the same request ID are idempotent; a mismatch fails loudly. See the
-[Jenkins handoff guide](docs/jenkins.md) and [example pipeline](Jenkinsfile.example) for the full
-contract and credential guidance.
-
-For existing indexed libraries, `pdf-bridge import-manifest` validates, hashes, scans, and copies
-historical PDFs without modifying the source. See [Historical import and backup](docs/importing.md).
-
-## Operational safeguards
-
-| Boundary | POC behavior |
+| Endpoint | Purpose |
 |---|---|
-| Upload | Bounded streaming and ClamAV `INSTREAM`; scanner errors and malware fail closed |
-| Storage | UUID paths outside the webroot, atomic promotion, no user-derived canonical paths |
-| Browser | Protected session, same-origin mutations, CSRF tokens, trusted-host checks, no CORS |
-| Automation | Separate bearer token, exact-host pinning, no redirects, batch-scoped downloads |
-| Retrieval | Exact request/response correlation; invalid groups or hits are rejected in full |
-| Container | Non-root, read-only root, dropped capabilities, `no-new-privileges`, one data volume |
+| `POST /uploads/preflight` | Return collection-scoped filename warnings |
+| `POST /uploads` | Stream, scan, promote, and queue analysis; returns `202` |
+| `GET /uploads?open=true` | Restore durable open work after refresh or restart |
+| `GET /uploads/{id}` | Poll document, operation, phase, and analysis state |
+| `GET /uploads/{id}/analysis` | Page through deterministic and LLM evidence |
+| `POST /uploads/{id}/decision` | Submit Keep, Replace, or Cancel with an idempotency key |
+| `POST /uploads/{id}/retry` | Retry retained failed work without a second semantic decision |
+| `DELETE /uploads/{id}` | Cancel eligible unpublished work and queue cleanup |
+| `GET /documents/{id}` | Read document detail and its audit ledger |
+| `POST /documents/{id}/deletion` | Queue verified deletion of active content |
+| `POST /search` | Proxy the stable external retrieval contract |
 
-Anonymous POC mode is not identity; collection labels are not end-user authorization; ClamAV is
-not a parser sandbox or content-disarm system. Keep the service restricted and read the
-[security review](docs/security.md) before evaluating deployment.
+Upload and decision mutations require `Idempotency-Key`. Decision bodies contain only
+`analysis_revision`, `action`, and, for Replace, `target_document_id`; there is no rationale field.
 
-## Development and verification
+## Analysis and indexing
 
-Python 3.12 is required for a direct development environment:
+- `pypdf==6.14.2` runs in a child process with wall-clock, Linux CPU/address-space, page,
+  normalized-character, and chunk limits. A limited subprocess reduces blast radius but is not a
+  complete parser sandbox.
+- `rapidfuzz==3.14.5` provides deterministic Unicode-aware filename-family warnings.
+- Paragraph/sentence-aware chunks target 400 lexical tokens with 60-token overlap and a
+  3,500-character hard cap. Defaults reject more than 2,000 pages, five million normalized
+  characters, or 10,000 chunks rather than truncating.
+- Dense vectors come from a configured private OpenAI-compatible endpoint. Sparse `content_bm25`
+  and dense `content_dense` vectors are stored together under deterministic UUIDv5 point IDs.
+- Candidate discovery searches active and screening indexes, applies deterministic thresholds, and
+  fuses rankings with reciprocal rank fusion. Two independent temperature-zero structured-output
+  calls add explanation-only evidence for the top 12 candidates.
+- Every point carries schema, document, analysis, chunk, collection, page, text-hash, bounded-text,
+  publication, and screening metadata. Active collections are physical epoch versions exposed by
+  stable collection-key aliases; screening is private.
 
-```sh
-python3.12 -m venv .venv
+## Historical import
+
+`pdf-bridge import-manifest` accepts only manifest version 3. It validates and scans each source PDF
+and creates ordinary `ANALYZE` operations; it never synthesizes already-ingested rows.
+
+```bash
+pdf-bridge import-manifest historical-v3.json \
+  --source-root /approved/source-pdfs \
+  --dry-run \
+  --actor-id change-1234
+
+pdf-bridge import-manifest historical-v3.json \
+  --source-root /approved/source-pdfs \
+  --apply \
+  --actor-id change-1234
+```
+
+See [historical import](docs/importing.md) for the strict manifest and recovery procedure.
+
+## Development
+
+Python 3.12 is required.
+
+```bash
+python -m venv .venv
 . .venv/bin/activate
-python -m pip install -e ".[dev]"
-
-python -m pytest
-python -m ruff check .
+python -m pip install -e '.[dev]'
+ruff check .
+pytest -q
 ```
 
-The default suite uses temporary storage and fake providers. Opt-in checks exercise real Chromium
-or a reachable `clamd` service:
-
-```sh
-python -m playwright install chromium
-PDF_BRIDGE_RUN_BROWSER_TESTS=1 python -m pytest tests/test_browser.py
-
-PDF_BRIDGE_RUN_CLAMAV_TESTS=1 \
-PDF_BRIDGE_CLAMD_HOST=127.0.0.1 \
-python -m pytest tests/test_clamav_integration.py
-```
-
-The ClamAV check needs current signatures and an already-running test daemon. Browser coverage
-drives the live upload, queue, pipeline, search, theme, and cleanup workflows.
+Browser tests require Playwright and its Chromium runtime. ClamAV integration tests require a live
+daemon and remain separately marked.
 
 ## Documentation
 
-| Guide | Use it for |
-|---|---|
-| [Internal documentation wiki (private)](https://pdf-bridge-field-guide.madsenjake0.chatgpt.site) | Role-based guides for the browser, Jenkins, pipeline, platform, retrieval, security, and codebase |
-| [Architecture and lifecycle](docs/architecture.md) | System boundaries, state machines, persistence, and batch semantics |
-| [Configuration reference](docs/configuration.md) | Environment variables, collections, branding, storage, identity, and scanner settings |
-| [Jenkins handoff guide](docs/jenkins.md) | Agent setup, manifests, reports, idempotency, and credentials |
-| [Historical import and backup](docs/importing.md) | Version 2 import manifests, dry runs, migration, and recovery |
-| [Operations runbook](docs/runbook.md) | Health checks, troubleshooting, upgrades, backups, and daily checks |
-| [Security model and enterprise gates](docs/security.md) | Implemented controls, residual risk, ClamAV operations, and production prerequisites |
-| [Playwright and ClamAV OSS review](docs/oss-review.md) | Licensing, maintenance posture, risk, alternatives, and Monday-ready decisions |
+- [Architecture and lifecycle](docs/architecture.md)
+- [Configuration](docs/configuration.md)
+- [Operations and cutover runbook](docs/runbook.md)
+- [Security model](docs/security.md)
+- [Historical import](docs/importing.md)
+- [Open-source review](docs/oss-review.md)
 
----
-
-<p align="center"><sub>PDF Bridge is a deliberately narrow bridge: it makes the handoff visible, verifiable, and boring in the best way.</sub></p>
+This remains a coordinated proof-of-concept reset. Before production use, complete the security,
+availability, evaluation-corpus, backup, retention, retrieval-authorization, and parser-isolation
+gates in the linked documents.

@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session, sessionmaker
 _IMPORT_STORAGE = tempfile.mkdtemp(prefix="pdf-bridge-import-")
 os.environ.setdefault("PDF_BRIDGE_STORAGE_ROOT", _IMPORT_STORAGE)
 os.environ.setdefault("PDF_BRIDGE_SESSION_SECRET", "test-import-session-secret-32-characters")
-os.environ.setdefault("PDF_BRIDGE_JOB_TOKEN", "test-import-job-secret-32-characters")
 os.environ.setdefault(
     "PDF_BRIDGE_COLLECTIONS",
     '[{"key":"customer","display_name":"Customer Product",'
@@ -51,7 +50,6 @@ def settings(tmp_path: Path) -> Settings:
         storage_root=storage_root,
         database_url=f"sqlite+pysqlite:///{(storage_root / 'catalog.sqlite3').as_posix()}",
         session_secret=SecretStr("test-session-secret-not-for-production"),
-        job_token=SecretStr("test-job-token-not-for-production"),
         search_api_token=SecretStr("test-search-token-not-for-production"),
         allowed_hosts=["testserver.local", "localhost", "127.0.0.1"],
         clamd_host="127.0.0.1",
@@ -127,7 +125,6 @@ def upload_pdf(client: TestClient, csrf_headers: dict[str, str]) -> Callable[...
         filename: str = "example.pdf",
         contents: bytes = PDF_A,
         key: str = "upload-key-0001",
-        confirm: bool = False,
         content_type: str = "application/pdf",
         collection: str = "customer",
     ):
@@ -138,14 +135,8 @@ def upload_pdf(client: TestClient, csrf_headers: dict[str, str]) -> Callable[...
             files={"file": (filename, contents, content_type)},
             data={
                 "idempotency_key": key,
-                "possible_duplicate_confirmed": str(confirm).lower(),
                 "collection_key": collection,
             },
         )
 
     return perform
-
-
-@pytest.fixture
-def job_headers(settings: Settings) -> dict[str, str]:
-    return {"Authorization": f"Bearer {settings.job_token.get_secret_value()}"}

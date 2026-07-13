@@ -17,42 +17,48 @@ from pdf_bridge.core.config import Settings
 from pdf_bridge.persistence.models import (
     Document,
     DocumentState,
-    JobBatch,
-    QueueOperation,
+    OperationType,
+    WorkOperation,
 )
 from pdf_bridge.presentation.view_models import (
+    analysis_view,
     audit_event_view,
-    components_view,
+    decision_view,
     document_view,
     operation_view,
 )
 from pdf_bridge.services import catalog
 from pdf_bridge.services.errors import ServiceError
-from pdf_bridge.services.lifecycle import ACTIVE_DOCUMENT_STATES
 
-LIBRARY_STATES = (
-    DocumentState.INGESTED,
-    DocumentState.DELETE_QUEUED,
-    DocumentState.DELETE_CLAIMED,
-    DocumentState.DELETE_CLEANUP,
-    DocumentState.DELETE_FAILED,
-)
 QUEUE_STATES = (
-    DocumentState.QUEUED,
-    DocumentState.CLAIMED,
-    DocumentState.STAGED,
+    DocumentState.ANALYZING,
+    DocumentState.REVIEW_REQUIRED,
+    DocumentState.INGESTING,
     DocumentState.INGEST_FAILED,
-    DocumentState.DELETE_QUEUED,
-    DocumentState.DELETE_CLAIMED,
-    DocumentState.DELETE_CLEANUP,
+    DocumentState.REPLACING,
+    DocumentState.REPLACE_FAILED,
+    DocumentState.DELETING,
     DocumentState.DELETE_FAILED,
-    DocumentState.CANCEL_CLEANUP,
+    DocumentState.CLEANUP_PENDING,
+    DocumentState.CLEANUP_FAILED,
 )
-PROCESSING_STATES = tuple(
-    state
-    for state in ACTIVE_DOCUMENT_STATES
-    if state != DocumentState.INGESTED
-)
+PROCESSING_STATES = QUEUE_STATES
+EXPECTED_OPERATION_BY_STATE = {
+    DocumentState.ANALYZING: OperationType.ANALYZE,
+    DocumentState.REVIEW_REQUIRED: OperationType.ANALYZE,
+    DocumentState.INGESTING: OperationType.INGEST,
+    DocumentState.INGEST_FAILED: OperationType.INGEST,
+    DocumentState.INGESTED: OperationType.INGEST,
+    DocumentState.REPLACING: OperationType.INGEST,
+    DocumentState.REPLACE_FAILED: OperationType.INGEST,
+    DocumentState.DELETING: OperationType.DELETE,
+    DocumentState.DELETE_FAILED: OperationType.DELETE,
+    DocumentState.DELETED: OperationType.DELETE,
+    DocumentState.CLEANUP_PENDING: OperationType.CLEANUP,
+    DocumentState.CLEANUP_FAILED: OperationType.CLEANUP,
+    DocumentState.REJECTED: OperationType.CLEANUP,
+    DocumentState.CANCELLED: OperationType.CLEANUP,
+}
 PAGE_SIZE = 25
 
 SearchRetriever = Callable[..., SearchResponse]
@@ -80,6 +86,29 @@ class PageResult:
     template_name: str
     context: dict[str, Any]
     status_code: int = 200
+
+
+def latest_operation(
+    operations: list[WorkOperation], document_state: DocumentState
+) -> WorkOperation | None:
+    """Return the newest attempt that owns the document's current state."""
+
+    if not operations:
+        return None
+    expected_type = EXPECTED_OPERATION_BY_STATE.get(document_state)
+    matching = [
+        item for item in operations if item.operation_type == expected_type
+    ]
+    candidates = matching or operations
+    return max(
+        enumerate(candidates),
+        key=lambda pair: (
+            pair[1].created_at,
+            pair[1].attempt,
+            pair[1].updated_at,
+            pair[0],
+        ),
+    )[1]
 
 
 def collection_view(definition: Any) -> dict[str, Any]:
@@ -386,26 +415,30 @@ def build_queue_page(
     order: str,
     page: int,
 ) -> PageResult:
-    """Build the current queue view with filters, sorting, and pagination."""
+    """Build the durable worker queue with filters, sorting, and pagination."""
 
     operations = db.scalars(
-        select(QueueOperation)
-        .join(QueueOperation.document)
-        .options(joinedload(QueueOperation.document))
+        select(WorkOperation)
+        .join(WorkOperation.document)
+        .options(joinedload(WorkOperation.document))
         .where(Document.state.in_(QUEUE_STATES))
     ).all()
 
     # Retries leave historical attempts in the ledger, while the queue presents
     # only the latest operation for each active document.
-    latest_by_document: dict[UUID, QueueOperation] = {}
+    operations_by_document: dict[UUID, list[WorkOperation]] = {}
     for operation_item in operations:
-        current = latest_by_document.get(operation_item.document_id)
-        if current is None or (operation_item.created_at, operation_item.attempt) > (
-            current.created_at,
-            current.attempt,
-        ):
-            latest_by_document[operation_item.document_id] = operation_item
-    current_operations = list(latest_by_document.values())
+        operations_by_document.setdefault(operation_item.document_id, []).append(
+            operation_item
+        )
+    current_operations: list[WorkOperation] = []
+    for document_operations in operations_by_document.values():
+        current = latest_operation(
+            document_operations,
+            document_operations[0].document.state,
+        )
+        if current is not None:
+            current_operations.append(current)
 
     normalized_status = status.upper()
     if status.casefold() != "all":
@@ -439,7 +472,7 @@ def build_queue_page(
     total = len(current_operations)
     start = (page - 1) * PAGE_SIZE
     visible = current_operations[start : start + PAGE_SIZE]
-    last_claim_at = db.scalar(select(func.max(JobBatch.claimed_at)))
+    last_worker_activity_at = db.scalar(select(func.max(WorkOperation.updated_at)))
     context = base_context(state, active_page="queue")
     context.update(
         {
@@ -460,7 +493,7 @@ def build_queue_page(
                     "order": order,
                 }
             ),
-            "last_claim_at": last_claim_at,
+            "last_worker_activity_at": last_worker_activity_at,
         }
     )
     return PageResult("queue.html", context)
@@ -507,7 +540,12 @@ def build_document_page(
         db.execute(
             select(Document)
             .where(Document.id == document_id)
-            .options(joinedload(Document.operations), joinedload(Document.audit_events))
+            .options(
+                joinedload(Document.operations),
+                joinedload(Document.analyses),
+                joinedload(Document.decisions),
+                joinedload(Document.audit_events),
+            )
         )
         .unique()
         .scalar_one_or_none()
@@ -520,15 +558,9 @@ def build_document_page(
             message="The requested document does not exist or is no longer available.",
         )
 
-    active_operation = max(
-        document.operations,
-        key=lambda item: (item.created_at, item.attempt),
-        default=None,
-    )
-    if document.state in LIBRARY_STATES:
-        active_page = "library"
-    else:
-        active_page = "queue"
+    active_operation = latest_operation(document.operations, document.state)
+    latest_analysis = max(document.analyses, key=lambda item: item.revision, default=None)
+    active_page = "queue" if document.state in QUEUE_STATES else "library"
     configured = configured_collections(state.settings)
     collection_map = {item["key"]: item for item in configured}
     context = base_context(state, active_page=active_page)
@@ -538,8 +570,9 @@ def build_document_page(
             "collection": collection_map.get(document.collection_key),
             "collections": configured,
             "active_operation": (operation_view(active_operation) if active_operation else None),
+            "analysis": analysis_view(latest_analysis),
+            "decisions": [decision_view(item) for item in document.decisions],
             "audit_events": [audit_event_view(event) for event in document.audit_events],
-            "pipeline_components": components_view(active_operation),
         }
     )
     return PageResult("document_detail.html", context)

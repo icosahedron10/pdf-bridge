@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Annotated, Literal
 from uuid import UUID
@@ -25,32 +26,32 @@ from litestar.response import File, Response
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
+    AnalysisDetailResponse,
     CollectionListResponse,
+    DecisionRequest,
     DeleteDocumentRequest,
     DocumentDetail,
     DocumentListResponse,
     DocumentMutationResponse,
     HealthResponse,
-    QueueListResponse,
     SearchRequest,
     SearchResponse,
+    UploadAcceptedResponse,
+    UploadListResponse,
     UploadPreflightRequest,
     UploadPreflightResponse,
-    UploadResponse,
+    UploadResource,
 )
 from pdf_bridge.http.problems import ProblemError, problem_responses
 from pdf_bridge.http.security import Actor, get_actor, require_csrf
 from pdf_bridge.managers import catalog, document, health, search
 from pdf_bridge.persistence.models import DocumentState
 from pdf_bridge.services.document import duplicate_error_extra
+from pdf_bridge.services.document import preflight_upload as run_preflight
 from pdf_bridge.services.errors import ServiceError
-from pdf_bridge.services.lifecycle import LifecycleError
+from pdf_bridge.services.intake import LifecycleError
 from pdf_bridge.services.scanner import ScannerError, clamd_ping
-from pdf_bridge.services.storage import (
-    FileTooLargeError,
-    InvalidPdfError,
-    remove_storage_key,
-)
+from pdf_bridge.services.storage import FileTooLargeError, InvalidPdfError
 
 
 @dataclass(slots=True)
@@ -59,7 +60,6 @@ class UploadForm:
 
     file: UploadFile
     collection_key: str
-    possible_duplicate_confirmed: bool = False
     idempotency_key: str | None = None
 
 
@@ -161,7 +161,7 @@ def get_document(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> DocumentDetail:
-    """Return one document with its operation and audit history."""
+    """Return one document with its analysis, decision, and audit history."""
 
     try:
         return catalog.get_document(db, document_id)
@@ -184,8 +184,10 @@ def document_content(
 ) -> File:
     """Serve a clean, available PDF inline from canonical storage."""
 
+    from pdf_bridge.services import document as document_service
+
     try:
-        result = document.content(
+        result = document_service.content(
             db,
             document_id=document_id,
             storage_root=request.app.state.settings.storage_root,
@@ -217,10 +219,10 @@ def upload_preflight(
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> UploadPreflightResponse:
-    """Validate upload metadata and surface possible duplicates."""
+    """Validate upload metadata and surface typed advisory filename warnings."""
 
     try:
-        return document.preflight_upload(
+        return run_preflight(
             db,
             definitions=request.app.state.settings.collections,
             filename=data.filename,
@@ -234,7 +236,7 @@ def upload_preflight(
 @post(
     "/uploads",
     dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=201,
+    status_code=202,
     responses=problem_responses(),
     sync_to_thread=True,
 )
@@ -244,8 +246,8 @@ def upload_document(
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
     header_idempotency_key: Annotated[str | None, HeaderParameter(name="Idempotency-Key")] = None,
-) -> UploadResponse:
-    """Scan, register, and queue a multipart PDF upload."""
+) -> UploadAcceptedResponse:
+    """Scan and register a PDF, then queue its analysis immediately."""
 
     try:
         # Litestar rewinds the spooled multipart part before the handler runs,
@@ -255,11 +257,11 @@ def upload_document(
             settings=request.app.state.settings,
             scanner=request.app.state.scanner,
             transition_lock=request.app.state.transition_lock,
+            worker=getattr(request.app.state, "worker", None),
             file=data.file.file,
             filename=data.file.filename or "",
             content_type=data.file.content_type,
             collection_key=data.collection_key,
-            possible_duplicate_confirmed=data.possible_duplicate_confirmed,
             header_idempotency_key=header_idempotency_key,
             form_idempotency_key=data.idempotency_key,
             actor_type=actor.kind,
@@ -288,25 +290,27 @@ def upload_document(
 
 
 @get(
-    "/queue",
+    "/uploads",
     dependencies=_BROWSER_ACTOR_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def list_queue(
+def list_uploads(
     request: Request,
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
+    open_only: Annotated[bool, QueryParameter(name="open")] = False,
     collection_key: FromQuery[str | None] = None,
     page: Annotated[int, QueryParameter(ge=1)] = 1,
     page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
-) -> QueueListResponse:
-    """List current queue operations by collection."""
+) -> UploadListResponse:
+    """List durable upload work so a browser can restore its workspace."""
 
     try:
-        return catalog.list_queue(
+        return catalog.list_uploads(
             db,
             definitions=request.app.state.settings.collections,
+            open_only=open_only,
             collection_key=collection_key,
             page=page,
             page_size=page_size,
@@ -315,30 +319,75 @@ def list_queue(
         raise _service_problem(exc) from exc
 
 
-@delete(
-    "/queue/{operation_id:uuid}",
+@get(
+    "/uploads/{upload_id:uuid}",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_upload(
+    upload_id: FromPath[UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> UploadResource:
+    """Return one upload's durable status, phase, and analysis summary."""
+
+    try:
+        return catalog.get_upload(db, upload_id)
+    except ServiceError as exc:
+        raise _service_problem(exc) from exc
+
+
+@get(
+    "/uploads/{upload_id:uuid}/analysis",
+    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_upload_analysis(
+    upload_id: FromPath[UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    page: Annotated[int, QueryParameter(ge=1)] = 1,
+    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 10,
+) -> AnalysisDetailResponse:
+    """Return paginated candidate evidence for the current analysis."""
+
+    try:
+        return catalog.get_upload_analysis(
+            db, upload_id=upload_id, page=page, page_size=page_size
+        )
+    except ServiceError as exc:
+        raise _service_problem(exc) from exc
+
+
+@post(
+    "/uploads/{upload_id:uuid}/decision",
     dependencies=_CSRF_ACTOR_DEPENDENCIES,
     status_code=200,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def cancel_queue_item(
+def decide_upload(
     request: Request,
-    operation_id: FromPath[UUID],
+    upload_id: FromPath[UUID],
+    data: JSONBody[DecisionRequest],
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
+    idempotency_key: Annotated[str | None, HeaderParameter(name="Idempotency-Key")] = None,
 ) -> DocumentMutationResponse:
-    """Cancel a queued operation and clean up its stored PDF."""
+    """Record an explicit Keep, Replace, or Cancel review decision."""
 
     try:
-        return document.cancel_queue_item(
+        return document.decide_upload(
             db,
             transition_lock=request.app.state.transition_lock,
-            storage_root=request.app.state.settings.storage_root,
-            operation_id=operation_id,
+            worker=getattr(request.app.state, "worker", None),
+            upload_id=upload_id,
+            request=data,
+            idempotency_key=idempotency_key or "",
             actor_type=actor.kind,
             actor_id=actor.identifier,
-            remove_file=remove_storage_key,
         )
     except LifecycleError as exc:
         raise _lifecycle_problem(exc) from exc
@@ -347,25 +396,54 @@ def cancel_queue_item(
 
 
 @post(
-    "/queue/{operation_id:uuid}/retry",
+    "/uploads/{upload_id:uuid}/retry",
     dependencies=_CSRF_ACTOR_DEPENDENCIES,
     status_code=200,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def retry_queue_item(
+def retry_upload(
     request: Request,
-    operation_id: FromPath[UUID],
+    upload_id: FromPath[UUID],
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
 ) -> DocumentMutationResponse:
-    """Queue a new attempt for a retryable failed operation."""
+    """Queue a new attempt for retained work whose last attempt failed."""
 
     try:
-        return document.retry_queue_item(
+        return document.retry_upload(
             db,
             transition_lock=request.app.state.transition_lock,
-            operation_id=operation_id,
+            worker=getattr(request.app.state, "worker", None),
+            upload_id=upload_id,
+            actor_type=actor.kind,
+            actor_id=actor.identifier,
+        )
+    except LifecycleError as exc:
+        raise _lifecycle_problem(exc) from exc
+
+
+@delete(
+    "/uploads/{upload_id:uuid}",
+    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    status_code=200,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def cancel_upload(
+    request: Request,
+    upload_id: FromPath[UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> DocumentMutationResponse:
+    """Cancel unpublished work and remove everything retained for it."""
+
+    try:
+        return document.cancel_upload(
+            db,
+            transition_lock=request.app.state.transition_lock,
+            worker=getattr(request.app.state, "worker", None),
+            upload_id=upload_id,
             actor_type=actor.kind,
             actor_id=actor.identifier,
         )
@@ -397,6 +475,7 @@ def request_document_deletion(
         return document.request_deletion(
             db,
             transition_lock=request.app.state.transition_lock,
+            worker=getattr(request.app.state, "worker", None),
             document_id=document_id,
             actor_type=actor.kind,
             actor_id=actor.identifier,
@@ -505,9 +584,12 @@ _API_ROUTE_HANDLERS = (
     get_document,
     document_content,
     upload_preflight,
-    list_queue,
-    cancel_queue_item,
-    retry_queue_item,
+    list_uploads,
+    get_upload,
+    get_upload_analysis,
+    decide_upload,
+    retry_upload,
+    cancel_upload,
     request_document_deletion,
     search_documents,
     live,
@@ -517,20 +599,20 @@ _API_ROUTE_HANDLERS = (
 
 
 def create_api_routers(upload_request_max_body_size: int) -> list[Router]:
-    """Build the API routers, isolating uploads behind their envelope limit."""
+    """Build the API router with a route-specific upload envelope limit."""
 
     if upload_request_max_body_size <= 0:
         raise ValueError("upload_request_max_body_size must be positive")
+    # Registering two routers at the same prefix makes Litestar synthesize two
+    # OPTIONS handlers for /uploads.  The framework supports the limit at the
+    # handler level, which keeps the contract atomic and the preflight/list
+    # endpoints on their ordinary request limits.
+    upload_handler = copy.copy(upload_document)
+    upload_handler.request_max_body_size = upload_request_max_body_size
     return [
         Router(
             path="/api/v1",
-            route_handlers=list(_API_ROUTE_HANDLERS),
+            route_handlers=[*_API_ROUTE_HANDLERS, upload_handler],
             tags=["PDF Bridge"],
-        ),
-        Router(
-            path="/api/v1",
-            route_handlers=[upload_document],
-            request_max_body_size=upload_request_max_body_size,
-            tags=["PDF Bridge"],
-        ),
+        )
     ]

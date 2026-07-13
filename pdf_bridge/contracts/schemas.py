@@ -1,4 +1,4 @@
-"""Strict Pydantic contracts for browser, retrieval, and Jenkins APIs."""
+"""Strict Pydantic contracts for the browser API and retrieval integration."""
 
 from __future__ import annotations
 
@@ -18,10 +18,13 @@ from pydantic import (
 )
 
 from pdf_bridge.persistence.models import (
-    BatchState,
+    AnalysisStatus,
+    DecisionAction,
     DocumentState,
+    OperationPhase,
     OperationState,
     OperationType,
+    ReplacementState,
     ScanState,
 )
 
@@ -31,6 +34,16 @@ CollectionKey = Annotated[
         min_length=1,
         max_length=63,
         pattern=r"^[a-z0-9][a-z0-9_-]{0,62}$",
+    ),
+]
+
+IdempotencyKey = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
 ]
 
@@ -64,7 +77,7 @@ class PaginatedResponse(ApiModel, Generic[T]):
 
 
 class DuplicateMatch(ApiModel):
-    """Existing document surfaced as an exact or possible duplicate."""
+    """Existing document surfaced by a duplicate or filename warning."""
 
     document_id: uuid.UUID
     filename: str
@@ -85,7 +98,6 @@ class ProblemDetail(ApiModel):
     code: str
     request_id: str | None = None
     duplicate: DuplicateMatch | None = None
-    possible_duplicates: list[DuplicateMatch] = Field(default_factory=list, max_length=100)
 
 
 class DocumentSummary(ApiModel):
@@ -101,31 +113,24 @@ class DocumentSummary(ApiModel):
     collection_key: CollectionKey
     uploaded_at: datetime
     ingested_at: datetime | None = None
+    rejected_at: datetime | None = None
     deleted_at: datetime | None = None
     detail_url: str | None = None
 
 
 class OperationSummary(ApiModel):
-    """Public summary of one queued pipeline operation."""
+    """Public summary of one durable worker operation."""
 
     id: uuid.UUID
     operation_type: OperationType
     state: OperationState
+    phase: OperationPhase
     attempt: int = Field(ge=1)
+    retryable: bool
     created_at: datetime
-    claimed_at: datetime | None = None
-    staged_at: datetime | None = None
+    started_at: datetime | None = None
     completed_at: datetime | None = None
-    pipeline_run_id: str | None = None
-    chunk_count: int | None = Field(default=None, ge=0)
-    component_results: list[dict[str, Any]] | None = None
     error: str | None = None
-
-
-class QueueOperationSummary(OperationSummary):
-    """Queued operation summary paired with its document."""
-
-    document: DocumentSummary
 
 
 class AuditEventPublic(ApiModel):
@@ -139,8 +144,197 @@ class AuditEventPublic(ApiModel):
     details: dict[str, Any]
 
 
+class FilenameWarningPublic(ApiModel):
+    """Advisory collection-scoped filename-family warning."""
+
+    kind: Literal[
+        "filename-family",
+        "token-set-similarity",
+        "jaro-winkler-similarity",
+    ]
+    similarity: float = Field(ge=0.0, le=1.0)
+    shared_tokens: list[str] = Field(default_factory=list, max_length=50)
+    matched: DuplicateMatch
+
+
+class AnalysisSummary(ApiModel):
+    """Completeness and result overview of one analysis revision."""
+
+    id: uuid.UUID
+    revision: int = Field(ge=1)
+    status: AnalysisStatus
+    pipeline_fingerprint: str | None = None
+    page_count: int | None = Field(default=None, ge=0)
+    chunk_count: int | None = Field(default=None, ge=0)
+    filename_warnings: list[FilenameWarningPublic] = Field(default_factory=list)
+    semantic_complete: bool
+    classification_complete: bool
+    incomplete_reasons: list[str] = Field(default_factory=list)
+    auto_ingest_eligible: bool
+    candidate_count: int = Field(ge=0)
+    classified_count: int = Field(ge=0)
+    overflow_count: int = Field(ge=0)
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class DecisionSummary(ApiModel):
+    """Immutable record of one operator decision."""
+
+    id: uuid.UUID
+    action: DecisionAction
+    analysis_revision: int = Field(ge=1)
+    target_document_id: uuid.UUID | None = None
+    advisory_override: bool
+    actor_id: str
+    created_at: datetime
+
+
+class ReplacementSummary(ApiModel):
+    """Progress of a replacement workflow attached to an upload."""
+
+    id: uuid.UUID
+    old_document_id: uuid.UUID
+    new_document_id: uuid.UUID
+    state: ReplacementState
+    error: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
+
+
+class UploadResource(ApiModel):
+    """One durable upload workspace row: document, operation, and analysis."""
+
+    upload_id: uuid.UUID
+    document: DocumentSummary
+    operation: OperationSummary | None = None
+    analysis: AnalysisSummary | None = None
+    replacement: ReplacementSummary | None = None
+    decision: DecisionSummary | None = None
+    review_required: bool
+    open: bool
+    status_url: str
+    analysis_url: str | None = None
+
+
+class UploadAcceptedResponse(ApiModel):
+    """202 response for an accepted upload queued for analysis."""
+
+    upload: UploadResource
+    idempotent_replay: bool = False
+
+
+class UploadListResponse(PaginatedResponse[UploadResource]):
+    """Paginated upload workspace response."""
+
+
+class UploadPreflightRequest(ApiModel):
+    """Filename, size, and collection submitted before an upload."""
+
+    filename: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=1)
+    collection_key: CollectionKey
+
+
+class UploadPreflightResponse(ApiModel):
+    """Normalized upload metadata with typed advisory filename warnings."""
+
+    normalized_filename: str
+    warnings: list[FilenameWarningPublic] = Field(default_factory=list, max_length=100)
+
+
+class ChunkExcerptPublic(ApiModel):
+    """Page-referenced excerpt from a retained analysis chunk."""
+
+    chunk_reference: str
+    page_start: int = Field(ge=1)
+    page_end: int = Field(ge=1)
+    text: str = Field(max_length=4000)
+
+
+class FindingPublic(ApiModel):
+    """Validated, explanation-only LLM finding for one candidate."""
+
+    role: Literal["classifier", "verifier"]
+    model_id: str
+    valid: bool
+    label: (
+        Literal[
+            "near_duplicate",
+            "likely_revision",
+            "potential_contradiction",
+            "consistent_overlap",
+            "unrelated",
+            "uncertain",
+        ]
+        | None
+    ) = None
+    summary: str | None = None
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
+
+
+class CandidatePublic(ApiModel):
+    """One qualifying candidate with its deterministic and LLM evidence."""
+
+    candidate_id: uuid.UUID
+    document: DuplicateMatch
+    source: Literal["active", "screening"]
+    rank: int = Field(ge=1)
+    reasons: list[str]
+    max_cosine: float
+    strong_cosine_chunks: int = Field(ge=0)
+    moderate_cosine_chunks: int = Field(ge=0)
+    bm25_strong_placements: int = Field(ge=0)
+    fused_score: float
+    classified: bool
+    overflow: bool
+    replacement_eligible: bool
+    findings: list[FindingPublic] = Field(default_factory=list)
+    incoming_excerpts: list[ChunkExcerptPublic] = Field(default_factory=list)
+    candidate_excerpts: list[ChunkExcerptPublic] = Field(default_factory=list)
+
+
+class AnalysisDetailResponse(ApiModel):
+    """Paginated candidate evidence for one upload's current analysis."""
+
+    upload_id: uuid.UUID
+    analysis: AnalysisSummary
+    candidates: list[CandidatePublic]
+    total_candidates: int = Field(ge=0)
+    page: int = Field(ge=1)
+    page_size: int = Field(ge=1, le=100)
+    pages: int = Field(ge=0)
+
+
+class DecisionRequest(ApiModel):
+    """Operator decision submitted against a specific analysis revision."""
+
+    analysis_revision: int = Field(ge=1)
+    action: Literal["keep", "replace", "cancel"]
+    target_document_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> DecisionRequest:
+        """Replace requires a target; Keep and Cancel forbid one."""
+
+        if self.action == "replace" and self.target_document_id is None:
+            raise ValueError("replace decisions require target_document_id")
+        if self.action != "replace" and self.target_document_id is not None:
+            raise ValueError("only replace decisions accept target_document_id")
+        return self
+
+
+class DocumentMutationResponse(ApiModel):
+    """Document state returned after a lifecycle mutation."""
+
+    document: DocumentSummary
+    operation_id: uuid.UUID | None = None
+    idempotent_replay: bool = False
+
+
 class DocumentDetail(DocumentSummary):
-    """Detailed document response including pipeline and audit history."""
+    """Detailed document response including analysis and audit history."""
 
     content_type: str
     scan_engine: str | None = None
@@ -149,20 +343,22 @@ class DocumentDetail(DocumentSummary):
     uploader_identity: str
     updated_at: datetime
     cancelled_at: datetime | None = None
-    pipeline_run_id: str | None = None
+    page_count: int | None = Field(default=None, ge=0)
     chunk_count: int | None = Field(default=None, ge=0)
-    pipeline_metadata: dict[str, Any] | None = None
+    text_sha256: str | None = None
+    analysis_revision: int = Field(ge=0)
+    analysis_manifest_hash: str | None = None
+    rejection_reason: str | None = None
+    replaced_by_document_id: uuid.UUID | None = None
     last_error: str | None = None
+    analysis: AnalysisSummary | None = None
+    decisions: list[DecisionSummary] = Field(default_factory=list)
     operations: list[OperationSummary] = Field(default_factory=list)
     audit_events: list[AuditEventPublic] = Field(default_factory=list)
 
 
 class DocumentListResponse(PaginatedResponse[DocumentSummary]):
     """Paginated document catalog response."""
-
-
-class QueueListResponse(PaginatedResponse[QueueOperationSummary]):
-    """Paginated queue operation response."""
 
 
 class CollectionSummary(ApiModel):
@@ -182,48 +378,6 @@ class CollectionListResponse(ApiModel):
 
     items: list[CollectionSummary]
     total: int = Field(ge=0)
-
-
-class UploadPreflightRequest(ApiModel):
-    """Filename, size, and collection submitted before an upload."""
-
-    filename: str = Field(min_length=1, max_length=255)
-    size_bytes: int = Field(ge=1)
-    collection_key: CollectionKey
-
-
-class UploadPreflightResponse(ApiModel):
-    """Normalized upload metadata and any possible duplicate warnings."""
-
-    normalized_filename: str
-    requires_confirmation: bool
-    possible_duplicates: list[DuplicateMatch] = Field(default_factory=list, max_length=100)
-
-
-IdempotencyKey = Annotated[
-    str,
-    StringConstraints(
-        strip_whitespace=True,
-        min_length=8,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
-    ),
-]
-
-
-class UploadResponse(ApiModel):
-    """Registered upload and its newly queued ingest operation."""
-
-    document: DocumentSummary
-    operation_id: uuid.UUID
-    idempotent_replay: bool = False
-
-
-class DocumentMutationResponse(ApiModel):
-    """Document state returned after a lifecycle mutation."""
-
-    document: DocumentSummary
-    operation_id: uuid.UUID | None = None
 
 
 class DeleteDocumentRequest(ApiModel):
@@ -259,7 +413,6 @@ class SearchRequest(ApiModel):
         if not normalized:
             raise ValueError("query must contain non-whitespace characters")
         return normalized
-
 
     @model_validator(mode="after")
     def validate_scope(self) -> SearchRequest:
@@ -317,175 +470,6 @@ class SearchResponse(ApiModel):
         return self
 
 
-class BatchClaimRequest(ApiModel):
-    """Idempotent Jenkins request to lease queued operations."""
-
-    request_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
-    limit: int = Field(default=100, ge=1, le=500)
-
-
-class BatchClaimResponse(ApiModel):
-    """Lease metadata for a claimed Jenkins batch."""
-
-    batch_id: uuid.UUID
-    request_id: str
-    state: BatchState
-    claimed_at: datetime
-    lease_expires_at: datetime
-    operation_count: int = Field(ge=0)
-    idempotent_replay: bool = False
-
-
-class BatchManifestItem(ApiModel):
-    """One operation and canonical staging path in a batch manifest."""
-
-    operation_id: uuid.UUID
-    document_id: uuid.UUID
-    operation_type: OperationType
-    filename: str
-    size_bytes: int = Field(ge=0)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    collection_key: CollectionKey
-    relative_path: str = Field(
-        min_length=1,
-        max_length=512,
-        pattern=r"^pdfs/[a-z0-9][a-z0-9_-]*/[0-9a-f-]{36}\.pdf$",
-    )
-    download_url: str | None = None
-
-
-class BatchManifestResponse(ApiModel):
-    """Versioned manifest of operations leased to a Jenkins batch."""
-
-    version: Literal[2] = 2
-    batch_id: uuid.UUID
-    request_id: str
-    state: BatchState
-    claimed_at: datetime
-    lease_expires_at: datetime
-    operations: list[BatchManifestItem] = Field(max_length=500)
-
-
-class BatchStageRequest(ApiModel):
-    """Operation identifiers acknowledged as durably staged by Jenkins."""
-
-    operation_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
-
-    @model_validator(mode="after")
-    def unique_operations(self) -> BatchStageRequest:
-        """Reject duplicate operation identifiers in a staging acknowledgement."""
-
-        if len(set(self.operation_ids)) != len(self.operation_ids):
-            raise ValueError("operation_ids must not contain duplicates")
-        return self
-
-
-class BatchStageResponse(ApiModel):
-    """Batch state after its staged operations are acknowledged."""
-
-    batch_id: uuid.UUID
-    state: BatchState
-    staged_at: datetime
-    operation_count: int = Field(ge=1)
-    idempotent_replay: bool = False
-
-
-class ComponentState(str, Enum):
-    """Outcome reported for an individual pipeline component."""
-
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    NOT_APPLICABLE = "not_applicable"
-
-
-class PipelineComponents(ApiModel):
-    """Component-level results required for a pipeline operation."""
-
-    pdf_source: ComponentState
-    markdown: ComponentState
-    bm25: ComponentState
-    dense: ComponentState
-
-
-class OperationResultInput(ApiModel):
-    """Validated pipeline result for one queued operation."""
-
-    operation_id: uuid.UUID
-    success: bool
-    chunk_count: int | None = Field(default=None, ge=0)
-    components: PipelineComponents
-    error: str | None = Field(default=None, max_length=4000)
-
-    @field_validator("error")
-    @classmethod
-    def normalize_error(cls, value: str | None) -> str | None:
-        """Trim a reported error while preserving an absent value."""
-
-        if value is None:
-            return None
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("error must contain non-whitespace characters")
-        return normalized
-
-    @model_validator(mode="after")
-    def consistent_result(self) -> OperationResultInput:
-        """Enforce agreement between success, components, and errors."""
-
-        component_states = (
-            self.components.pdf_source,
-            self.components.markdown,
-            self.components.bm25,
-            self.components.dense,
-        )
-        if self.success and any(
-            state != ComponentState.SUCCEEDED for state in component_states
-        ):
-            raise ValueError("a successful result requires every component to succeed")
-        if self.success and self.error:
-            raise ValueError("a successful result cannot include an error")
-        if not self.success and not self.error:
-            raise ValueError("a failed result must include an error")
-        return self
-
-
-class BatchResultsRequest(ApiModel):
-    """Versioned pipeline results submitted for a staged batch."""
-
-    pipeline_run_id: str = Field(min_length=1, max_length=255)
-    results: list[OperationResultInput] = Field(min_length=1, max_length=500)
-
-    @field_validator("pipeline_run_id")
-    @classmethod
-    def normalize_pipeline_run_id(cls, value: str) -> str:
-        """Trim and validate the reporting pipeline run identifier."""
-
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("pipeline_run_id must contain non-whitespace characters")
-        return normalized
-
-    @model_validator(mode="after")
-    def unique_results(self) -> BatchResultsRequest:
-        """Require exactly one result for every reported operation."""
-
-        operation_ids = [result.operation_id for result in self.results]
-        if len(set(operation_ids)) != len(operation_ids):
-            raise ValueError("results must contain exactly one entry per operation")
-        return self
-
-
-class BatchResultsResponse(ApiModel):
-    """Final batch state and aggregate operation outcome counts."""
-
-    batch_id: uuid.UUID
-    state: BatchState
-    completed_at: datetime
-    succeeded: int = Field(ge=0)
-    failed: int = Field(ge=0)
-    idempotent_replay: bool = False
-
-
 class HealthResponse(ApiModel):
     """Process or dependency health status returned by readiness endpoints."""
 
@@ -499,15 +483,12 @@ class HistoricalManifestDocument(ApiModel):
     path: str = Field(min_length=1, max_length=2000)
     filename: str | None = Field(default=None, min_length=1, max_length=255)
     collection_key: CollectionKey
-    ingested_at: datetime | None = None
-    chunk_count: int | None = Field(default=None, ge=0)
-    pipeline_run_id: str | None = Field(default=None, max_length=255)
 
 
 class HistoricalImportManifest(ApiModel):
-    """Versioned collection of documents for controlled historical import."""
+    """Version-3 manifest creating normal analysis operations on import."""
 
-    version: Literal[2]
+    version: Literal[3]
     documents: list[HistoricalManifestDocument] = Field(min_length=1, max_length=10_000)
 
 

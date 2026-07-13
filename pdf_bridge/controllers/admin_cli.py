@@ -41,7 +41,7 @@ def import_manifest_command(
             exists=True,
             dir_okay=False,
             readable=True,
-            help="Strict version 2 historical import manifest.",
+            help="Strict version 3 historical import manifest.",
         ),
     ],
     source_root: Annotated[
@@ -69,7 +69,7 @@ def import_manifest_command(
         ),
     ] = "local-import",
 ) -> None:
-    """Validate or apply a controlled import of already-ingested historical PDFs."""
+    """Validate or queue a controlled import through normal semantic intake."""
 
     try:
         response = run_manifest_import(

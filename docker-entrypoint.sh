@@ -6,20 +6,20 @@ if [ -z "${PDF_BRIDGE_STORAGE_ROOT:-}" ]; then
     exit 64
 fi
 
-if [ -z "${PDF_BRIDGE_SESSION_SECRET:-}" ] || [ -z "${PDF_BRIDGE_JOB_TOKEN:-}" ]; then
-    echo "PDF_BRIDGE_SESSION_SECRET and PDF_BRIDGE_JOB_TOKEN are required" >&2
+if [ -z "${PDF_BRIDGE_SESSION_SECRET:-}" ] || [ -z "${PDF_BRIDGE_QDRANT_API_KEY:-}" ]; then
+    echo "PDF_BRIDGE_SESSION_SECRET and PDF_BRIDGE_QDRANT_API_KEY are required" >&2
     exit 64
 fi
 
-case "$PDF_BRIDGE_SESSION_SECRET:$PDF_BRIDGE_JOB_TOKEN" in
+case "$PDF_BRIDGE_SESSION_SECRET:$PDF_BRIDGE_QDRANT_API_KEY:${PDF_BRIDGE_EMBEDDING_API_TOKEN:-}:${PDF_BRIDGE_LLM_API_TOKEN:-}" in
     *CHANGE_ME*|development-only-change-me:*)
         echo "replace all placeholder/development secrets before starting PDF Bridge" >&2
         exit 64
         ;;
 esac
 
-if [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_JOB_TOKEN" ]; then
-    echo "session and Jenkins secrets must be different" >&2
+if [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_QDRANT_API_KEY" ]; then
+    echo "session and Qdrant administrative secrets must be different" >&2
     exit 64
 fi
 

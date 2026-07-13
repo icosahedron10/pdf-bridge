@@ -30,8 +30,9 @@ export default function Home() {
       <Callout title="Role guides are responsibility views, not application roles">
         <p>
           Browser users currently share one capability set. Trusted-header mode supplies identity
-          attribution but not role authorization. Jenkins is the only separate enforced boundary,
-          through its bearer token. One person may hold several of these responsibilities.
+          attribution but not role authorization. Every trusted operator may Keep, Replace, Cancel,
+          and delete. Service and provider credentials protect machine boundaries; they do not add
+          browser roles. One person may hold several of these responsibilities.
         </p>
       </Callout>
 
@@ -51,11 +52,11 @@ export default function Home() {
       <section id="journey">
         <h2>Document journey</h2>
         <div className="journey compact-journey">
-          <div><span>Library operator</span><strong>Select collection and upload.</strong><p>The framework spools the multipart part, then the bridge copies it into private quarantine while validating, hashing, and scanning. Only clean content is promoted atomically.</p></div>
-          <div><span>Jenkins owner</span><strong>Claim and stage an immutable batch.</strong><p>The CLI checks canonical paths, byte counts, hashes, and the complete operation set before acknowledgement.</p></div>
-          <div><span>RAG pipeline owner</span><strong>Parse, index, or delete.</strong><p>Every operation receives a strict result covering PDF source, Markdown, BM25, and dense components.</p></div>
-          <div><span>PDF Bridge</span><strong>Apply results and expose recoverable state.</strong><p>The catalog records success, failure, or cleanup without optimistic deletion.</p></div>
-          <div><span>Retrieval and chatbot owners</span><strong>Return correlated results within authorized collections.</strong><p>Collection and bridge UUID remain consistent from catalog through Qdrant and policy.</p></div>
+          <div><span>Library operator</span><strong>Select a collection and upload.</strong><p>The bridge streams, validates, hashes, and scans each PDF. Clean bytes are promoted atomically and return as durable analysis work.</p></div>
+          <div><span>Internal worker</span><strong>Extract and compare.</strong><p>A limited parser child produces page-mapped text. The worker searches active and private screening indexes inside the selected collection.</p></div>
+          <div><span>Operator or policy</span><strong>Publish or review.</strong><p>A clear analysis proceeds automatically. Advisory findings wait indefinitely for an explicit Keep, Replace, or Cancel decision.</p></div>
+          <div><span>PDF Bridge</span><strong>Mutate Qdrant safely.</strong><p>Durable outbox steps publish complete dense and BM25 points, or remove and verify old points before a replacement becomes active.</p></div>
+          <div><span>Retrieval and chatbot owners</span><strong>Query only authorized active content.</strong><p>The stable collection alias and bridge UUID remain consistent from catalog through Qdrant and user policy.</p></div>
         </div>
       </section>
 
@@ -64,11 +65,12 @@ export default function Home() {
         <DocumentationTable
           headings={["System", "Owns", "Does not own"]}
           rows={[
-            ["PDF Bridge", "Clean canonical PDF bytes, catalog, lifecycle, queue, audit, browser workspace", "PDF parsing, chunks, indexes, end-user authorization"],
-            ["ClamAV", "First-pass malware signature scanning", "Proof that a PDF is safe to parse"],
-            ["Jenkins client", "Authenticated claim, verified download, atomic staging, report submission", "Parsing or catalog mutation"],
-            ["RAG pipeline", "Parsing, derived PDF/Markdown, BM25, dense/Qdrant, downstream delete", "Collection placement or canonical bridge storage"],
-            ["Retrieval service", "Search execution, ranking, grouped response contract", "End-user authorization"],
+            ["PDF Bridge", "Canonical bytes, lifecycle, analysis artifacts, decisions, audit, outbox, and Qdrant mutation", "Chatbot-user authorization"],
+            ["ClamAV", "Synchronous malware signature verdict", "Parser containment or lifecycle state"],
+            ["Parser subprocess", "Page-mapped extraction under hard limits", "Network access, durable state, decisions, or indexing"],
+            ["Embedding and LLM providers", "Configured model inference", "Candidate suppression, publication, replacement, or deletion"],
+            ["Qdrant", "Active and private screening vector persistence", "Catalog authority or operator decisions"],
+            ["Retrieval service", "Keyword, semantic, and hybrid search over active aliases", "Screening access or end-user authorization"],
             ["Chatbot manager", "Authenticated user policy and allowed-collection intersection", "Bridge operator workflows"],
           ]}
         />
@@ -91,8 +93,9 @@ export default function Home() {
         <p>
           This POC is intended for a restricted internal network. Anonymous mode is not identity,
           collection audience labels are not authorization, SQLite supports one application
-          process, and a clean ClamAV result does not neutralize parser risk. The security reviewer
-          guide and OSS reference separate implemented controls from work required before a
+          process, and a clean ClamAV result does not neutralize parser risk. The resource-limited
+          parser subprocess is defense in depth, not a complete sandbox. The security reviewer
+          guide and OSS reference separate implemented controls from the work required before a
           controlled pilot or enterprise claim.
         </p>
       </section>

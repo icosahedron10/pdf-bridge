@@ -52,9 +52,7 @@ def test_openapi_preserves_optional_body_and_pdf_download_media_type(
     assert deletion["requestBody"].get("required", False) is False
     assert "application/json" in deletion["requestBody"]["content"]
 
-    download = schema["paths"][
-        "/api/v1/jobs/batches/{batch_id}/operations/{operation_id}/content"
-    ]["get"]
+    download = schema["paths"]["/api/v1/documents/{document_id}/content"]["get"]
     assert "application/pdf" in download["responses"]["200"]["content"]
 
 
