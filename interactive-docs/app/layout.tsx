@@ -30,11 +30,20 @@ export async function generateMetadata(): Promise<Metadata> {
       title: "PDF Bridge documentation",
       description: "Role guides, lifecycle, contracts, operations, and code reference.",
       type: "website",
+      images: [
+        {
+          url: "/og.png",
+          width: 1731,
+          height: 909,
+          alt: "PDF Bridge documentation: role guides, lifecycle, operations, and security",
+        },
+      ],
     },
     twitter: {
-      card: "summary",
+      card: "summary_large_image",
       title: "PDF Bridge documentation",
       description: "Role guides, lifecycle, contracts, operations, and code reference.",
+      images: ["/og.png"],
     },
   };
 }

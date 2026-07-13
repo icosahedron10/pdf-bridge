@@ -51,7 +51,7 @@ export default function Home() {
       <section id="journey">
         <h2>Document journey</h2>
         <div className="journey compact-journey">
-          <div><span>Library operator</span><strong>Select collection and upload.</strong><p>The bridge validates metadata, streams bytes, calculates SHA-256, scans through ClamAV, and retains only clean canonical content.</p></div>
+          <div><span>Library operator</span><strong>Select collection and upload.</strong><p>The framework spools the multipart part, then the bridge copies it into private quarantine while validating, hashing, and scanning. Only clean content is promoted atomically.</p></div>
           <div><span>Jenkins owner</span><strong>Claim and stage an immutable batch.</strong><p>The CLI checks canonical paths, byte counts, hashes, and the complete operation set before acknowledgement.</p></div>
           <div><span>RAG pipeline owner</span><strong>Parse, index, or delete.</strong><p>Every operation receives a strict result covering PDF source, Markdown, BM25, and dense components.</p></div>
           <div><span>PDF Bridge</span><strong>Apply results and expose recoverable state.</strong><p>The catalog records success, failure, or cleanup without optimistic deletion.</p></div>

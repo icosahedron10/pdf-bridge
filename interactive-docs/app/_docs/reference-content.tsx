@@ -231,7 +231,7 @@ const codeMap: GuidePage = {
         <DocumentationTable
           headings={["Layer", "Owns", "Representative files"]}
           rows={[
-            [<code key="app">app.py</code>, "Composition of settings, middleware, providers, collaborators, and routers", "pdf_bridge/app.py"],
+            [<code key="app">app.py</code>, "Composition plus lifespan ownership of the engine, session factory, shared retrieval client, middleware, and routers", "pdf_bridge/app.py"],
             [<code key="controllers">controllers/</code>, "HTTP and Typer input binding, auth dependencies, public output, safe error translation", "api.py, jobs.py, web.py, job_cli.py, admin_cli.py"],
             [<code key="managers">managers/</code>, "Locks, transactions, commit/rollback, workflow and cleanup sequencing", "document.py, batch.py, job_client.py"],
             [<code key="services">services/</code>, "Rules, queries, storage, scanner, retrieval, staging, and page-data behavior", "lifecycle.py, document.py, storage.py, search.py"],
@@ -250,6 +250,7 @@ const codeMap: GuidePage = {
           <li>Services do not import Litestar, HTTP, managers, controllers, or the app.</li>
           <li>Controllers do not construct SQL.</li>
           <li>Managers own transaction commit and rollback.</li>
+          <li>Blocking filesystem, scanner, retrieval, and database-backed page flows use synchronous handlers with <code>sync_to_thread=True</code>.</li>
           <li>Presentation is stateless and does not call services or issue SQL.</li>
           <li>Package initializers do not re-export implementations.</li>
         </ul>
@@ -274,7 +275,8 @@ const codeMap: GuidePage = {
         <p>
           Put the rule in the lowest layer that owns it. Transport-specific parsing stays in a
           controller; transaction and compensation sequences stay in a manager; reusable business
-          rules and I/O stay in services; persisted fields require models plus an Alembic migration.
+          rules and I/O stay in services; application-owned resource lifecycle stays in the
+          composition root; persisted fields require models plus an Alembic migration.
         </p>
       </section>
 
@@ -303,6 +305,7 @@ const configuration: GuidePage = {
   toc: [
     { id: "settings", label: "Settings" },
     { id: "startup", label: "Startup and health" },
+    { id: "runtime", label: "Runtime ownership" },
     { id: "storage", label: "Storage layout" },
     { id: "backup", label: "Backup and import" },
     { id: "upgrade", label: "Upgrade rules" },
@@ -319,7 +322,7 @@ const configuration: GuidePage = {
             ["Storage/database", "PDF_BRIDGE_STORAGE_ROOT and optional PDF_BRIDGE_DATABASE_URL", "External to source/synchronized folders; SQLite defaults below storage root"],
             ["Identity", "PDF_BRIDGE_AUTH_MODE, PDF_BRIDGE_TRUSTED_PROXY_CIDRS, PDF_BRIDGE_TRUSTED_IDENTITY_HEADER", "Identity headers accepted only from configured immediate peers"],
             ["Secrets", "PDF_BRIDGE_SESSION_SECRET and PDF_BRIDGE_JOB_TOKEN", "Required outside tests, at least 32 characters, distinct, and not placeholders"],
-            ["Intake", "PDF_BRIDGE_MAX_UPLOAD_BYTES and PDF_BRIDGE_MAX_UPLOAD_FILES", "Upload limit cannot exceed the ClamAV stream ceiling"],
+            ["Intake", "PDF_BRIDGE_MAX_UPLOAD_BYTES, PDF_BRIDGE_MAX_UPLOAD_FILES, and PDF_BRIDGE_UPLOAD_CHUNK_BYTES", "Upload limit cannot exceed the ClamAV stream ceiling; chunk size bounds each quarantine copy read"],
             ["Scanner", "PDF_BRIDGE_CLAMD_HOST, PDF_BRIDGE_CLAMD_PORT, PDF_BRIDGE_CLAMD_TIMEOUT, PDF_BRIDGE_CLAMD_STREAM_MAX_BYTES", "Any detection, timeout, error, or malformed reply fails closed"],
             ["Batch", "PDF_BRIDGE_CLAIM_LEASE_MINUTES", "Size for download/staging, not ingestion duration"],
             ["Retrieval", "PDF_BRIDGE_SEARCH_API_URL, PDF_BRIDGE_SEARCH_API_TOKEN, PDF_BRIDGE_SEARCH_API_TIMEOUT", "Token is separate; enterprise URL must be HTTPS"],
@@ -332,18 +335,34 @@ const configuration: GuidePage = {
         <p>
           Settings validate cross-field rules before subdirectories are created. The Compose
           entrypoint preflights or creates the storage root and runs Alembic before Uvicorn. During
-          application lifespan, the bridge then requires every document, including tombstones, to
-          have a collection and validates active catalog collection references.
+          application lifespan, the bridge validates active collection references against the same
+          settings-selected database that request sessions will use.
         </p>
         <DocumentationTable
           headings={["Endpoint", "Meaning"]}
           rows={[
             [<code key="l">/api/v1/health/live</code>, "Process only"],
-            [<code key="r">/api/v1/health/ready</code>, "Database, writable storage, and ClamAV PING; intended for traffic admission"],
+            [<code key="r">/api/v1/health/ready</code>, "Database, writable root/objects/temporary/quarantine directories, and ClamAV PING; intended for traffic admission"],
             [<code key="d">/api/v1/health/dependencies</code>, "Currently the same detailed check body; intended for restricted operator diagnosis"],
           ]}
         />
         <p>Retrieval is deliberately absent from readiness. ClamAV PING does not prove signature freshness.</p>
+      </section>
+
+      <section id="runtime">
+        <h2>Runtime ownership and concurrency</h2>
+        <p>
+          One application lifespan owns the SQLAlchemy engine and session factory plus one shared
+          synchronous retrieval client. It closes what it creates on normal shutdown and on startup
+          failure; injected test clients remain caller-owned, and custom database providers are
+          rejected outside test mode.
+        </p>
+        <p>
+          Upload, scanner-dependent pages, and retrieval use synchronous handlers with
+          <code>sync_to_thread=True</code>. Blocking file, scanner, HTTP, or SQLite work therefore
+          runs in Litestar worker threads instead of blocking the event loop; liveness remains
+          responsive while an upload scan is waiting.
+        </p>
       </section>
 
       <section id="storage">
@@ -353,6 +372,12 @@ const configuration: GuidePage = {
           Canonical object keys are UUID-derived. The downstream
           <code>pdfs/{`{collection}`}/{`{document_id}`}.pdf</code> tree is not bridge
           canonical storage.
+        </p>
+        <p>
+          Litestar first spools each multipart part. The bridge then copies it in configured chunks
+          to a private file under <code>quarantine/</code>, hashes and validates it, scans that exact
+          copy, and promotes clean bytes atomically into <code>objects/</code>.
+          <code>temporary/</code> is reserved for historical import staging.
         </p>
       </section>
 
@@ -367,7 +392,9 @@ const configuration: GuidePage = {
         <p>
           <code>pdf-bridge import-manifest</code> is a controlled one-time registration of already
           indexed PDFs. Use an explicit source root, dry-run first, then reviewed <code>--apply</code>.
-          It does not reconstruct queue/batch/audit history and is not a backup mechanism.
+          It does not reconstruct queue/batch/audit history and is not a backup mechanism. If its
+          session-scope commit fails, every promoted canonical object is removed; all removals are
+          attempted and any failures are reported with their storage keys.
         </p>
       </section>
 

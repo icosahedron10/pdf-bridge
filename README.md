@@ -26,7 +26,7 @@ work, staging verified files, and reporting outcomes.
 > lowers risk; it does not make hostile PDFs safe. Before broader use, complete the controls in the
 > [security and enterprise-gates review](docs/security.md).
 
-**[Open the internal documentation wiki (private OpenAI Sites)](https://pdf-bridge-field-guide.madsenjake0.chatgpt.site)**
+**[Open the internal documentation wiki (OpenAI Sites)](https://pdf-bridge-field-guide.madsenjake0.chatgpt.site)**
 · [Read the Playwright and ClamAV OSS review](docs/oss-review.md)
 
 ## At a glance

@@ -81,3 +81,17 @@ test("does not expose the removed document-routing workflow", async () => {
     assert.doesNotMatch(html, /Needs review|Classification reviewer|review_required/i, path);
   }
 });
+
+test("documents the current runtime, quarantine, and compensation model", async () => {
+  const configuration = await render("/reference/configuration");
+  const configurationHtml = await configuration.text();
+  assert.match(configurationHtml, /Runtime ownership and concurrency/);
+  assert.match(configurationHtml, /PDF_BRIDGE_UPLOAD_CHUNK_BYTES/);
+  assert.match(configurationHtml, /root\/objects\/temporary\/quarantine/);
+  assert.match(configurationHtml, /session-scope commit fails/);
+
+  const maintainer = await render("/roles/code-maintainer");
+  const maintainerHtml = await maintainer.text();
+  assert.match(maintainerHtml, /sync_to_thread=True/);
+  assert.match(maintainerHtml, /startup\/shutdown resource ownership/i);
+});

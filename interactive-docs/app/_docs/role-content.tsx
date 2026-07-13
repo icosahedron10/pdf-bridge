@@ -51,7 +51,7 @@ const libraryOperator: GuidePage = {
         <div className="journey">
           <div><span>1. Your action</span><strong>Open Collections and choose the destination corpus.</strong><p>Review the audience label, description, and available and processing counts.</p></div>
           <div><span>2. Your action</span><strong>Open Upload, keep that collection selected, and choose PDFs.</strong><p>Preflight checks name and size. A possible duplicate requires your explicit confirmation.</p></div>
-          <div><span>3. System response</span><strong>The bridge validates, hashes, scans, and promotes each file.</strong><p>A clean PDF enters Queue as <code>QUEUED</code> with its immutable collection. Rejected bytes never become available content.</p></div>
+          <div><span>3. System response</span><strong>The bridge copies the spooled part into private quarantine, validates, hashes, scans, and promotes it atomically.</strong><p>A clean PDF enters Queue as <code>QUEUED</code> with its immutable collection. Rejected bytes never become available content.</p></div>
           <div><span>4. Waiting</span><strong>Jenkins claims and stages work for the downstream pipeline.</strong><p>Queue shows the latest attempt as queued, claimed, staged, failed, or in cleanup.</p></div>
           <div><span>5. Result</span><strong>The document becomes available or remains retryable.</strong><p>Use the document ledger for operation, batch, component, and audit evidence.</p></div>
         </div>
@@ -118,7 +118,7 @@ const libraryOperator: GuidePage = {
             { path: "pdf_bridge/controllers/web.py", purpose: "Browser routes and transport binding" },
             { path: "pdf_bridge/services/web_page.py", purpose: "Collection, queue, document, and search page data" },
             { path: "pdf_bridge/managers/document.py", purpose: "Upload and lifecycle transaction boundaries" },
-            { path: "pdf_bridge/services/document.py", purpose: "Preflight, streaming, scan, and storage workflow" },
+            { path: "pdf_bridge/services/document.py", purpose: "Preflight, quarantine copy, scan, and atomic promotion workflow" },
             { path: "pdf_bridge/services/lifecycle.py", purpose: "Document and operation transition rules" },
             { path: "pdf_bridge/templates/", purpose: "Browser views" },
             { path: "tests/test_browser.py", purpose: "End-to-end coworker workflows" },
@@ -375,8 +375,8 @@ const platformOperator: GuidePage = {
         <p>
           The supported topology is Linux and Docker Compose. Configure independent session and job
           secrets, allowed hosts, identity mode, collection registry, external storage root,
-          ClamAV connection, claim lease, and optional retrieval connection. JSON list values must
-          remain valid JSON.
+          upload chunk size, ClamAV connection, claim lease, and optional retrieval connection and
+          timeout. JSON list values must remain valid JSON.
         </p>
         <Callout title="One process while the catalog is SQLite" tone="warning">
           <p>
@@ -391,8 +391,8 @@ const platformOperator: GuidePage = {
         <CodeBlock>{"docker compose up -d --build\ndocker compose ps\ndocker compose logs --tail=100 app clamav"}</CodeBlock>
         <div className="journey">
           <div><span>1. System response</span><strong>ClamAV initializes its persistent signature database.</strong><p>The first start may take minutes and requires the scanner memory budget.</p></div>
-          <div><span>2. System response</span><strong>The application entrypoint applies Alembic migrations.</strong><p>Startup fails if migration fails; lifespan then checks active catalog collection references.</p></div>
-          <div><span>3. Your action</span><strong>Wait for readiness before admitting users or Jenkins.</strong><p>Database, writable storage, and scanner must all be usable.</p></div>
+          <div><span>2. System response</span><strong>The entrypoint migrates, then the application lifespan creates its database and retrieval resources.</strong><p>Startup validates active collection references against the same database that will serve requests. Owned resources are released even if startup fails.</p></div>
+          <div><span>3. Your action</span><strong>Wait for readiness before admitting users or Jenkins.</strong><p>Database, storage root, objects, temporary import staging, upload quarantine, and scanner must all be usable.</p></div>
           <div><span>4. Ongoing work</span><strong>Monitor signatures, capacity, queue age, reconciliation, backups, and credentials.</strong><p>Retrieval outages remain visible but do not make the upload/catalog service unready.</p></div>
         </div>
       </section>
@@ -403,7 +403,7 @@ const platformOperator: GuidePage = {
           headings={["Surface", "Meaning"]}
           rows={[
             [<code key="l">/api/v1/health/live</code>, "The process can answer HTTP; use for liveness/restart"],
-            [<code key="r">/api/v1/health/ready</code>, "Database, storage, and ClamAV are usable; use for traffic admission"],
+            [<code key="r">/api/v1/health/ready</code>, "Database, every required storage directory, and ClamAV are usable; use for traffic admission"],
             [<code key="d">/api/v1/health/dependencies</code>, "Currently the same detailed check body as ready; intended for restricted operator diagnosis"],
             ["Compose logs", "Migration, application, FreshClam, clamd, and readiness evidence"],
             ["Queue and ledger", "Claim age, bounded pipeline errors, cleanup state, and correlation identifiers"],
@@ -419,6 +419,7 @@ const platformOperator: GuidePage = {
           <li>Monitor signature age and FreshClam errors; a PONG does not prove currency.</li>
           <li>Back up the complete <code>bridge_data</code> volume, not a live SQLite file alone.</li>
           <li>Run historical import locally with an explicit source root, dry-run, and reviewed manifest.</li>
+          <li>Reserve <code>temporary/</code> for historical imports; live uploads stage under private <code>quarantine/</code>.</li>
           <li>Treat collection-key changes as coordinated corpus migrations.</li>
           <li>Never rewrite lifecycle/audit rows or recursively delete computed paths.</li>
         </ul>
@@ -433,6 +434,7 @@ const platformOperator: GuidePage = {
             ["Scanner unavailable", "Upload trust gate outage", "Restore clamd/signatures/network; keep uploads closed"],
             ["SQLite locked", "Unsupported concurrency, stalled I/O, or live-file manipulation", "Return to one process and inspect volume health"],
             ["Startup rejects collections", "Active rows no longer match the deployment registry", "Correct configuration or run a coordinated migration"],
+            ["Historical import commit fails", "The catalog transaction did not complete after one or more promotions", "Confirm every promoted object was removed; any failed storage keys are reported for repair"],
             ["Cleanup state persists", "Canonical unlink failed after catalog/downstream work", "Repair storage and replay the exact cleanup"],
           ]}
         />
@@ -452,8 +454,9 @@ const platformOperator: GuidePage = {
         <ModuleReferences
           items={[
             { path: "pdf_bridge/core/config.py", purpose: "Settings validation and enterprise startup guards" },
-            { path: "pdf_bridge/app.py", purpose: "Composition, lifespan checks, and middleware" },
-            { path: "pdf_bridge/services/health.py", purpose: "Database, storage, and scanner checks" },
+            { path: "pdf_bridge/app.py", purpose: "Composition, lifespan-owned resources, startup validation, and middleware" },
+            { path: "pdf_bridge/services/health.py", purpose: "Database, complete storage-layout, and scanner checks" },
+            { path: "pdf_bridge/managers/importing.py", purpose: "Historical import transaction and post-promotion compensation" },
             { path: "docker-compose.yml", purpose: "Topology, volumes, health, limits, and hardening" },
             { path: "docker-entrypoint.sh", purpose: "Migration-before-start sequence" },
             { path: "docs/runbook.md", purpose: "Troubleshooting, backup, upgrades, and cutover" },
@@ -698,9 +701,10 @@ const securityReviewer: GuidePage = {
       <section id="implemented">
         <h2>Implemented controls</h2>
         <ul>
-          <li>Bounded streaming, strict PDF name/signature checks, SHA-256, and duplicate gates.</li>
-          <li>ClamAV before canonical promotion; detection, timeout, malformed reply, and outage fail closed.</li>
+          <li>Bounded multipart spooling followed by a private quarantine copy, strict PDF name/signature checks, SHA-256, and duplicate gates.</li>
+          <li>ClamAV before atomic canonical promotion; detection, timeout, malformed reply, and outage fail closed.</li>
           <li>UUID-derived paths outside the webroot; filenames remain display metadata.</li>
+          <li>Upload and historical-import transaction failures roll back catalog state and compensate promoted objects; cleanup failures are surfaced.</li>
           <li>Encrypted/authenticated session state, same-origin mutations, CSRF, and trusted Host checks.</li>
           <li>Separate automation credentials, exact-host pinning, no redirects, and batch-scoped downloads.</li>
           <li>Canonical path, byte count, hash, operation-set, and result correlation checks.</li>
@@ -768,7 +772,9 @@ const securityReviewer: GuidePage = {
             { path: "docs/oss-review.md", purpose: "Official-source dependency due diligence and Monday checklist" },
             { path: "pdf_bridge/http/security.py", purpose: "Session actor, CSRF, origin, proxy, and Jenkins credential checks" },
             { path: "pdf_bridge/services/scanner.py", purpose: "Fail-closed clamd INSTREAM protocol" },
-            { path: "pdf_bridge/services/storage.py", purpose: "Temporary, promotion, canonical path, and controlled unlink behavior" },
+            { path: "pdf_bridge/services/storage.py", purpose: "Private quarantine/import staging, atomic promotion, canonical paths, and controlled unlink behavior" },
+            { path: "tests/test_app_lifecycle.py", purpose: "Owned-resource validation, startup-failure cleanup, and injected-resource ownership" },
+            { path: "tests/test_uploads.py", purpose: "Quarantine, private modes, responsiveness, and transaction compensation evidence" },
             { path: "tests/test_security_and_import.py", purpose: "Security and administrative import evidence" },
             { path: "tests/test_clamav_integration.py", purpose: "Opt-in clean/EICAR live-daemon check" },
           ]}
@@ -801,9 +807,11 @@ const codeMaintainer: GuidePage = {
       <section id="orientation">
         <h2>Orient in the package</h2>
         <p>
-          <code>pdf_bridge/app.py</code> is the composition root. It assembles settings, logging,
-          database providers, scanner/search collaborators, Litestar routes, sessions, and outer
-          middleware. Other package-root modules should not accumulate implementation behavior.
+          <code>pdf_bridge/app.py</code> is the composition root. Its lifespan builds the engine,
+          session factory, and shared synchronous retrieval client from the active settings,
+          validates the database it will serve, and releases owned resources on shutdown or startup
+          failure. Test-injected clients remain caller-owned. Other package-root modules should not
+          accumulate implementation behavior.
         </p>
         <DocumentationTable
           headings={["Layer", "Responsibility"]}
@@ -853,10 +861,11 @@ const codeMaintainer: GuidePage = {
         <ul>
           <li>Dependencies point downward; services never import Litestar, HTTP, managers, controllers, or app.</li>
           <li>Controllers do not construct SQL; managers own commits and rollbacks.</li>
+          <li>Blocking upload, scanner, page, and retrieval work uses <code>sync_to_thread=True</code> to run in Litestar worker threads so the event loop remains responsive.</li>
           <li>Scanner, path, staging, result, and search-correlation failures fail closed.</li>
           <li>User metadata never forms canonical storage or handoff paths.</li>
           <li>Collection is required for every document and immutable after queue.</li>
-          <li>Filesystem promotion and database mutation have explicit compensation.</li>
+          <li>Filesystem promotion and database mutation have explicit compensation through audit flush and commit; cleanup failures surface.</li>
           <li>Idempotent replays must match material request/result data exactly.</li>
           <li>Cleanup-pending states preserve enough information for exact replay after failure.</li>
         </ul>
@@ -872,6 +881,8 @@ const codeMaintainer: GuidePage = {
             ["Browser opt-in", "Chromium workflows across upload, queue, search, navigation, and deletion"],
             ["ClamAV opt-in", "Clean PDF-shaped fixture and EICAR against a real daemon"],
             [<code key="ar">tests/test_architecture.py</code>, "Exact modules, one-way imports, transaction ownership, and service transport independence"],
+            [<code key="al">tests/test_app_lifecycle.py</code>, "Settings-owned database, shared search client, and startup/shutdown resource ownership"],
+            [<code key="up">tests/test_uploads.py</code>, "Private quarantine, concurrent responsiveness, and upload compensation"],
           ]}
         />
       </section>
