@@ -1,5 +1,9 @@
 # OSS review: Playwright and ClamAV
 
+> **Status: Historical review.** This document records a point-in-time dependency decision and is
+> not a source of target architecture. The target processing stack is defined in
+> [ADR 0003](adr/0003-processing-stack.md).
+>
 > Point-in-time review: **2026-07-12**. This is engineering due diligence, not legal
 > advice. Re-check versions, support status, and terms before an external release or a
 > production approval.
@@ -248,11 +252,17 @@ Close these gaps before a controlled pilot:
 - A managed multi-engine scanning service or content-disarm-and-reconstruction service may better
   meet enterprise policy, but it adds cost, data-transfer/privacy review, network dependency, and
   vendor lock-in. Evaluate it as a policy decision, not a drop-in OSS library swap.
-- Sandboxed downstream PDF parsing remains necessary regardless of scanner choice.
+- Sandboxed PDF Bridge parsing remains necessary regardless of scanner choice.
 
 **Recommendation:** retain ClamAV as the POC's first-pass malware gate, implement freshness and
 limit policy, and keep the documented enterprise gate that requires an organizational decision on
 augmentation or replacement.
+
+This review predates the target local `sentence-transformers/all-mpnet-base-v2`, FastEmbed BM25,
+and vLLM Markdown-formatting dependencies. Complete and record a separate license, model-card,
+artifact-provenance, and container-distribution review for that stack before implementation is
+called release-ready. PyMuPDF and PyMuPDF4LLM are explicitly excluded from the target because their
+AGPL/commercial licensing model is not acceptable for this project.
 
 ## Monday-ready checklist
 

@@ -1,121 +1,96 @@
-"""Document upload, content, and decision use-case implementation."""
+"""Admission, filename advisory, and protected source access for API v2."""
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from uuid import UUID
 
-from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from pdf_bridge.contracts.schemas import (
-    IdempotencyKey,
-    UploadAcceptedResponse,
-    UploadPreflightResponse,
-)
 from pdf_bridge.core.config import CollectionDefinition, Settings
-from pdf_bridge.persistence.models import Document, OperationType
-from pdf_bridge.presentation.api_serializers import (
-    duplicate_match,
-    filename_warning,
-    upload_resource,
+from pdf_bridge.persistence.models import (
+    TERMINAL_DOCUMENT_STATES,
+    Document,
+    DocumentState,
+    OperationPriority,
+    OperationType,
+    ScanState,
+    WorkOperation,
 )
-from pdf_bridge.services.catalog import configured_collection
-from pdf_bridge.services.errors import ServiceError
+from pdf_bridge.presentation.api_serializers import upload_accepted_response
+from pdf_bridge.services.filenames import compare_filenames, profile_filename
 from pdf_bridge.services.intake import (
-    DuplicateDocumentError,
+    IdempotencyReplay,
     LifecycleError,
-    UploadRegistration,
-    find_filename_warnings,
-    register_staged_upload,
+    audit,
+    complete_idempotency,
+    enqueue_operation,
+    reserve_idempotency,
 )
 from pdf_bridge.services.scanner import Scanner, ScanResult
 from pdf_bridge.services.storage import (
     BinaryReadable,
-    InvalidFilenameError,
+    PromotedFile,
     StagedFile,
     StorageLayout,
     normalize_filename,
+    promote_staged_file,
     resolve_storage_key,
     stream_upload,
     validate_pdf_filename,
 )
 
-_idempotency_adapter = TypeAdapter(IdempotencyKey)
+
+@dataclass(frozen=True, slots=True)
+class PreparedAdmission:
+    """Bounded, validated, clean upload awaiting a short catalog transaction."""
+
+    staged: StagedFile
+    layout: StorageLayout
+    filename: str
+    normalized_filename: str
+    collection: CollectionDefinition
+    scan: ScanResult
 
 
 @dataclass(frozen=True, slots=True)
-class DocumentContent:
-    """Canonical content metadata needed by an HTTP controller."""
+class AdmissionOutcome:
+    document: Document
+    operation: WorkOperation
+    promoted: PromotedFile
+    response_body: dict[str, object]
 
+
+@dataclass(frozen=True, slots=True)
+class SourceContent:
     path: Path
     filename: str
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedUpload:
-    """A validated, staged, and scanned upload awaiting catalog registration."""
-
-    staged: StagedFile
-    layout: StorageLayout
-    display_filename: str
-    collection_key: str
-    scan_result: ScanResult
+class FilenameAdvisoryMatch:
+    document_id: uuid.UUID
+    original_filename: str
+    state: DocumentState
+    match_type: str
+    score: float
 
 
-def validate_idempotency_key(*, header_value: str | None, form_value: str | None) -> str:
-    """Validate and reconcile the two supported idempotency-key inputs."""
-
-    if header_value and form_value and header_value != form_value:
-        raise ServiceError(
-            "The header and form idempotency keys must be identical.",
-            status=422,
-            code="idempotency-key-mismatch",
-            title="Idempotency keys did not match",
-        )
-    try:
-        return _idempotency_adapter.validate_python(header_value or form_value)
-    except ValidationError as exc:
-        raise ServiceError(
-            "Provide an 8–128 character Idempotency-Key header.",
-            status=422,
-            code="invalid-idempotency-key",
-            title="Idempotency key was rejected",
-        ) from exc
-
-
-def preflight_upload(
-    session: Session,
-    *,
-    definitions: list[CollectionDefinition],
-    filename: str,
-    size_bytes: int,  # part of the stable request contract; warnings are name-based
-    collection_key: str,
-) -> UploadPreflightResponse:
-    """Validate upload metadata and return typed advisory filename warnings."""
-
-    configured_collection(definitions, collection_key)
-    try:
-        normalized = normalize_filename(filename)
-    except InvalidFilenameError as exc:
-        raise ServiceError(
-            str(exc),
-            status=422,
-            code="invalid-filename",
-            title="Filename was rejected",
-        ) from exc
-    warnings = find_filename_warnings(
-        session, collection_key=collection_key, filename=filename
-    )
-    return UploadPreflightResponse(
-        normalized_filename=normalized,
-        warnings=[filename_warning(document, match) for document, match in warnings],
+def configured_collection(
+    definitions: tuple[CollectionDefinition, ...] | list[CollectionDefinition],
+    key: str,
+) -> CollectionDefinition:
+    for definition in definitions:
+        if definition.key == key and definition.enabled:
+            return definition
+    raise LifecycleError(
+        "collection_not_found", "The configured collection was not found.", status=404
     )
 
 
-def prepare_upload(
+def prepare_admission(
     *,
     settings: Settings,
     scanner: Scanner,
@@ -123,30 +98,17 @@ def prepare_upload(
     filename: str,
     content_type: str | None,
     collection_key: str,
-) -> PreparedUpload:
-    """Validate, stream, and scan an upload without opening a database transaction."""
+) -> PreparedAdmission:
+    """Stream, shape-check, and scan one upload outside a DB transaction."""
 
-    configured_collection(settings.collections, collection_key)
-    try:
-        display_filename = validate_pdf_filename(filename)
-    except InvalidFilenameError as exc:
-        raise ServiceError(
-            str(exc),
-            status=422,
-            code="invalid-filename",
-            title="Filename was rejected",
-        ) from exc
-    if content_type and content_type.casefold() not in {
-        "application/pdf",
-        "application/octet-stream",
-    }:
-        raise ServiceError(
-            "The upload must use the application/pdf content type.",
-            status=422,
-            code="invalid-content-type",
-            title="File type was rejected",
+    collection = configured_collection(settings.collections, collection_key)
+    display_filename = validate_pdf_filename(filename)
+    if content_type is not None and content_type.casefold() != "application/pdf":
+        raise LifecycleError(
+            "unsupported_media_type",
+            "The upload must use the application/pdf media type.",
+            status=415,
         )
-
     layout = StorageLayout.from_root(settings.storage_root)
     staged = stream_upload(
         file,
@@ -155,146 +117,227 @@ def prepare_upload(
         chunk_bytes=settings.upload_chunk_bytes,
     )
     try:
-        scan_result = scanner(staged.path)
+        scan = scanner(staged.path)
+        if scan.state == ScanState.INFECTED:
+            raise LifecycleError(
+                "malware_detected", "The upload was rejected by malware screening.", status=422
+            )
+        if scan.state != ScanState.CLEAN:
+            raise LifecycleError(
+                "scanner_incomplete",
+                "Malware screening did not produce a clean result.",
+                status=503,
+                retryable=True,
+            )
     except Exception:
         staged.path.unlink(missing_ok=True)
         raise
-    return PreparedUpload(
+    return PreparedAdmission(
         staged=staged,
         layout=layout,
-        display_filename=display_filename,
-        collection_key=collection_key,
-        scan_result=scan_result,
+        filename=display_filename,
+        normalized_filename=normalize_filename(display_filename),
+        collection=collection,
+        scan=scan,
     )
 
 
-def register_upload(
+def discard_prepared_admission(prepared: PreparedAdmission) -> None:
+    prepared.staged.path.unlink(missing_ok=True)
+
+
+def _find_exact_duplicate(
     session: Session,
     *,
-    prepared: PreparedUpload,
+    collection_key: str,
+    sha256: str,
+) -> Document | None:
+    return session.scalar(
+        select(Document)
+        .where(
+            Document.collection_key == collection_key,
+            Document.sha256 == sha256,
+            Document.state.not_in(TERMINAL_DOCUMENT_STATES),
+        )
+        .order_by(Document.created_at.asc())
+    )
+
+
+def admission_response(document: Document, operation: WorkOperation) -> dict[str, object]:
+    """Build the exact stable response snapshot stored for idempotent replay."""
+
+    response = upload_accepted_response(document, operation)
+    return response.model_dump(mode="json")
+
+
+def register_admission(
+    session: Session,
+    *,
+    prepared: PreparedAdmission,
     idempotency_key: str,
     actor_type: str,
     actor_id: str,
-) -> UploadRegistration:
-    """Apply the catalog mutation for a prepared upload without committing it."""
+) -> AdmissionOutcome | IdempotencyReplay:
+    """Promote clean bytes and atomically register PREFLIGHTING + operation."""
 
-    return register_staged_upload(
+    request = {
+        "collection_key": prepared.collection.key,
+        "filename": prepared.filename,
+        "size_bytes": prepared.staged.size_bytes,
+        "sha256": prepared.staged.sha256,
+    }
+    idempotency = reserve_idempotency(
         session,
-        staged=prepared.staged,
-        layout=prepared.layout,
-        filename=prepared.display_filename,
-        collection_key=prepared.collection_key,
-        idempotency_key=idempotency_key,
-        actor_type=actor_type,
+        key=idempotency_key,
+        action="upload_document",
         actor_id=actor_id,
-        scan_result=prepared.scan_result,
+        request_material=request,
     )
+    if isinstance(idempotency, IdempotencyReplay):
+        discard_prepared_admission(prepared)
+        return idempotency
+
+    duplicate = _find_exact_duplicate(
+        session,
+        collection_key=prepared.collection.key,
+        sha256=prepared.staged.sha256,
+    )
+    if duplicate is not None:
+        discard_prepared_admission(prepared)
+        raise LifecycleError(
+            "exact_duplicate",
+            "The same PDF bytes are already retained in this collection.",
+            extra={"existing_document_id": str(duplicate.id)},
+        )
+
+    document = Document(
+        id=uuid.uuid4(),
+        collection_key=prepared.collection.key,
+        original_filename=prepared.filename,
+        normalized_filename=prepared.normalized_filename,
+        content_type="application/pdf",
+        size_bytes=prepared.staged.size_bytes,
+        sha256=prepared.staged.sha256,
+        state=DocumentState.PREFLIGHTING,
+        scan_state=prepared.scan.state,
+        scan_engine=prepared.scan.engine,
+        scan_signature=prepared.scan.signature,
+        scanned_at=prepared.scan.scanned_at,
+        created_by=actor_id,
+    )
+    promoted: PromotedFile | None = None
+    try:
+        promoted = promote_staged_file(prepared.staged, prepared.layout, document.id)
+        document.storage_key = promoted.storage_key
+        session.add(document)
+        session.flush()
+        operation = enqueue_operation(
+            session,
+            document=document,
+            operation_type=OperationType.PREFLIGHT,
+            priority=OperationPriority.NORMAL,
+            idempotency_record_id=idempotency.id,
+        )
+        body = admission_response(document, operation)
+        complete_idempotency(
+            idempotency,
+            status=202,
+            body=body,
+            resource_type="document",
+            resource_id=document.id,
+        )
+        audit(
+            session,
+            event_type="document_admitted",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            document_id=document.id,
+            operation_id=operation.id,
+            details={"collection_key": document.collection_key},
+        )
+        return AdmissionOutcome(
+            document=document,
+            operation=operation,
+            promoted=promoted,
+            response_body=body,
+        )
+    except Exception:
+        if promoted is not None:
+            promoted.path.unlink(missing_ok=True)
+        else:
+            discard_prepared_admission(prepared)
+        raise
 
 
-def discard_promoted_upload(registration: UploadRegistration | None) -> None:
-    """Remove canonical bytes promoted by an upload whose transaction failed."""
+def compensate_failed_commit(outcome: AdmissionOutcome) -> None:
+    """Remove promoted bytes if the surrounding catalog commit fails."""
 
-    if registration is None or registration.promoted is None:
-        return
-    registration.promoted.path.unlink(missing_ok=True)
+    outcome.promoted.path.unlink(missing_ok=True)
 
 
-def resolve_idempotency_conflict(
+def filename_advisory(
     session: Session,
     *,
-    prepared: PreparedUpload,
-    idempotency_key: str,
-    cause: Exception,
-) -> UploadAcceptedResponse:
-    """Resolve a commit race as an idempotent replay or a stable conflict."""
+    definitions: tuple[CollectionDefinition, ...] | list[CollectionDefinition],
+    collection_key: str,
+    filename: str,
+    limit: int = 20,
+) -> tuple[str, list[FilenameAdvisoryMatch]]:
+    """Return bounded same-collection filename-only warnings."""
 
-    existing = session.scalar(select(Document).where(Document.idempotency_key == idempotency_key))
-    if existing is None:
-        raise cause
-    if (
-        existing.sha256 != prepared.staged.sha256
-        or existing.size_bytes != prepared.staged.size_bytes
-        or existing.normalized_filename != normalize_filename(prepared.display_filename)
-        or existing.collection_key != prepared.collection_key
-    ):
-        raise LifecycleError(
-            "The idempotency key was already used for a different file.",
-            code="idempotency-key-conflict",
-        ) from cause
-    operation = next(
-        (
-            item
-            for item in sorted(
-                existing.operations, key=lambda op: (op.attempt, op.created_at), reverse=True
+    configured_collection(definitions, collection_key)
+    normalized = normalize_filename(filename)
+    incoming = profile_filename(filename)
+    documents = session.scalars(
+        select(Document)
+        .where(
+            Document.collection_key == collection_key,
+            Document.state.not_in(TERMINAL_DOCUMENT_STATES),
+        )
+        .order_by(Document.created_at.desc())
+        .limit(500)
+    ).all()
+    matches: list[FilenameAdvisoryMatch] = []
+    for document in documents:
+        match = compare_filenames(incoming, profile_filename(document.original_filename))
+        if match is None:
+            continue
+        matches.append(
+            FilenameAdvisoryMatch(
+                document_id=document.id,
+                original_filename=document.original_filename,
+                state=document.state,
+                match_type=match.kind,
+                score=match.similarity,
             )
-            if item.operation_type == OperationType.ANALYZE
-        ),
-        None,
-    )
-    if operation is None:
-        raise cause
-    return UploadAcceptedResponse(
-        upload=upload_resource(
-            existing,
-            operation=operation,
-            analysis=None,
-            replacement=None,
-            decision=None,
-        ),
-        idempotent_replay=True,
-    )
+        )
+    matches.sort(key=lambda item: (-item.score, item.original_filename.casefold()))
+    return normalized, matches[:limit]
 
 
-def upload_accepted_response(registration: UploadRegistration) -> UploadAcceptedResponse:
-    """Serialize a completed upload registration for the 202 response."""
+def source_content(
+    session: Session,
+    *,
+    document_id: uuid.UUID,
+    storage_root: Path,
+) -> SourceContent:
+    """Resolve source bytes only while the lifecycle access gate is open."""
 
-    return UploadAcceptedResponse(
-        upload=upload_resource(
-            registration.document,
-            operation=registration.operation,
-            analysis=None,
-            replacement=None,
-            decision=None,
-        ),
-        idempotent_replay=registration.idempotent_replay,
-    )
-
-
-def content(session: Session, *, document_id: UUID, storage_root: Path) -> DocumentContent:
-    """Resolve clean, retained document content from canonical storage."""
-
-    from pdf_bridge.services.intake import can_serve_content
+    from pdf_bridge.services.intake import can_serve_source
 
     document = session.get(Document, document_id)
     if document is None:
-        raise ServiceError(
-            "No catalog record exists for this document ID.",
-            status=404,
-            code="document-not-found",
-            title="Document not found",
-        )
-    if not can_serve_content(document):
-        raise ServiceError(
-            "Only retained PDFs with a clean malware scan can be opened.",
-            status=409,
-            code="content-not-available",
-            title="PDF content is not available",
-        )
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    if not can_serve_source(document):
+        status = 410 if document.state in TERMINAL_DOCUMENT_STATES else 409
+        code = "content_purged" if status == 410 else "content_blocked"
+        raise LifecycleError(code, "The source PDF is not available.", status=status)
     layout = StorageLayout.from_root(storage_root)
     path = resolve_storage_key(layout, document.storage_key or "")
     if not path.is_file():
-        raise ServiceError(
-            "The catalog and canonical storage are inconsistent. Contact the operator.",
+        raise LifecycleError(
+            "stored_file_missing",
+            "The catalog source object is unavailable.",
             status=500,
-            code="stored-file-missing",
-            title="Stored PDF is missing",
         )
-    return DocumentContent(path=path, filename=document.original_filename)
-
-
-def duplicate_error_extra(exc: LifecycleError) -> dict | None:
-    """Serialize duplicate-specific lifecycle details for the HTTP error contract."""
-
-    if isinstance(exc, DuplicateDocumentError):
-        return {"duplicate": duplicate_match(exc.document).model_dump(mode="json")}
-    return None
+    return SourceContent(path=path, filename=document.original_filename)

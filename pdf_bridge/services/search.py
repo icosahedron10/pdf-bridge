@@ -1,4 +1,4 @@
-"""Typed, deliberately narrow integration with the external retrieval API."""
+"""Strict operator-only proxy for the separately owned retrieval service."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import httpx
 from pydantic import ValidationError
 
-from pdf_bridge.contracts.schemas import SearchRequest, SearchResponse
+from pdf_bridge.contracts.schemas import OperatorSearchRequest, OperatorSearchResponse
 from pdf_bridge.core.config import Settings
 from pdf_bridge.services.errors import ServiceError
 
@@ -16,88 +16,80 @@ MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024
 
 def search_retrieval(
     settings: Settings,
-    request: SearchRequest,
+    request: OperatorSearchRequest,
     *,
     client: httpx.Client,
-) -> SearchResponse:
-    """Call retrieval and strictly correlate its bounded response to the request.
+) -> OperatorSearchResponse:
+    """Forward one bounded collection-scoped query and validate its wire result."""
 
-    The client is owned by the caller: the application lifespan provides one
-    shared instance, and tests may inject their own.
-    """
-
-    configured = {collection.key for collection in settings.collections}
-    unknown = [key for key in request.collections if key not in configured]
-    if unknown:
+    definition = next(
+        (
+            collection
+            for collection in settings.collections
+            if collection.key == request.collection_key and collection.enabled
+        ),
+        None,
+    )
+    if definition is None:
         raise ServiceError(
-            "Search may use only collections configured for this deployment.",
-            status=422,
-            code="collection-not-configured",
-            title="Search collection was rejected",
+            "The requested collection is not available.",
+            status=404,
+            code="collection_not_found",
+            title="Collection not found",
         )
-    if not settings.search_api_url:
+    if settings.search_api_url is None or settings.search_api_token is None:
         raise ServiceError(
-            "Browsing remains available, but the retrieval search endpoint is not configured.",
+            "The operator retrieval integration is not configured.",
             status=503,
-            code="search-not-configured",
-            title="Search is not configured",
+            code="search_not_configured",
+            title="Search is unavailable",
         )
 
-    headers = {"Accept": "application/json"}
-    if settings.search_api_token:
-        headers["Authorization"] = f"Bearer {settings.search_api_token.get_secret_value()}"
-
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {settings.search_api_token.get_secret_value()}",
+    }
     try:
         with client.stream(
             "POST",
             f"{settings.search_api_url.rstrip('/')}/search",
             json=request.model_dump(mode="json"),
             headers=headers,
+            timeout=settings.search_api_timeout_seconds,
         ) as response:
             response.raise_for_status()
             body = bytearray()
             for chunk in response.iter_bytes():
                 body.extend(chunk)
                 if len(body) > MAX_SEARCH_RESPONSE_BYTES:
-                    raise ValueError("retrieval response exceeded the configured limit")
-        result = SearchResponse.model_validate(json.loads(body))
-        expected_groups = set(request.collections)
-        actual_groups = {group.collection_key for group in result.groups}
-        if request.include_hits:
-            offset = (request.page - 1) * request.page_size
-            invalid_hits = any(
-                len(group.hits) != min(request.page_size, max(group.total - offset, 0))
-                for group in result.groups
-            )
-        else:
-            invalid_hits = any(group.hits for group in result.groups)
+                    raise ValueError("retrieval response exceeded the safety limit")
+        result = OperatorSearchResponse.model_validate(json.loads(body))
         if (
-            result.query != request.query
-            or result.mode != request.mode
-            or actual_groups != expected_groups
-            or len(result.groups) != len(request.collections)
-            or invalid_hits
+            result.collection_key != request.collection_key
+            or result.query != request.query
+            or result.mode is not request.mode
+            or len(result.results) > request.limit
         ):
             raise ValueError("retrieval response did not correlate to its request")
         return result
     except httpx.RequestError as exc:
         raise ServiceError(
-            "The retrieval service could not be reached. No fallback search was used.",
+            "The retrieval service could not be reached; no fallback was used.",
             status=503,
-            code="search-unavailable",
-            title="Search is temporarily unavailable",
+            code="search_unavailable",
+            title="Search is unavailable",
         ) from exc
     except httpx.HTTPStatusError as exc:
         raise ServiceError(
-            "The retrieval service rejected the request. No fallback search was used.",
+            "The retrieval service rejected the query; no fallback was used.",
             status=502,
-            code="search-upstream-error",
-            title="Search service returned an error",
+            code="search_upstream_error",
+            title="Search upstream failed",
         ) from exc
-    except (ValueError, ValidationError) as exc:
+    except (ValueError, ValidationError, UnicodeDecodeError) as exc:
         raise ServiceError(
-            "The retrieval service returned data that did not match the configured contract.",
+            "The retrieval service returned an invalid response.",
             status=502,
-            code="search-invalid-response",
+            code="search_invalid_response",
             title="Search response was invalid",
         ) from exc

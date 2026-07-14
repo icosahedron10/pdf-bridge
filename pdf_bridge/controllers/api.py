@@ -1,11 +1,12 @@
-"""Human-facing typed JSON HTTP controller."""
+"""Strict JSON and content transport for the sole API v2 surface."""
 
 from __future__ import annotations
 
 import copy
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal
-from uuid import UUID
+from typing import Annotated
 
 from litestar import Request, Router, delete, get, post
 from litestar.datastructures import UploadFile
@@ -13,93 +14,307 @@ from litestar.di import NamedDependency, Provide
 from litestar.enums import RequestEncodingType
 from litestar.openapi.datastructures import ResponseSpec
 from litestar.openapi.spec import Operation, RequestBody
-from litestar.params import (
-    Body,
-    FromPath,
-    FromQuery,
-    HeaderParameter,
-    JSONBody,
-    MultipartBody,
-    QueryParameter,
-)
+from litestar.params import Body, FromPath, FromQuery, JSONBody, MultipartBody, QueryParameter
 from litestar.response import File, Response
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from pdf_bridge.contracts.schemas import (
-    AnalysisDetailResponse,
+    ChunkListResponse,
+    CollectionDetail,
     CollectionListResponse,
+    CollectionPhysicalTarget,
     DecisionRequest,
-    DeleteDocumentRequest,
     DocumentDetail,
     DocumentListResponse,
-    DocumentMutationResponse,
+    EventListResponse,
     HealthResponse,
-    SearchRequest,
-    SearchResponse,
+    HistoryResponse,
+    MarkdownDocument,
+    MutationResponse,
+    NameCheckRequest,
+    NameCheckResponse,
+    OperationDetail,
+    OperationMetricsResponse,
+    OperatorSearchRequest,
+    OperatorSearchResponse,
+    PreflightResponse,
+    RetryRequest,
+    SanitizedFailure,
     UploadAcceptedResponse,
-    UploadListResponse,
-    UploadPreflightRequest,
-    UploadPreflightResponse,
-    UploadResource,
 )
 from pdf_bridge.http.problems import ProblemError, problem_responses
-from pdf_bridge.http.security import Actor, get_actor, require_csrf
+from pdf_bridge.http.security import (
+    Actor,
+    csrf_token,
+    get_actor,
+    require_csrf,
+    require_idempotency_key,
+)
 from pdf_bridge.managers import catalog, document, health, search
-from pdf_bridge.persistence.models import DocumentState
-from pdf_bridge.services.document import duplicate_error_extra
-from pdf_bridge.services.document import preflight_upload as run_preflight
+from pdf_bridge.persistence.models import (
+    Document,
+    DocumentState,
+    TerminalDisposition,
+    WorkOperation,
+)
+from pdf_bridge.presentation.api_serializers import SerializationError
+from pdf_bridge.services import document as document_service
 from pdf_bridge.services.errors import ServiceError
 from pdf_bridge.services.intake import LifecycleError
 from pdf_bridge.services.scanner import ScannerError, clamd_ping
-from pdf_bridge.services.storage import FileTooLargeError, InvalidPdfError
+from pdf_bridge.services.storage import (
+    FileTooLargeError,
+    InvalidFilenameError,
+    InvalidPdfError,
+    StorageError,
+)
+from pdf_bridge.services.vector_index import (
+    INDEX_SCHEMA_VERSION,
+    VectorIndexSchemaError,
+    VectorIndexUnavailableError,
+    validate_collection_schema,
+)
 
 
-@dataclass(slots=True)
-class UploadForm:
-    """Multipart upload contract with the public form field names."""
+class UploadForm(BaseModel):
+    """The upload route accepts exactly one multipart field named ``file``."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     file: UploadFile
-    collection_key: str
-    idempotency_key: str | None = None
 
 
 @dataclass
 class OptionalRequestBodyOperation(Operation):
-    """Correct Litestar 2.24's always-required OpenAPI request-body flag."""
+    """Mark an optional strict JSON body correctly in generated OpenAPI."""
 
     def __post_init__(self) -> None:
         if isinstance(self.request_body, RequestBody):
             self.request_body.required = False
 
 
-_BROWSER_ACTOR_DEPENDENCIES = {"_actor": Provide(get_actor, sync_to_thread=False)}
-_CSRF_ACTOR_DEPENDENCIES = {"actor": Provide(require_csrf)}
-_CSRF_CHECK_DEPENDENCIES = {"_actor": Provide(require_csrf)}
+_READ_DEPENDENCIES = {"_actor": Provide(get_actor, sync_to_thread=False)}
+_CSRF_DEPENDENCIES = {"actor": Provide(require_csrf)}
+_MUTATION_DEPENDENCIES = {
+    "actor": Provide(require_csrf),
+    "idempotency_key": Provide(require_idempotency_key, sync_to_thread=False),
+}
 
 
-def _lifecycle_problem(exc: LifecycleError) -> ProblemError:
-    return ProblemError(
-        status=exc.status,
-        code=exc.code,
-        title="Document operation was rejected",
-        detail=str(exc),
-        extra=duplicate_error_extra(exc),
+def _problem(exc: Exception) -> ProblemError:
+    if isinstance(exc, LifecycleError):
+        existing_document_id = (
+            exc.extra.get("existing_document_id")
+            if exc.code == "exact_duplicate"
+            else None
+        )
+        return ProblemError(
+            status=exc.status,
+            code=exc.code,
+            detail=exc.message,
+            retryable=exc.retryable,
+            existing_document_id=existing_document_id,
+        )
+    if isinstance(exc, ServiceError):
+        return ProblemError(
+            status=exc.status,
+            code=exc.code,
+            detail=str(exc),
+            retryable=exc.status == 503,
+        )
+    if isinstance(exc, FileTooLargeError):
+        return ProblemError(
+            status=413,
+            code="upload_too_large",
+            detail="The PDF exceeds the configured upload size limit.",
+        )
+    if isinstance(exc, InvalidPdfError):
+        return ProblemError(
+            status=422,
+            code="invalid_pdf",
+            detail="The uploaded file is not a valid PDF.",
+        )
+    if isinstance(exc, InvalidFilenameError):
+        return ProblemError(
+            status=422,
+            code="invalid_filename",
+            detail="The filename is not a valid PDF display name.",
+        )
+    if isinstance(exc, ScannerError):
+        return ProblemError(
+            status=503,
+            code="scanner_unavailable",
+            detail="Malware screening could not be completed.",
+            retryable=True,
+        )
+    if isinstance(exc, StorageError):
+        return ProblemError(
+            status=500,
+            code="storage_failure",
+            detail="Canonical storage could not complete the request.",
+        )
+    if isinstance(exc, SerializationError):
+        return ProblemError(
+            status=500,
+            code="catalog_serialization_failed",
+            detail="Catalog data could not be represented safely.",
+        )
+    raise TypeError("unsupported deliberate transport failure")
+
+
+_TRANSPORT_ERRORS = (
+    LifecycleError,
+    ServiceError,
+    ScannerError,
+    StorageError,
+    SerializationError,
+)
+
+
+def _qdrant_client(request: Request):
+    providers = getattr(request.app.state, "worker_providers", None)
+    if providers is None:
+        worker = getattr(request.app.state, "worker", None)
+        providers = getattr(worker, "providers", None)
+    return getattr(providers, "qdrant", None)
+
+
+def _require_visible_document(
+    request: Request,
+    session: Session,
+    document_id: uuid.UUID,
+) -> None:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    try:
+        document_service.configured_collection(
+            list(request.app.state.settings.collections), document.collection_key
+        )
+    except LifecycleError as exc:
+        raise LifecycleError(
+            "document_not_found", "The document was not found.", status=404
+        ) from exc
+
+
+def _require_visible_operation(
+    request: Request,
+    session: Session,
+    operation_id: uuid.UUID,
+) -> None:
+    operation = session.get(WorkOperation, operation_id)
+    if operation is not None:
+        _require_visible_document(request, session, operation.document_id)
+
+
+def _collection_target(request: Request, key: str) -> CollectionPhysicalTarget:
+    definition = document_service.configured_collection(
+        list(request.app.state.settings.collections), key
+    )
+    client = _qdrant_client(request)
+    failure: SanitizedFailure | None = None
+    compatible = False
+    if client is None:
+        failure = SanitizedFailure(
+            code="qdrant_unavailable",
+            message="The fixed Qdrant target is unavailable.",
+            retryable=True,
+        )
+    else:
+        try:
+            validate_collection_schema(client, definition.qdrant_collection_name)
+            compatible = True
+        except VectorIndexSchemaError:
+            failure = SanitizedFailure(
+                code="qdrant_schema_incompatible",
+                message="The fixed Qdrant target has an incompatible schema.",
+                retryable=False,
+            )
+        except VectorIndexUnavailableError:
+            failure = SanitizedFailure(
+                code="qdrant_unavailable",
+                message="The fixed Qdrant target is unavailable.",
+                retryable=True,
+            )
+    return CollectionPhysicalTarget(
+        qdrant_collection_name=definition.qdrant_collection_name,
+        schema_version=INDEX_SCHEMA_VERSION,
+        schema_compatible=compatible,
+        failure=failure,
     )
 
 
-def _service_problem(exc: ServiceError) -> ProblemError:
-    return ProblemError(
-        status=exc.status,
-        code=exc.code,
-        title=exc.title,
-        detail=str(exc),
-        extra=exc.extra,
+def _worker_checks(
+    request: Request,
+) -> Mapping[str, tuple[bool, str | None]] | None:
+    worker = getattr(request.app.state, "worker", None)
+    checker = getattr(worker, "readiness_checks", None)
+    if checker is None:
+        return None
+    try:
+        result = checker()
+    except Exception:
+        return {"worker": (False, "worker_readiness_failed")}
+    if not isinstance(result, Mapping):
+        return {"worker": (False, "worker_readiness_invalid")}
+    return result
+
+
+def _health_response(result: HealthResponse) -> Response[HealthResponse]:
+    return Response(
+        content=result,
+        status_code=200 if result.status == "OK" else 503,
+        headers={"Cache-Control": "no-store"},
     )
+
+
+def _authenticated_response(request: Request, content):
+    """Attach the stable browser CSRF token to every authenticated GET."""
+
+    return Response(
+        content=content,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-CSRF-Token": csrf_token(request),
+        },
+    )
+
+
+def _health_responses() -> dict[int, ResponseSpec]:
+    return {
+        **problem_responses(),
+        503: ResponseSpec(
+            data_container=HealthResponse,
+            description="A required dependency is not ready",
+            generate_examples=False,
+        ),
+    }
+
+
+@get("/health/live", responses=problem_responses(), sync_to_thread=False)
+def live() -> HealthResponse:
+    """Report process liveness without probing dependencies."""
+
+    return health.live()
+
+
+@get("/health/ready", responses=_health_responses(), sync_to_thread=True)
+def ready(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
+    """Report catalog, storage, scanner, worker, model, and Qdrant readiness."""
+
+    result = health.ready(
+        request.app.state.settings,
+        db,
+        scanner_probe=clamd_ping,
+        provider_checks=_worker_checks(request),
+    )
+    return _health_response(result)
 
 
 @get(
     "/collections",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    dependencies=_READ_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
@@ -107,151 +322,127 @@ def list_collections(
     request: Request,
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-) -> CollectionListResponse:
-    """List configured collections with live catalog counts."""
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 50,
+) -> Response[CollectionListResponse]:
+    """Initialize the browser session and list configured logical collections."""
 
-    return catalog.list_collections(
-        db,
-        request.app.state.settings.collections,
-    )
+    try:
+        result = catalog.list_collections(
+            db,
+            request.app.state.settings.collections,
+            cursor=cursor,
+            limit=limit,
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
 
 
 @get(
-    "/documents",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    "/collections/{key:str}",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_collection(
+    request: Request,
+    key: FromPath[str],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> Response[CollectionDetail]:
+    """Return configured metadata and read-only fixed-target status."""
+
+    try:
+        result = catalog.get_collection(
+            db,
+            request.app.state.settings.collections,
+            key,
+            target=_collection_target(request, key),
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@get(
+    "/collections/{key:str}/documents",
+    dependencies=_READ_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
 def list_documents(
     request: Request,
+    key: FromPath[str],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-    document_scope: Annotated[
-        Literal["library", "queue", "all"], QueryParameter(name="scope")
-    ] = "all",
-    document_state: Annotated[DocumentState | None, QueryParameter(name="state")] = None,
-    collection_key: FromQuery[str | None] = None,
-    page: Annotated[int, QueryParameter(ge=1)] = 1,
-    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
-) -> DocumentListResponse:
-    """List documents filtered by lifecycle scope and collection."""
+    document_state: Annotated[
+        DocumentState | None, QueryParameter(name="state")
+    ] = None,
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 50,
+) -> Response[DocumentListResponse]:
+    """Return current nonterminal documents in one configured collection."""
 
     try:
-        return catalog.list_documents(
+        result = catalog.list_documents(
             db,
             definitions=request.app.state.settings.collections,
-            document_scope=document_scope,
-            document_state=document_state,
-            collection_key=collection_key,
-            page=page,
-            page_size=page_size,
+            collection_key=key,
+            state=document_state,
+            cursor=cursor,
+            limit=limit,
         )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
-
-
-@get(
-    "/documents/{document_id:uuid}",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
-    responses=problem_responses(),
-    sync_to_thread=True,
-)
-def get_document(
-    document_id: FromPath[UUID],
-    _actor: NamedDependency[Actor],
-    db: NamedDependency[Session],
-) -> DocumentDetail:
-    """Return one document with its analysis, decision, and audit history."""
-
-    try:
-        return catalog.get_document(db, document_id)
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
-
-
-@get(
-    "/documents/{document_id:uuid}/content",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
-    media_type="application/pdf",
-    responses=problem_responses(),
-    sync_to_thread=True,
-)
-def document_content(
-    request: Request,
-    document_id: FromPath[UUID],
-    _actor: NamedDependency[Actor],
-    db: NamedDependency[Session],
-) -> File:
-    """Serve a clean, available PDF inline from canonical storage."""
-
-    from pdf_bridge.services import document as document_service
-
-    try:
-        result = document_service.content(
-            db,
-            document_id=document_id,
-            storage_root=request.app.state.settings.storage_root,
-        )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
-    return File(
-        result.path,
-        media_type="application/pdf",
-        filename=result.filename,
-        content_disposition_type="inline",
-        headers={
-            "Cache-Control": "private, no-store",
-            "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'self'",
-        },
-    )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
 
 
 @post(
-    "/uploads/preflight",
-    dependencies=_CSRF_CHECK_DEPENDENCIES,
-    status_code=200,
+    "/collections/{key:str}/name-check",
+    dependencies=_CSRF_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def upload_preflight(
+def name_check(
     request: Request,
-    data: JSONBody[UploadPreflightRequest],
-    _actor: NamedDependency[Actor],
+    key: FromPath[str],
+    data: JSONBody[NameCheckRequest],
+    actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-) -> UploadPreflightResponse:
-    """Validate upload metadata and surface typed advisory filename warnings."""
+) -> NameCheckResponse:
+    """Return a filename-only advisory before upload."""
 
+    del actor
     try:
-        return run_preflight(
+        return document.name_check(
             db,
-            definitions=request.app.state.settings.collections,
+            settings=request.app.state.settings,
+            collection_key=key,
             filename=data.filename,
-            size_bytes=data.size_bytes,
-            collection_key=data.collection_key,
         )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
 
 
 @post(
-    "/uploads",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
+    "/collections/{key:str}/documents",
+    dependencies=_MUTATION_DEPENDENCIES,
     status_code=202,
     responses=problem_responses(),
     sync_to_thread=True,
 )
 def upload_document(
     request: Request,
+    key: FromPath[str],
     data: MultipartBody[UploadForm],
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-    header_idempotency_key: Annotated[str | None, HeaderParameter(name="Idempotency-Key")] = None,
+    idempotency_key: NamedDependency[str],
 ) -> UploadAcceptedResponse:
-    """Scan and register a PDF, then queue its analysis immediately."""
+    """Stream, scan, durably admit, and enqueue exactly one PDF."""
 
     try:
-        # Litestar rewinds the spooled multipart part before the handler runs,
-        # so its plain synchronous file object streams from the beginning.
         return document.upload_document(
             db,
             settings=request.app.state.settings,
@@ -261,358 +452,421 @@ def upload_document(
             file=data.file.file,
             filename=data.file.filename or "",
             content_type=data.file.content_type,
-            collection_key=data.collection_key,
-            header_idempotency_key=header_idempotency_key,
-            form_idempotency_key=data.idempotency_key,
+            collection_key=key,
+            idempotency_key=idempotency_key,
             actor_type=actor.kind,
             actor_id=actor.identifier,
         )
-    except (FileTooLargeError, InvalidPdfError) as exc:
-        raise ProblemError(
-            status=413 if isinstance(exc, FileTooLargeError) else 422,
-            code="upload-too-large" if isinstance(exc, FileTooLargeError) else "invalid-pdf",
-            title="PDF upload was rejected",
-            detail=str(exc),
-        ) from exc
-    except ScannerError as exc:
-        raise ProblemError(
-            status=503,
-            code="scanner-unavailable",
-            title="Malware scan could not be completed",
-            detail="The upload was not queued. Retry after ClamAV is healthy.",
-        ) from exc
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
     finally:
         data.file.file.close()
 
 
 @get(
-    "/uploads",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    "/documents/{document_id:uuid}",
+    dependencies=_READ_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def list_uploads(
+def get_document(
     request: Request,
+    document_id: FromPath[uuid.UUID],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-    open_only: Annotated[bool, QueryParameter(name="open")] = False,
-    collection_key: FromQuery[str | None] = None,
-    page: Annotated[int, QueryParameter(ge=1)] = 1,
-    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
-) -> UploadListResponse:
-    """List durable upload work so a browser can restore its workspace."""
+) -> Response[DocumentDetail]:
+    """Return one composed immutable metadata and lifecycle view."""
 
     try:
-        return catalog.list_uploads(
+        _require_visible_document(request, db, document_id)
+        result = catalog.get_document(db, document_id)
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@get(
+    "/documents/{document_id:uuid}/source",
+    dependencies=_READ_DEPENDENCIES,
+    media_type="application/pdf",
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_source(
+    request: Request,
+    document_id: FromPath[uuid.UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> File:
+    """Serve a retained clean source PDF inline and without caching."""
+
+    try:
+        _require_visible_document(request, db, document_id)
+        result = document_service.source_content(
             db,
-            definitions=request.app.state.settings.collections,
-            open_only=open_only,
-            collection_key=collection_key,
-            page=page,
-            page_size=page_size,
+            document_id=document_id,
+            storage_root=request.app.state.settings.storage_root,
         )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return File(
+        path=result.path,
+        media_type="application/pdf",
+        filename=result.filename,
+        content_disposition_type="inline",
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'self'",
+            "X-Content-Type-Options": "nosniff",
+            "X-CSRF-Token": csrf_token(request),
+        },
+    )
 
 
 @get(
-    "/uploads/{upload_id:uuid}",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    "/documents/{document_id:uuid}/markdown",
+    dependencies=_READ_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def get_upload(
-    upload_id: FromPath[UUID],
+def get_markdown(
+    request: Request,
+    document_id: FromPath[uuid.UUID],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-) -> UploadResource:
-    """Return one upload's durable status, phase, and analysis summary."""
+) -> Response[MarkdownDocument]:
+    """Return validated canonical Markdown and exact page provenance as JSON."""
 
     try:
-        return catalog.get_upload(db, upload_id)
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+        _require_visible_document(request, db, document_id)
+        result = catalog.get_markdown(db, document_id)
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
 
 
 @get(
-    "/uploads/{upload_id:uuid}/analysis",
-    dependencies=_BROWSER_ACTOR_DEPENDENCIES,
+    "/documents/{document_id:uuid}/chunks",
+    dependencies=_READ_DEPENDENCIES,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def get_upload_analysis(
-    upload_id: FromPath[UUID],
+def list_chunks(
+    request: Request,
+    document_id: FromPath[uuid.UUID],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-    page: Annotated[int, QueryParameter(ge=1)] = 1,
-    page_size: Annotated[int, QueryParameter(ge=1, le=100)] = 10,
-) -> AnalysisDetailResponse:
-    """Return paginated candidate evidence for the current analysis."""
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 50,
+) -> Response[ChunkListResponse]:
+    """Return one revision-bound public chunk page without numeric vectors."""
 
     try:
-        return catalog.get_upload_analysis(
-            db, upload_id=upload_id, page=page, page_size=page_size
+        _require_visible_document(request, db, document_id)
+        result = catalog.list_chunks(
+            db,
+            document_id=document_id,
+            cursor=cursor,
+            limit=limit,
         )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@get(
+    "/documents/{document_id:uuid}/preflight",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_preflight(
+    request: Request,
+    document_id: FromPath[uuid.UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 25,
+) -> Response[PreflightResponse]:
+    """Return retained revision completeness and bounded candidate evidence."""
+
+    try:
+        _require_visible_document(request, db, document_id)
+        result = catalog.get_preflight(
+            db,
+            document_id=document_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
 
 
 @post(
-    "/uploads/{upload_id:uuid}/decision",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=200,
+    "/documents/{document_id:uuid}/decision",
+    dependencies=_MUTATION_DEPENDENCIES,
+    status_code=202,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def decide_upload(
+def decide_document(
     request: Request,
-    upload_id: FromPath[UUID],
+    document_id: FromPath[uuid.UUID],
     data: JSONBody[DecisionRequest],
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-    idempotency_key: Annotated[str | None, HeaderParameter(name="Idempotency-Key")] = None,
-) -> DocumentMutationResponse:
-    """Record an explicit Keep, Replace, or Cancel review decision."""
+    idempotency_key: NamedDependency[str],
+) -> MutationResponse:
+    """Record Keep, Replace, or Cancel against one exact revision."""
 
     try:
-        return document.decide_upload(
+        return document.decide_document(
             db,
+            settings=request.app.state.settings,
             transition_lock=request.app.state.transition_lock,
             worker=getattr(request.app.state, "worker", None),
-            upload_id=upload_id,
+            document_id=document_id,
             request=data,
-            idempotency_key=idempotency_key or "",
+            idempotency_key=idempotency_key,
             actor_type=actor.kind,
             actor_id=actor.identifier,
         )
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
 
 
 @post(
-    "/uploads/{upload_id:uuid}/retry",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=200,
-    responses=problem_responses(),
-    sync_to_thread=True,
-)
-def retry_upload(
-    request: Request,
-    upload_id: FromPath[UUID],
-    actor: NamedDependency[Actor],
-    db: NamedDependency[Session],
-) -> DocumentMutationResponse:
-    """Queue a new attempt for retained work whose last attempt failed."""
-
-    try:
-        return document.retry_upload(
-            db,
-            transition_lock=request.app.state.transition_lock,
-            worker=getattr(request.app.state, "worker", None),
-            upload_id=upload_id,
-            actor_type=actor.kind,
-            actor_id=actor.identifier,
-        )
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
-
-
-@delete(
-    "/uploads/{upload_id:uuid}",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=200,
-    responses=problem_responses(),
-    sync_to_thread=True,
-)
-def cancel_upload(
-    request: Request,
-    upload_id: FromPath[UUID],
-    actor: NamedDependency[Actor],
-    db: NamedDependency[Session],
-) -> DocumentMutationResponse:
-    """Cancel unpublished work and remove everything retained for it."""
-
-    try:
-        return document.cancel_upload(
-            db,
-            transition_lock=request.app.state.transition_lock,
-            worker=getattr(request.app.state, "worker", None),
-            upload_id=upload_id,
-            actor_type=actor.kind,
-            actor_id=actor.identifier,
-        )
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
-
-
-@post(
-    "/documents/{document_id:uuid}/deletion",
-    dependencies=_CSRF_ACTOR_DEPENDENCIES,
-    status_code=200,
+    "/documents/{document_id:uuid}/retry",
+    dependencies=_MUTATION_DEPENDENCIES,
+    status_code=202,
     responses=problem_responses(),
     sync_to_thread=True,
     operation_class=OptionalRequestBodyOperation,
 )
-def request_document_deletion(
+def retry_document(
     request: Request,
-    document_id: FromPath[UUID],
+    document_id: FromPath[uuid.UUID],
     actor: NamedDependency[Actor],
     db: NamedDependency[Session],
+    idempotency_key: NamedDependency[str],
     data: Annotated[
-        DeleteDocumentRequest | None,
+        RetryRequest | None,
         Body(media_type=RequestEncodingType.JSON),
     ] = None,
-) -> DocumentMutationResponse:
-    """Queue deletion of an eligible catalog document."""
+) -> MutationResponse:
+    """Resume the exact durable failed checkpoint without mutable input."""
 
+    del data
     try:
-        return document.request_deletion(
+        return document.retry_document(
             db,
             transition_lock=request.app.state.transition_lock,
             worker=getattr(request.app.state, "worker", None),
             document_id=document_id,
+            idempotency_key=idempotency_key,
             actor_type=actor.kind,
             actor_id=actor.identifier,
-            reason=data.reason if data else None,
         )
-    except LifecycleError as exc:
-        raise _lifecycle_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
 
 
-@post(
-    "/search",
-    dependencies=_CSRF_CHECK_DEPENDENCIES,
-    status_code=200,
+@delete(
+    "/documents/{document_id:uuid}",
+    dependencies=_MUTATION_DEPENDENCIES,
+    status_code=202,
     responses=problem_responses(),
     sync_to_thread=True,
 )
-def search_documents(
+def delete_document(
     request: Request,
-    data: JSONBody[SearchRequest],
+    document_id: FromPath[uuid.UUID],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    idempotency_key: NamedDependency[str],
+) -> MutationResponse:
+    """Block reads and queue high-priority verified deletion."""
+
+    try:
+        return document.delete_document(
+            db,
+            settings=request.app.state.settings,
+            transition_lock=request.app.state.transition_lock,
+            worker=getattr(request.app.state, "worker", None),
+            document_id=document_id,
+            idempotency_key=idempotency_key,
+            actor_type=actor.kind,
+            actor_id=actor.identifier,
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+
+
+@get(
+    "/documents/{document_id:uuid}/events",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def list_events(
+    request: Request,
+    document_id: FromPath[uuid.UUID],
     _actor: NamedDependency[Actor],
     db: NamedDependency[Session],
-) -> SearchResponse:
-    """Search configured collections through the external retrieval service.
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 50,
+) -> Response[EventListResponse]:
+    """Return a content-free page of lifecycle audit events."""
 
-    Bridge search is an operator workspace feature; chatbot authorization and
-    answer generation happen outside PDF Bridge against retrieval directly.
-    """
+    try:
+        _require_visible_document(request, db, document_id)
+        result = catalog.list_events(
+            db,
+            document_id=document_id,
+            cursor=cursor,
+            limit=limit,
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
 
+
+@get(
+    "/operations/metrics",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_operation_metrics(
+    request: Request,
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> Response[OperationMetricsResponse]:
+    """Return content-free queue depth, age, and durable phase aggregates."""
+
+    try:
+        result = catalog.operation_metrics(
+            db, definitions=request.app.state.settings.collections
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@get(
+    "/operations/{operation_id:uuid}",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def get_operation(
+    request: Request,
+    operation_id: FromPath[uuid.UUID],
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> Response[OperationDetail]:
+    """Return queue position, phase age, attempt, and sanitized failure."""
+
+    try:
+        _require_visible_operation(request, db, operation_id)
+        result = catalog.get_operation(db, operation_id)
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@get(
+    "/history",
+    dependencies=_READ_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def list_history(
+    request: Request,
+    _actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+    collection_key: FromQuery[str | None] = None,
+    disposition: FromQuery[TerminalDisposition | None] = None,
+    cursor: FromQuery[str | None] = None,
+    limit: Annotated[int, QueryParameter(ge=1, le=100)] = 50,
+) -> Response[HistoryResponse]:
+    """Return terminal content-free tombstones."""
+
+    try:
+        result = catalog.list_history(
+            db,
+            definitions=request.app.state.settings.collections,
+            collection_key=collection_key,
+            disposition=disposition,
+            cursor=cursor,
+            limit=limit,
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
+    return _authenticated_response(request, result)
+
+
+@post(
+    "/operator/search",
+    dependencies=_CSRF_DEPENDENCIES,
+    responses=problem_responses(),
+    sync_to_thread=True,
+)
+def operator_search(
+    request: Request,
+    data: JSONBody[OperatorSearchRequest],
+    actor: NamedDependency[Actor],
+    db: NamedDependency[Session],
+) -> OperatorSearchResponse:
+    """Proxy one bounded operator-only query to the configured retrieval service."""
+
+    del actor
     try:
         return search.search_documents(
             db,
             settings=request.app.state.settings,
-            definitions=request.app.state.settings.collections,
             request=data,
             client=request.app.state.search_http_client,
         )
-    except ServiceError as exc:
-        raise _service_problem(exc) from exc
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
 
 
-@get(
-    "/health/live",
-    responses=problem_responses(),
-    sync_to_thread=False,
-)
-def live() -> HealthResponse:
-    """Report that the application process is running."""
-
-    return HealthResponse(status="ok", checks={"process": "ok"})
-
-
-def _dependency_checks(request: Request, db: Session) -> dict[str, str]:
-    return health.check_dependencies(
-        request.app.state.settings,
-        db,
-        scanner_probe=clamd_ping,
-    )
-
-
-def _health_response(checks: dict[str, str]) -> Response[HealthResponse]:
-    healthy = all(value == "ok" for value in checks.values())
-    body = HealthResponse(status="ok" if healthy else "degraded", checks=checks)
-    return Response(
-        content=body,
-        status_code=200 if healthy else 503,
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-def _health_responses(description: str) -> dict[int, ResponseSpec]:
-    return {
-        **problem_responses(),
-        503: ResponseSpec(
-            data_container=HealthResponse,
-            description=description,
-            generate_examples=False,
-        ),
-    }
-
-
-@get(
-    "/health/ready",
-    responses=_health_responses("A dependency is not ready"),
-    sync_to_thread=True,
-)
-def ready(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
-    """Report whether dependencies are ready to serve application traffic."""
-
-    return _health_response(_dependency_checks(request, db))
-
-
-@get(
-    "/health/dependencies",
-    responses=_health_responses("A dependency is unavailable"),
-    sync_to_thread=True,
-)
-def dependencies(request: Request, db: NamedDependency[Session]) -> Response[HealthResponse]:
-    """Report detailed availability for each required dependency."""
-
-    return _health_response(_dependency_checks(request, db))
-
-
-_API_ROUTE_HANDLERS = (
-    list_collections,
-    list_documents,
-    get_document,
-    document_content,
-    upload_preflight,
-    list_uploads,
-    get_upload,
-    get_upload_analysis,
-    decide_upload,
-    retry_upload,
-    cancel_upload,
-    request_document_deletion,
-    search_documents,
+_NON_UPLOAD_API_ROUTE_HANDLERS = (
     live,
     ready,
-    dependencies,
+    list_collections,
+    get_collection,
+    list_documents,
+    name_check,
+    get_document,
+    get_source,
+    get_markdown,
+    list_chunks,
+    get_preflight,
+    decide_document,
+    retry_document,
+    delete_document,
+    list_events,
+    get_operation_metrics,
+    get_operation,
+    list_history,
+    operator_search,
 )
 
 
 def create_api_routers(upload_request_max_body_size: int) -> list[Router]:
-    """Build the API router with a route-specific upload envelope limit."""
+    """Build the sole v2 router with a route-specific upload body limit."""
 
     if upload_request_max_body_size <= 0:
         raise ValueError("upload_request_max_body_size must be positive")
-    # Registering two routers at the same prefix makes Litestar synthesize two
-    # OPTIONS handlers for /uploads.  The framework supports the limit at the
-    # handler level, which keeps the contract atomic and the preflight/list
-    # endpoints on their ordinary request limits.
     upload_handler = copy.copy(upload_document)
     upload_handler.request_max_body_size = upload_request_max_body_size
     return [
         Router(
-            path="/api/v1",
-            route_handlers=[*_API_ROUTE_HANDLERS, upload_handler],
-            tags=["PDF Bridge"],
+            path="/api/v2",
+            route_handlers=[*_NON_UPLOAD_API_ROUTE_HANDLERS, upload_handler],
+            tags=["PDF Bridge API v2"],
         )
     ]

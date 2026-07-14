@@ -8,6 +8,7 @@ scores are never mixed directly.
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
@@ -67,6 +68,8 @@ def reciprocal_rank_fusion(
 ) -> dict[uuid.UUID, float]:
     """Fuse ranked document lists with RRF; each list contributes 1/(k+rank)."""
 
+    if k <= 0:
+        raise ValueError("RRF k must be positive")
     scores: dict[uuid.UUID, float] = {}
     for ranking in rankings:
         seen: set[uuid.UUID] = set()
@@ -96,13 +99,32 @@ def evaluate_candidates(
     ordered by fused rank, then UUID for determinism.
     """
 
+    referenced_ids = set(filename_family_ids) | set(identical_text_ids)
+    for result_group in (*dense_results, *bm25_results):
+        for hit in result_group:
+            if hit.rank < 1:
+                raise ValueError("candidate hit ranks must be positive")
+            if not hit.chunk_id:
+                raise ValueError("candidate hit chunk IDs cannot be blank")
+            if not math.isfinite(hit.score):
+                raise ValueError("candidate hit scores must be finite")
+            referenced_ids.add(hit.document_id)
+            expected_source = sources.get(hit.document_id)
+            if expected_source is not None and expected_source != hit.source:
+                raise ValueError("candidate source evidence is inconsistent")
+    missing_sources = referenced_ids - sources.keys()
+    if missing_sources:
+        raise ValueError("every candidate document must have an explicit source")
+    if any(source not in {"active", "screening"} for source in sources.values()):
+        raise ValueError("candidate sources must be active or screening")
+
     evidence: dict[uuid.UUID, CandidateEvidence] = {}
 
     def entry(document_id: uuid.UUID) -> CandidateEvidence:
         if document_id not in evidence:
             evidence[document_id] = CandidateEvidence(
                 document_id=document_id,
-                source=sources.get(document_id, "active"),
+                source=sources[document_id],
             )
         return evidence[document_id]
 

@@ -111,3 +111,19 @@ async def require_csrf(request: Request) -> Actor:
             detail="Refresh the page and retry the action.",
         )
     return get_actor(request)
+
+
+def require_idempotency_key(request: Request) -> str:
+    """Require one bounded visible mutation key before expensive work begins."""
+
+    value = request.headers.get("idempotency-key", "")
+    if not 8 <= len(value) <= 128 or any(
+        ord(character) < 33 or ord(character) > 126 for character in value
+    ):
+        raise ProblemError(
+            status=400,
+            code="invalid_idempotency_key",
+            title="Idempotency key is invalid",
+            detail="Idempotency-Key must contain 8 to 128 visible ASCII characters.",
+        )
+    return value

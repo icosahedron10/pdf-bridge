@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "corpus_id": "pdf-bridge-evaluation-v1",
+  "license": "CC0-1.0",
+  "provenance": "Original synthetic test documents authored for PDF Bridge; no external content.",
+  "generator": {
+    "path": "tests/fixtures/evaluation/build_corpus.py",
+    "python": "3.12",
+    "reportlab": "4.4.3",
+    "deterministic_mode": "invariant metadata, uncompressed streams, built-in fonts"
+  },
+  "filename_families": [
+    {
+      "members": [
+        "employee-onboarding-handbook-v1.pdf",
+        "employee-onboarding-handbook-v2.pdf"
+      ],
+      "expected_family_key": [
+        "employee",
+        "handbook",
+        "onboarding"
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "filename": "operations-guide.pdf",
+      "sha256": "e84d476866acba919f525a72e06b5dd7959b434a7ffc869374bb2fe7dc398bca",
+      "size_bytes": 3285,
+      "license": "CC0-1.0",
+      "provenance": "Original English operations checklist generated from repository-owned fixture text.",
+      "expected": {
+        "outcome": "accept",
+        "page_count": 2,
+        "page_text_sha256": [
+          "0fbffa48ece2ba13ee6da7d16ebd6f5fd398b07cbffa89bbd66741b5f94b1c80",
+          "b007e83d14da9b4de6cae56eda4f91a585cfa5c423b2824738575dd3bbaab6e6"
+        ],
+        "page_contains": [
+          [
+            "Operations Guide",
+            "1. Confirm the package checksum",
+            "3. Record the immutable revision"
+          ],
+          [
+            "Verification",
+            "- Run the readiness probe",
+            "- Compare the expected point count"
+          ]
+        ],
+        "formatter_slice_counts": [
+          1,
+          1
+        ],
+        "headings_by_page": [
+          [
+            "Operations Guide",
+            "Installation"
+          ],
+          [
+            "Verification"
+          ]
+        ],
+        "chunk_page_coverage": [
+          1,
+          2
+        ],
+        "spans_page_boundary": true,
+        "tables": []
+      }
+    },
+    {
+      "filename": "inventory-tables.pdf",
+      "sha256": "bc604584830de3aae4e0e6e87a100b9bd4ade80340b441c885327997c2a79573",
+      "size_bytes": 3701,
+      "license": "CC0-1.0",
+      "provenance": "Original synthetic regional inventory with a repeated six-column table.",
+      "expected": {
+        "outcome": "accept",
+        "page_count": 2,
+        "page_text_sha256": [
+          "fd7f96558b867afe668ccb53309d6de4d03ef3012b2a497e14355670fc710fbb",
+          "2fd52e76ba4a5a4e8479550af25f06cf1c880d1b92ccbe86ff260543f63e70be"
+        ],
+        "page_contains": [
+          [
+            "Regional Inventory Table",
+            "Region      Item             SKU",
+            "West        Cable Bundle"
+          ],
+          [
+            "Regional Inventory Table (continued)",
+            "Region      Item             SKU",
+            "Prairie     Meter Card"
+          ]
+        ],
+        "formatter_slice_counts": [
+          1,
+          1
+        ],
+        "headings_by_page": [
+          [
+            "Regional Inventory Table"
+          ],
+          [
+            "Regional Inventory Table (continued)"
+          ]
+        ],
+        "chunk_page_coverage": [
+          1,
+          2
+        ],
+        "spans_page_boundary": true,
+        "tables": [
+          {
+            "page": 1,
+            "columns": [
+              "Region",
+              "Item",
+              "SKU",
+              "Owner",
+              "Window",
+              "Status"
+            ],
+            "rows": [
+              [
+                "North",
+                "Field Kit",
+                "FK-101",
+                "Rowan",
+                "08:00-10:00",
+                "Ready"
+              ],
+              [
+                "South",
+                "Safety Manual",
+                "SM-204",
+                "Morgan",
+                "10:00-12:00",
+                "Review"
+              ],
+              [
+                "East",
+                "Sensor Pack",
+                "SP-310",
+                "Taylor",
+                "12:00-14:00",
+                "Ready"
+              ],
+              [
+                "West",
+                "Cable Bundle",
+                "CB-415",
+                "Jordan",
+                "14:00-16:00",
+                "Hold"
+              ]
+            ]
+          },
+          {
+            "page": 2,
+            "columns": [
+              "Region",
+              "Item",
+              "SKU",
+              "Owner",
+              "Window",
+              "Status"
+            ],
+            "rows": [
+              [
+                "Central",
+                "Valve Set",
+                "VS-520",
+                "Casey",
+                "08:30-09:30",
+                "Ready"
+              ],
+              [
+                "Coastal",
+                "Pump Guide",
+                "PG-625",
+                "Avery",
+                "09:30-11:30",
+                "Review"
+              ],
+              [
+                "Mountain",
+                "Filter Case",
+                "FC-730",
+                "Quinn",
+                "11:30-13:30",
+                "Ready"
+              ],
+              [
+                "Prairie",
+                "Meter Card",
+                "MC-845",
+                "Riley",
+                "13:30-15:30",
+                "Hold"
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "filename": "page-boundary-procedure.pdf",
+      "sha256": "cdfe45eacdaa06512039ca5db8672f96ade296721168aa1cb4d6fbbcbbf2895b",
+      "size_bytes": 3044,
+      "license": "CC0-1.0",
+      "provenance": "Original two-page recovery procedure with distinct boundary assertions.",
+      "expected": {
+        "outcome": "accept",
+        "page_count": 2,
+        "page_text_sha256": [
+          "413701b2805d05c4a4c925b7baae1fe012e579a816ac430576e547132266ebbe",
+          "4da09f4d6a96d7f6b250e1510e58ef901066251e211158c49b8efd634cad5ae4"
+        ],
+        "page_contains": [
+          [
+            "Recovery Procedure",
+            "associated with page one"
+          ],
+          [
+            "Resume",
+            "associated with page two"
+          ]
+        ],
+        "formatter_slice_counts": [
+          1,
+          1
+        ],
+        "headings_by_page": [
+          [
+            "Recovery Procedure",
+            "Checkpoint"
+          ],
+          [
+            "Resume"
+          ]
+        ],
+        "chunk_page_coverage": [
+          1,
+          2
+        ],
+        "spans_page_boundary": true,
+        "tables": []
+      }
+    },
+    {
+      "filename": "employee-onboarding-handbook-v1.pdf",
+      "sha256": "676d1ad3625dc4b46674814baac2d053225c907773ea6431cd545cbce1aa9e0f",
+      "size_bytes": 2262,
+      "license": "CC0-1.0",
+      "provenance": "Original synthetic employee handbook revision one.",
+      "expected": {
+        "outcome": "accept",
+        "page_count": 1,
+        "page_text_sha256": [
+          "aea37c34180f15ae06c68772b0b0d4ffde4aeb885c089681dddbd493cf703696"
+        ],
+        "page_contains": [
+          [
+            "Employee Onboarding Handbook",
+            "Revision 1",
+            "manager approval"
+          ]
+        ],
+        "formatter_slice_counts": [
+          1
+        ],
+        "headings_by_page": [
+          [
+            "Employee Onboarding Handbook",
+            "Revision 1"
+          ]
+        ],
+        "chunk_page_coverage": [
+          1
+        ],
+        "spans_page_boundary": false,
+        "tables": []
+      }
+    },
+    {
+      "filename": "employee-onboarding-handbook-v2.pdf",
+      "sha256": "830f4e73c85e8f5f37080e2f4cbe7cee5c67f78c55dd74bc4baebd58375ae917",
+      "size_bytes": 2261,
+      "license": "CC0-1.0",
+      "provenance": "Original synthetic employee handbook revision two.",
+      "expected": {
+        "outcome": "accept",
+        "page_count": 1,
+        "page_text_sha256": [
+          "43d62dbd6628c66b9f61c445206a995912db8fa4eb6ad3c02a89407e0716fe44"
+        ],
+        "page_contains": [
+          [
+            "Employee Onboarding Handbook",
+            "Revision 2",
+            "security approval"
+          ]
+        ],
+        "formatter_slice_counts": [
+          1
+        ],
+        "headings_by_page": [
+          [
+            "Employee Onboarding Handbook",
+            "Revision 2"
+          ]
+        ],
+        "chunk_page_coverage": [
+          1
+        ],
+        "spans_page_boundary": false,
+        "tables": []
+      }
+    },
+    {
+      "filename": "encrypted-notice.pdf",
+      "sha256": "fe1eae9b7d78abec4a7cf430be4a29285342ce06057f20653656aab0a2a264bc",
+      "size_bytes": 2379,
+      "license": "CC0-1.0",
+      "provenance": "Original encrypted rejection fixture generated with a non-secret test password.",
+      "expected": {
+        "outcome": "reject",
+        "reason": "encrypted"
+      }
+    },
+    {
+      "filename": "image-only-diagram.pdf",
+      "sha256": "aa47bc11a077e041c4ba1ec794e0820ec521fe0fbed3440a72c2ed27c519c0f4",
+      "size_bytes": 1845,
+      "license": "CC0-1.0",
+      "provenance": "Original vector-art page with no embedded text, standing in for an OCR-only scan.",
+      "expected": {
+        "outcome": "reject",
+        "reason": "image-only",
+        "page_count": 1,
+        "page_text_sha256": [
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ]
+      }
+    },
+    {
+      "filename": "malformed-truncated.pdf",
+      "sha256": "199919e94185d3e81bffda7d63cb235152b47f99269b6408f51a188c68ae912c",
+      "size_bytes": 152,
+      "license": "CC0-1.0",
+      "provenance": "Original deliberately truncated PDF object graph.",
+      "expected": {
+        "outcome": "reject",
+        "reason": "malformed"
+      }
+    }
+  ]
+}

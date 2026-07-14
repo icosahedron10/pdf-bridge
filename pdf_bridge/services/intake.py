@@ -1,118 +1,239 @@
-"""Transactional intake, decision, and lifecycle transitions.
-
-Every function here mutates the session and flushes without committing;
-managers own the transaction boundary. Hard failures (exact same-collection
-duplicates, unusable PDFs) block; everything semantic is advisory and flows
-through review decisions.
-"""
+"""Transactional API-v2 lifecycle and durable queue transitions."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import Session
 
 from pdf_bridge.persistence.models import (
-    OPEN_UPLOAD_STATES,
-    RETAINED_DOCUMENT_STATES,
     AuditEvent,
-    CollectionEpoch,
+    CandidateEvidence,
+    Decision,
     DecisionAction,
+    DeletionPhase,
+    DeletionProgress,
     Document,
-    DocumentAnalysis,
     DocumentState,
-    IntakeDecision,
+    ExtractedPage,
+    FormatterBatch,
+    IdempotencyRecord,
     OperationPhase,
+    OperationPriority,
     OperationState,
     OperationType,
-    ReplacementState,
-    ReplacementWorkflow,
+    PreparedCandidate,
+    PreparedChunk,
+    PreparedChunkVector,
+    PreparedPage,
+    PreparedRevision,
+    PublicationRecord,
+    PublicationStatus,
+    RevisionArtifact,
+    RevisionStatus,
     ScanState,
+    TerminalDisposition,
+    Tombstone,
     WorkOperation,
+    priority_for_operation,
     utc_now,
 )
-from pdf_bridge.services.filenames import (
-    FilenameMatch,
-    compare_filenames,
-    profile_filename,
-)
-from pdf_bridge.services.scanner import ScanResult
-from pdf_bridge.services.storage import (
-    PromotedFile,
-    StagedFile,
-    StorageLayout,
-    normalize_filename,
-    promote_staged_file,
-    validate_pdf_filename,
-)
-
-# States a replacement target must currently hold: exactly one current,
-# same-collection, ingested document.
-REPLACEABLE_STATES = (DocumentState.INGESTED,)
-
-CANCELLABLE_STATES = (
-    DocumentState.ANALYZING,
-    DocumentState.REVIEW_REQUIRED,
-    DocumentState.INGESTING,
-    DocumentState.INGEST_FAILED,
-    DocumentState.REPLACING,
-    DocumentState.REPLACE_FAILED,
-    DocumentState.CLEANUP_FAILED,
-)
-
-RETRYABLE_DOCUMENT_STATES = {
-    DocumentState.ANALYZING: (OperationType.ANALYZE, DocumentState.ANALYZING),
-    DocumentState.INGEST_FAILED: (OperationType.INGEST, DocumentState.INGESTING),
-    DocumentState.REPLACE_FAILED: (OperationType.INGEST, DocumentState.REPLACING),
-    DocumentState.DELETE_FAILED: (OperationType.DELETE, DocumentState.DELETING),
-    DocumentState.CLEANUP_FAILED: (OperationType.CLEANUP, DocumentState.CLEANUP_PENDING),
-}
 
 
 class LifecycleError(RuntimeError):
-    """Deliberate catalog transition failure with a stable transport code."""
+    """A deliberate, sanitized lifecycle conflict suitable for an API error."""
 
-    def __init__(self, message: str, *, code: str, status: int = 409) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int = 409,
+        retryable: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.message = message
         self.status = status
-
-
-class DuplicateDocumentError(LifecycleError):
-    """Raised when the same collection already holds identical file bytes."""
-
-    def __init__(self, document: Document) -> None:
-        super().__init__(
-            "This collection already contains a document with identical file contents.",
-            code="exact-duplicate",
-            status=409,
-        )
-        self.document = document
+        self.retryable = retryable
+        self.extra = extra or {}
 
 
 @dataclass(frozen=True, slots=True)
-class UploadRegistration:
-    """Document, operation, and storage result of registering an upload."""
+class IdempotencyReplay:
+    """Completed response material for an identical repeated mutation."""
 
-    document: Document
-    operation: WorkOperation
-    promoted: PromotedFile | None
-    idempotent_replay: bool = False
+    status: int
+    body: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
-class DecisionOutcome:
-    """Decision record plus the follow-up work it queued."""
-
-    decision: IntakeDecision
+class MutationOutcome:
     document: Document
     operation: WorkOperation | None
-    replacement: ReplacementWorkflow | None
-    idempotent_replay: bool = False
+    idempotency: IdempotencyRecord
+
+
+_PREFLIGHT_OPERATION_PHASES = frozenset(
+    {
+        OperationPhase.QUEUED,
+        OperationPhase.EXTRACTING,
+        OperationPhase.CHECKING_ELIGIBILITY,
+        OperationPhase.PACKING_FORMATTER_BATCHES,
+        OperationPhase.FORMATTING_MARKDOWN,
+        OperationPhase.VALIDATING_MARKDOWN,
+        OperationPhase.CHUNKING_MARKDOWN,
+        OperationPhase.EMBEDDING_DENSE,
+        OperationPhase.EMBEDDING_SPARSE,
+        OperationPhase.UPSERTING_SCREENING_POINTS,
+        OperationPhase.DISCOVERING_CANDIDATES,
+        OperationPhase.CLASSIFYING_CANDIDATES,
+        OperationPhase.SEALING_REVISION,
+    }
+)
+_PUBLICATION_OPERATION_PHASES = frozenset(
+    {
+        OperationPhase.QUEUED,
+        OperationPhase.UPSERT_ACTIVE_POINTS,
+        OperationPhase.VERIFY_ACTIVE_POINTS,
+        OperationPhase.REMOVE_SCREENING_POINTS,
+        OperationPhase.VERIFY_SCREENING_REMOVAL,
+    }
+)
+_DELETION_OPERATION_PHASES = frozenset(
+    {OperationPhase.QUEUED}
+    | {OperationPhase(phase.value) for phase in DeletionPhase}
+)
+
+
+def canonical_request_sha256(action: str, material: dict[str, Any]) -> str:
+    """Hash one mutation's strict canonical request identity."""
+
+    payload = json.dumps(
+        {"action": action, "request": material},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def reserve_idempotency(
+    session: Session,
+    *,
+    key: str,
+    action: str,
+    actor_id: str,
+    request_material: dict[str, Any],
+) -> IdempotencyRecord | IdempotencyReplay:
+    """Reserve a globally unique key or replay its identical completed response."""
+
+    if not 8 <= len(key) <= 128 or any(
+        character.isspace() or not character.isprintable() for character in key
+    ):
+        raise LifecycleError(
+            "invalid_idempotency_key",
+            "Idempotency-Key must contain 8 to 128 visible characters.",
+            status=400,
+        )
+    if not action or len(action) > 64 or not actor_id or len(actor_id) > 255:
+        raise LifecycleError(
+            "invalid_idempotency_identity",
+            "The idempotency action and actor identity are invalid.",
+            status=400,
+        )
+    request_hash = canonical_request_sha256(action, request_material)
+    existing = session.scalar(
+        select(IdempotencyRecord).where(IdempotencyRecord.key == key).with_for_update()
+    )
+    if existing is not None:
+        if (
+            existing.action != action
+            or existing.actor_id != actor_id
+            or existing.request_sha256 != request_hash
+        ):
+            raise LifecycleError(
+                "idempotency_conflict",
+                "The idempotency key was already used for a different request.",
+            )
+        if existing.response_status is None or existing.response_body is None:
+            raise LifecycleError(
+                "idempotency_in_progress",
+                "The original request is still being committed; retry shortly.",
+                retryable=True,
+            )
+        return IdempotencyReplay(
+            status=existing.response_status,
+            body=json.loads(json.dumps(existing.response_body)),
+        )
+    record = IdempotencyRecord(
+        key=key,
+        action=action,
+        request_sha256=request_hash,
+        actor_id=actor_id,
+    )
+    session.add(record)
+    session.flush()
+    return record
+
+
+def complete_idempotency(
+    record: IdempotencyRecord,
+    *,
+    status: int,
+    body: dict[str, Any],
+    resource_type: str,
+    resource_id: uuid.UUID,
+) -> None:
+    """Seal replay material once; an exact duplicate completion is a no-op."""
+
+    if not 100 <= status <= 599 or not resource_type or len(resource_type) > 64:
+        raise LifecycleError(
+            "invalid_idempotency_response",
+            "The idempotency response metadata is invalid.",
+            status=500,
+        )
+    try:
+        body_snapshot = json.loads(
+            json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise LifecycleError(
+            "invalid_idempotency_response",
+            "The idempotency response body is not valid JSON.",
+            status=500,
+        ) from exc
+    if not isinstance(body_snapshot, dict):
+        raise LifecycleError(
+            "invalid_idempotency_response",
+            "The idempotency response body must be a JSON object.",
+            status=500,
+        )
+    if record.completed_at is not None:
+        if (
+            record.response_status == status
+            and record.response_body == body_snapshot
+            and record.resource_type == resource_type
+            and record.resource_id == resource_id
+        ):
+            return
+        raise LifecycleError(
+            "idempotency_completion_conflict",
+            "Completed idempotency replay material cannot be changed.",
+        )
+    record.response_status = status
+    record.response_body = body_snapshot
+    record.resource_type = resource_type
+    record.resource_id = resource_id
+    record.completed_at = utc_now()
 
 
 def audit(
@@ -121,16 +242,15 @@ def audit(
     event_type: str,
     actor_type: str,
     actor_id: str,
-    document: Document | None = None,
-    operation: WorkOperation | None = None,
+    document_id: uuid.UUID | None = None,
+    operation_id: uuid.UUID | None = None,
     details: dict[str, Any] | None = None,
 ) -> AuditEvent:
-    """Append one immutable audit event."""
+    """Append a content-free lifecycle event."""
 
     event = AuditEvent(
-        document=document,
-        document_id=document.id if document else None,
-        operation_id=operation.id if operation else None,
+        document_id=document_id,
+        operation_id=operation_id,
         event_type=event_type,
         actor_type=actor_type,
         actor_id=actor_id,
@@ -140,802 +260,1370 @@ def audit(
     return event
 
 
-def collection_epoch(session: Session, collection_key: str) -> int:
-    """Return the current epoch for a collection, creating epoch 1 lazily."""
-
-    row = session.get(CollectionEpoch, collection_key)
-    if row is None:
-        row = CollectionEpoch(collection_key=collection_key, epoch=1)
-        session.add(row)
-        session.flush()
-    return row.epoch
-
-
-def validate_collection_references(session: Session, configured_keys: set[str]) -> None:
-    """Fail startup when retained catalog rows escape configured collections."""
-
-    unknown = list(
-        session.scalars(
-            select(Document.collection_key)
-            .where(
-                Document.state.in_(RETAINED_DOCUMENT_STATES),
-                Document.collection_key.not_in(configured_keys),
-            )
-            .distinct()
-        ).all()
-    )
-    if unknown:
-        raise RuntimeError(
-            "active documents reference unconfigured collections: " + ", ".join(sorted(unknown))
-        )
-
-
-def find_exact_collection_duplicate(
-    session: Session, *, sha256: str, collection_key: str
-) -> Document | None:
-    """Find retained identical bytes in the same collection only.
-
-    Cross-collection duplicates are deliberately permitted: collections are
-    isolated corpora and never warn about or block each other.
-    """
-
-    return session.scalar(
-        select(Document)
-        .where(
-            Document.sha256 == sha256,
-            Document.collection_key == collection_key,
-            Document.state.in_(RETAINED_DOCUMENT_STATES),
-        )
-        .order_by(Document.uploaded_at.desc())
-        .limit(1)
-    )
-
-
-def find_filename_warnings(
+def next_attempt(
     session: Session,
-    *,
-    collection_key: str,
-    filename: str,
-    exclude_document_id: uuid.UUID | None = None,
-) -> list[tuple[Document, FilenameMatch]]:
-    """Compare a filename against retained documents in one collection."""
-
-    incoming = profile_filename(filename)
-    query = (
-        select(Document)
-        .where(
-            Document.collection_key == collection_key,
-            Document.state.in_(RETAINED_DOCUMENT_STATES),
-        )
-        .order_by(Document.uploaded_at.desc())
-    )
-    if exclude_document_id is not None:
-        query = query.where(Document.id != exclude_document_id)
-    warnings: list[tuple[Document, FilenameMatch]] = []
-    for existing in session.scalars(query).all():
-        match = compare_filenames(incoming, profile_filename(existing.original_filename))
-        if match is not None:
-            warnings.append((existing, match))
-    return warnings
-
-
-def replacement_target_issue(
-    session: Session,
-    target: Document,
-    *,
-    collection_key: str,
-) -> str | None:
-    """Return why a live document cannot be selected for replacement."""
-
-    if target.collection_key != collection_key:
-        return "replacement-cross-collection"
-    if target.state not in REPLACEABLE_STATES:
-        return "replacement-target-not-ingested"
-    target_operation = session.scalar(
-        select(WorkOperation.id)
-        .where(
-            WorkOperation.document_id == target.id,
-            WorkOperation.state.in_((OperationState.QUEUED, OperationState.RUNNING)),
-        )
-        .limit(1)
-    )
-    if target_operation is not None:
-        return "replacement-target-busy"
-    in_flight = session.scalar(
-        select(ReplacementWorkflow.id)
-        .where(
-            ReplacementWorkflow.old_document_id == target.id,
-            ReplacementWorkflow.state.not_in((ReplacementState.SUCCEEDED, ReplacementState.FAILED)),
-        )
-        .limit(1)
-    )
-    if in_flight is not None:
-        return "replacement-target-busy"
-    return None
-
-
-def find_identical_text_documents(
-    session: Session,
-    *,
-    collection_key: str,
-    text_sha256: str,
-    exclude_document_id: uuid.UUID,
-) -> list[Document]:
-    """Find retained same-collection documents with identical normalized text."""
-
-    return list(
-        session.scalars(
-            select(Document).where(
-                Document.collection_key == collection_key,
-                Document.text_sha256 == text_sha256,
-                Document.state.in_(RETAINED_DOCUMENT_STATES),
-                Document.id != exclude_document_id,
-            )
-        ).all()
-    )
-
-
-def next_attempt(session: Session, document_id: uuid.UUID, operation_type: OperationType) -> int:
-    """Number the next durable attempt for one document and operation type."""
-
-    latest = session.scalar(
+    document_id: uuid.UUID,
+    operation_type: OperationType,
+) -> int:
+    maximum = session.scalar(
         select(func.max(WorkOperation.attempt)).where(
             WorkOperation.document_id == document_id,
             WorkOperation.operation_type == operation_type,
         )
     )
-    return (latest or 0) + 1
+    return int(maximum or 0) + 1
+
+
+def set_operation_phase(
+    operation: WorkOperation,
+    phase: OperationPhase,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Advance the durable phase clock only when the operation phase changes."""
+
+    if operation.phase is phase:
+        return False
+    transition_at = now or utc_now()
+    if transition_at.tzinfo is None:
+        raise ValueError("operation phase transition timestamps must be timezone-aware")
+    operation.phase = phase
+    operation.phase_started_at = transition_at.astimezone(UTC)
+    return True
 
 
 def enqueue_operation(
     session: Session,
+    *,
     document: Document,
     operation_type: OperationType,
-    *,
-    replacement_id: uuid.UUID | None = None,
+    priority: OperationPriority,
+    prepared_revision_id: uuid.UUID | None = None,
+    replacement_target_document_id: uuid.UUID | None = None,
+    idempotency_record_id: uuid.UUID | None = None,
+    phase: OperationPhase = OperationPhase.QUEUED,
 ) -> WorkOperation:
-    """Create one queued durable operation for the internal worker."""
+    """Create one durable immediately eligible operation."""
 
+    replacement_delete = replacement_target_document_id is not None
+    try:
+        expected_priority = priority_for_operation(
+            operation_type, replacement_delete=replacement_delete
+        )
+    except ValueError as exc:
+        raise LifecycleError(
+            "operation_binding_invalid",
+            "Only a publication operation can own replacement deletion.",
+            status=500,
+        ) from exc
+    if priority is not expected_priority:
+        raise LifecycleError(
+            "operation_priority_invalid",
+            "The operation priority does not match its durable work class.",
+            status=500,
+        )
+    if replacement_target_document_id == document.id:
+        raise LifecycleError(
+            "operation_binding_invalid",
+            "A replacement operation cannot target its incoming document.",
+            status=500,
+        )
+    allowed_phases = {
+        OperationType.PREFLIGHT: _PREFLIGHT_OPERATION_PHASES,
+        OperationType.PUBLISH: (
+            _PUBLICATION_OPERATION_PHASES | _DELETION_OPERATION_PHASES
+            if replacement_delete
+            else _PUBLICATION_OPERATION_PHASES
+        ),
+        OperationType.DELETE: _DELETION_OPERATION_PHASES,
+    }[operation_type]
+    if phase not in allowed_phases:
+        raise LifecycleError(
+            "operation_phase_invalid",
+            "The resume phase does not belong to the operation work class.",
+            status=500,
+        )
+
+    now = utc_now()
     operation = WorkOperation(
-        document=document,
+        document_id=document.id,
+        prepared_revision_id=prepared_revision_id,
+        replacement_target_document_id=replacement_target_document_id,
+        idempotency_record_id=idempotency_record_id,
         operation_type=operation_type,
+        priority=int(priority),
         state=OperationState.QUEUED,
-        phase=OperationPhase.QUEUED,
+        phase=phase,
+        phase_started_at=now,
         attempt=next_attempt(session, document.id, operation_type),
-        replacement_id=replacement_id,
+        created_at=now,
+        updated_at=now,
     )
     session.add(operation)
     session.flush()
+    audit(
+        session,
+        event_type=f"{operation_type.value.lower()}_queued",
+        actor_type="system",
+        actor_id="pdf-bridge",
+        document_id=document.id,
+        operation_id=operation.id,
+        details={
+            "priority": int(priority),
+            "attempt": operation.attempt,
+            "phase": phase.value,
+            "replacement_target_document_id": (
+                str(replacement_target_document_id)
+                if replacement_target_document_id is not None
+                else None
+            ),
+        },
+    )
     return operation
 
 
 def latest_operation(
     session: Session,
     document_id: uuid.UUID,
-    *,
     operation_type: OperationType | None = None,
 ) -> WorkOperation | None:
-    """Return the newest operation for a document, optionally by type."""
-
-    query = (
-        select(WorkOperation)
-        .where(WorkOperation.document_id == document_id)
-        .order_by(WorkOperation.created_at.desc(), WorkOperation.attempt.desc())
-        .limit(1)
-    )
+    statement = select(WorkOperation).where(WorkOperation.document_id == document_id)
     if operation_type is not None:
-        query = query.where(WorkOperation.operation_type == operation_type)
-    return session.scalar(query)
+        statement = statement.where(WorkOperation.operation_type == operation_type)
+    if operation_type is not None:
+        statement = statement.order_by(
+            WorkOperation.attempt.desc(),
+            WorkOperation.created_at.desc(),
+            WorkOperation.id.desc(),
+        )
+    else:
+        statement = statement.order_by(
+            WorkOperation.created_at.desc(), WorkOperation.id.desc()
+        )
+    return session.scalar(statement)
 
 
-def latest_analysis(session: Session, document_id: uuid.UUID) -> DocumentAnalysis | None:
-    """Return the newest analysis revision for a document."""
+def latest_sealed_revision(
+    session: Session, document_id: uuid.UUID
+) -> PreparedRevision | None:
+    return session.scalar(
+        select(PreparedRevision)
+        .where(
+            PreparedRevision.document_id == document_id,
+            PreparedRevision.status == RevisionStatus.SEALED,
+        )
+        .order_by(PreparedRevision.revision_number.desc())
+    )
+
+
+def latest_revision(session: Session, document_id: uuid.UUID) -> PreparedRevision | None:
+    """Return the newest preparation attempt, including an incomplete one."""
 
     return session.scalar(
-        select(DocumentAnalysis)
-        .where(DocumentAnalysis.document_id == document_id)
-        .order_by(DocumentAnalysis.revision.desc())
-        .limit(1)
+        select(PreparedRevision)
+        .where(PreparedRevision.document_id == document_id)
+        .order_by(PreparedRevision.revision_number.desc())
     )
 
 
-def register_staged_upload(
-    session: Session,
-    *,
-    staged: StagedFile,
-    layout: StorageLayout,
-    filename: str,
-    collection_key: str,
-    idempotency_key: str,
-    actor_type: str,
-    actor_id: str,
-    scan_result: ScanResult,
-) -> UploadRegistration:
-    """Validate and atomically register a scanned upload for analysis."""
-
-    existing = (
-        session.execute(
-            select(Document)
-            .where(Document.idempotency_key == idempotency_key)
-            .options(joinedload(Document.operations))
-        )
-        .unique()
-        .scalar_one_or_none()
+def get_document_for_update(session: Session, document_id: uuid.UUID) -> Document:
+    document = session.scalar(
+        select(Document).where(Document.id == document_id).with_for_update()
     )
-    if existing is not None:
-        if (
-            existing.sha256 != staged.sha256
-            or existing.size_bytes != staged.size_bytes
-            or existing.normalized_filename != normalize_filename(filename)
-            or existing.collection_key != collection_key
-        ):
-            raise LifecycleError(
-                "The idempotency key was already used for a different file.",
-                code="idempotency-key-conflict",
-            )
-        analyze_operations = [
-            item for item in existing.operations if item.operation_type == OperationType.ANALYZE
-        ]
-        if not analyze_operations:
-            raise LifecycleError(
-                "The upload idempotency record has no analysis operation.",
-                code="catalog-inconsistent",
-                status=500,
-            )
-        operation = max(analyze_operations, key=lambda item: (item.attempt, item.created_at))
-        return UploadRegistration(existing, operation, None, idempotent_replay=True)
-
-    display_filename = validate_pdf_filename(filename)
-    duplicate = find_exact_collection_duplicate(
-        session, sha256=staged.sha256, collection_key=collection_key
-    )
-    if duplicate is not None:
-        raise DuplicateDocumentError(duplicate)
-    if scan_result.state != ScanState.CLEAN:
-        raise LifecycleError(
-            "Only files reported clean by the configured scanner may be queued.",
-            code="scan-not-clean",
-            status=422,
-        )
-
-    epoch = collection_epoch(session, collection_key)
-    document = Document(
-        id=uuid.uuid4(),
-        original_filename=display_filename,
-        normalized_filename=normalize_filename(display_filename),
-        size_bytes=staged.size_bytes,
-        sha256=staged.sha256,
-        idempotency_key=idempotency_key,
-        state=DocumentState.ANALYZING,
-        scan_state=scan_result.state,
-        scan_engine=scan_result.engine,
-        scan_signature=scan_result.signature,
-        scanned_at=scan_result.scanned_at,
-        uploader_identity=actor_id,
-        collection_key=collection_key,
-        collection_epoch=epoch,
-    )
-    promoted: PromotedFile | None = None
-    try:
-        promoted = promote_staged_file(staged, layout, document.id)
-        document.storage_key = promoted.storage_key
-        session.add(document)
-        session.flush()
-        operation = enqueue_operation(session, document, OperationType.ANALYZE)
-        audit(
-            session,
-            event_type="upload_received",
-            actor_type=actor_type,
-            actor_id=actor_id,
-            document=document,
-            operation=operation,
-            details={
-                "status": DocumentState.ANALYZING.value,
-                "collection_key": collection_key,
-                "detail": "PDF accepted and queued for analysis.",
-            },
-        )
-        audit(
-            session,
-            event_type="malware_scan_clean",
-            actor_type="scanner",
-            actor_id=scan_result.engine,
-            document=document,
-            operation=operation,
-            details={"status": scan_result.state.value},
-        )
-        session.flush()
-    except Exception:
-        if promoted is not None:
-            promoted.path.unlink(missing_ok=True)
-        raise
-    return UploadRegistration(document, operation, promoted)
-
-
-def get_upload_document(session: Session, upload_id: uuid.UUID) -> Document:
-    """Load one upload's document or fail with a stable 404."""
-
-    document = session.get(Document, upload_id)
     if document is None:
-        raise LifecycleError("No upload exists for this ID.", code="upload-not-found", status=404)
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
     return document
 
 
-def _require_review_state(document: Document) -> None:
-    if document.state != DocumentState.REVIEW_REQUIRED:
-        raise LifecycleError(
-            "Only an upload awaiting review accepts a decision.",
-            code="decision-not-applicable",
+def _publication_for_revision(
+    session: Session, prepared_revision_id: uuid.UUID
+) -> PublicationRecord | None:
+    return session.scalar(
+        select(PublicationRecord).where(
+            PublicationRecord.prepared_revision_id == prepared_revision_id
         )
+    )
 
 
-def _current_complete_analysis(session: Session, document: Document) -> DocumentAnalysis:
-    analysis = latest_analysis(session, document.id)
-    if analysis is None or analysis.completed_at is None:
-        raise LifecycleError(
-            "This upload has no completed analysis to decide on.",
-            code="analysis-not-complete",
-        )
-    return analysis
-
-
-def record_decision(
+def _ensure_publication_record(
     session: Session,
     *,
     document: Document,
-    analysis_revision: int,
-    action: DecisionAction,
-    target_document_id: uuid.UUID | None,
-    idempotency_key: str,
+    revision: PreparedRevision,
+) -> PublicationRecord:
+    """Create or validate the one exact-target publication checkpoint."""
+
+    expected_points = revision.expected_point_count
+    if (
+        revision.document_id != document.id
+        or revision.status is not RevisionStatus.SEALED
+        or expected_points is None
+    ):
+        raise LifecycleError(
+            "publication_binding_invalid",
+            "Publication requires a sealed revision belonging to the document.",
+            status=500,
+        )
+    publication = _publication_for_revision(session, revision.id)
+    if publication is None:
+        publication = PublicationRecord(
+            document_id=document.id,
+            prepared_revision_id=revision.id,
+            active_qdrant_collection=revision.active_qdrant_collection,
+            status=PublicationStatus.PENDING,
+            expected_points=expected_points,
+        )
+        session.add(publication)
+        return publication
+    if (
+        publication.document_id != document.id
+        or publication.active_qdrant_collection != revision.active_qdrant_collection
+        or publication.expected_points != expected_points
+    ):
+        raise LifecycleError(
+            "publication_binding_invalid",
+            "The publication checkpoint does not match its sealed revision.",
+            status=500,
+        )
+    if publication.status is not PublicationStatus.PENDING:
+        raise LifecycleError(
+            "publication_already_started",
+            "The prepared revision already has a non-pending publication checkpoint.",
+        )
+    return publication
+
+
+def _open_publication_operation(
+    session: Session, *, document_id: uuid.UUID, prepared_revision_id: uuid.UUID
+) -> WorkOperation | None:
+    return session.scalar(
+        select(WorkOperation)
+        .where(
+            WorkOperation.document_id == document_id,
+            WorkOperation.prepared_revision_id == prepared_revision_id,
+            WorkOperation.operation_type == OperationType.PUBLISH,
+            WorkOperation.replacement_target_document_id.is_(None),
+            WorkOperation.state.in_((OperationState.QUEUED, OperationState.RUNNING)),
+        )
+        .order_by(WorkOperation.attempt.desc())
+    )
+
+
+def queue_clear_publication(
+    session: Session,
+    *,
+    document: Document,
+    revision: PreparedRevision,
+) -> WorkOperation:
+    """Queue automatic publication for a complete candidate-free revision."""
+
+    if document.state is DocumentState.PUBLISHING:
+        existing = _open_publication_operation(
+            session,
+            document_id=document.id,
+            prepared_revision_id=revision.id,
+        )
+        if existing is not None:
+            return existing
+        raise LifecycleError(
+            "publication_operation_missing",
+            "The publishing document has no active publication operation.",
+            status=500,
+        )
+    candidate_count = session.scalar(
+        select(func.count())
+        .select_from(PreparedCandidate)
+        .where(PreparedCandidate.prepared_revision_id == revision.id)
+    )
+    if (
+        document.state is not DocumentState.PREFLIGHTING
+        or revision.document_id != document.id
+        or revision.status is not RevisionStatus.SEALED
+        or not revision.clear_for_publication
+        or not revision.formatter_complete
+        or not revision.vector_complete
+        or not revision.candidate_discovery_complete
+        or not revision.advisory_complete
+        or bool(revision.incomplete_reasons)
+        or int(candidate_count or 0) != 0
+    ):
+        raise LifecycleError(
+            "revision_not_publishable", "The prepared revision is not clear for publication."
+        )
+    _ensure_publication_record(session, document=document, revision=revision)
+    document.state = DocumentState.PUBLISHING
+    document.failure_code = None
+    document.failure_message = None
+    document.failure_retryable = False
+    return enqueue_operation(
+        session,
+        document=document,
+        operation_type=OperationType.PUBLISH,
+        priority=OperationPriority.PUBLISH,
+        prepared_revision_id=revision.id,
+    )
+
+
+def _require_current_review_revision(
+    session: Session,
+    document: Document,
+    prepared_revision_id: uuid.UUID,
+) -> PreparedRevision:
+    if document.state != DocumentState.REVIEW_REQUIRED:
+        raise LifecycleError(
+            "document_state_conflict",
+            "A review decision is not allowed in the document's current state.",
+        )
+    revision = session.scalar(
+        select(PreparedRevision).where(
+            PreparedRevision.id == prepared_revision_id,
+            PreparedRevision.document_id == document.id,
+        )
+    )
+    current = latest_sealed_revision(session, document.id)
+    if (
+        revision is None
+        or revision.status != RevisionStatus.SEALED
+        or current is None
+        or current.id != revision.id
+        or revision.manifest_sha256 is None
+    ):
+        raise LifecycleError(
+            "stale_prepared_revision",
+            "The decision does not name the current sealed prepared revision.",
+        )
+    if revision.decision is not None:
+        raise LifecycleError("decision_exists", "This prepared revision already has a decision.")
+    return revision
+
+
+def _validate_replacement_target(
+    session: Session,
+    *,
+    incoming: Document,
+    target_id: uuid.UUID,
+) -> tuple[Document, PreparedRevision, PublicationRecord]:
+    if target_id == incoming.id:
+        raise LifecycleError("invalid_replacement_target", "A document cannot replace itself.")
+    target = session.scalar(select(Document).where(Document.id == target_id).with_for_update())
+    if target is None or target.collection_key != incoming.collection_key:
+        raise LifecycleError(
+            "invalid_replacement_target",
+            "The replacement target must be in the same configured collection.",
+        )
+    if target.state != DocumentState.READY:
+        raise LifecycleError(
+            "replacement_target_unavailable", "The replacement target is no longer READY."
+        )
+    if target.replaced_by_document_id is not None:
+        raise LifecycleError(
+            "replacement_target_busy",
+            "The replacement target is already bound to another incoming document.",
+        )
+    conflicting = session.scalar(
+        select(WorkOperation.id).where(
+            or_(
+                WorkOperation.document_id == target.id,
+                WorkOperation.replacement_target_document_id == target.id,
+            ),
+            WorkOperation.state.in_((OperationState.QUEUED, OperationState.RUNNING)),
+        )
+    )
+    if conflicting is not None:
+        raise LifecycleError(
+            "replacement_target_busy", "The replacement target is already being changed."
+        )
+    revision, publication = _verified_ready_binding(session, target)
+    return target, revision, publication
+
+
+def _verified_ready_binding(
+    session: Session, document: Document
+) -> tuple[PreparedRevision, PublicationRecord]:
+    """Resolve the successful publication target for a READY document."""
+
+    publication = session.scalar(
+        select(PublicationRecord)
+        .where(
+            PublicationRecord.document_id == document.id,
+            PublicationRecord.status == PublicationStatus.VERIFIED,
+        )
+        .order_by(PublicationRecord.verified_at.desc(), PublicationRecord.created_at.desc())
+    )
+    if publication is None:
+        raise LifecycleError(
+            "publication_record_missing",
+            "A READY document has no verified publication checkpoint.",
+            status=500,
+        )
+    revision = session.get(PreparedRevision, publication.prepared_revision_id)
+    if (
+        revision is None
+        or revision.document_id != document.id
+        or revision.status is not RevisionStatus.SEALED
+        or revision.active_qdrant_collection != publication.active_qdrant_collection
+        or revision.expected_point_count != publication.expected_points
+    ):
+        raise LifecycleError(
+            "publication_binding_invalid",
+            "The verified publication checkpoint is not bound to its sealed revision.",
+            status=500,
+        )
+    return revision, publication
+
+
+def _validate_deletion_binding(
+    session: Session,
+    *,
+    document: Document,
+    prepared_revision_id: uuid.UUID | None,
+    publication_record_id: uuid.UUID | None,
+    active_qdrant_collection: str,
+) -> None:
+    """Fail hard when a deletion target is not pinned to the named catalog rows."""
+
+    revision = (
+        session.get(PreparedRevision, prepared_revision_id)
+        if prepared_revision_id is not None
+        else None
+    )
+    if prepared_revision_id is not None and (
+        revision is None
+        or revision.document_id != document.id
+        or revision.active_qdrant_collection != active_qdrant_collection
+    ):
+        raise LifecycleError(
+            "deletion_binding_invalid",
+            "The deletion revision does not match the document and active target.",
+            status=500,
+        )
+    publication = (
+        session.get(PublicationRecord, publication_record_id)
+        if publication_record_id is not None
+        else None
+    )
+    if publication_record_id is not None and (
+        publication is None
+        or publication.document_id != document.id
+        or publication.prepared_revision_id != prepared_revision_id
+        or publication.active_qdrant_collection != active_qdrant_collection
+    ):
+        raise LifecycleError(
+            "deletion_binding_invalid",
+            "The deletion publication checkpoint does not match the exact target.",
+            status=500,
+        )
+
+
+def _latest_deletion_operation(
+    session: Session, document_id: uuid.UUID
+) -> WorkOperation | None:
+    """Find either a direct delete or the publish operation owning replacement cleanup."""
+
+    return session.scalar(
+        select(WorkOperation)
+        .where(
+            or_(
+                (
+                    (WorkOperation.document_id == document_id)
+                    & (WorkOperation.operation_type == OperationType.DELETE)
+                ),
+                (
+                    (WorkOperation.replacement_target_document_id == document_id)
+                    & (WorkOperation.operation_type == OperationType.PUBLISH)
+                ),
+            )
+        )
+        .order_by(WorkOperation.created_at.desc(), WorkOperation.id.desc())
+    )
+
+
+def begin_deletion(
+    session: Session,
+    *,
+    document: Document,
+    terminal_disposition: TerminalDisposition,
+    active_qdrant_collection: str,
+    screening_qdrant_collection: str,
+    prepared_revision_id: uuid.UUID | None,
+    publication_record_id: uuid.UUID | None,
+    priority: OperationPriority,
     actor_type: str,
     actor_id: str,
-) -> DecisionOutcome:
-    """Validate and record an immutable Keep, Replace, or Cancel decision."""
+    idempotency_record_id: uuid.UUID | None = None,
+) -> WorkOperation:
+    """Block reads and durably queue point-first terminal cleanup."""
 
-    replay = session.scalar(
-        select(IntakeDecision).where(IntakeDecision.idempotency_key == idempotency_key)
+    if priority is not OperationPriority.HIGH:
+        raise LifecycleError(
+            "operation_priority_invalid",
+            "Direct deletion must use HIGH priority.",
+            status=500,
+        )
+    if active_qdrant_collection == screening_qdrant_collection:
+        raise LifecycleError(
+            "collection_configuration_invalid",
+            "Active and screening collection targets must be distinct.",
+            status=500,
+        )
+    _validate_deletion_binding(
+        session,
+        document=document,
+        prepared_revision_id=prepared_revision_id,
+        publication_record_id=publication_record_id,
+        active_qdrant_collection=active_qdrant_collection,
     )
-    if replay is not None:
+    progress = document.deletion_progress
+    if progress is not None:
         if (
-            replay.document_id != document.id
-            or replay.analysis_revision != analysis_revision
-            or replay.action != action
-            or replay.target_document_id != target_document_id
+            document.state not in {DocumentState.DELETING, DocumentState.DELETE_FAILED}
+            or document.terminal_disposition is not progress.terminal_disposition
         ):
             raise LifecycleError(
-                "The decision idempotency key was already used for a different decision.",
-                code="idempotency-key-conflict",
+                "deletion_binding_invalid",
+                "The deletion checkpoint does not match the document lifecycle.",
+                status=500,
             )
-        operation = latest_operation(session, document.id)
-        replacement = session.scalar(
-            select(ReplacementWorkflow).where(ReplacementWorkflow.decision_id == replay.id)
-        )
-        return DecisionOutcome(
-            decision=replay,
-            document=document,
-            operation=operation,
-            replacement=replacement,
-            idempotent_replay=True,
-        )
-
-    _require_review_state(document)
-    analysis = _current_complete_analysis(session, document)
-    if analysis.revision != analysis_revision:
+        if (
+            progress.terminal_disposition != terminal_disposition
+            or progress.active_qdrant_collection != active_qdrant_collection
+            or progress.screening_qdrant_collection != screening_qdrant_collection
+            or progress.prepared_revision_id != prepared_revision_id
+            or progress.publication_record_id != publication_record_id
+        ):
+            raise LifecycleError(
+                "deletion_binding_conflict",
+                "The document already has a different terminal cleanup binding.",
+            )
+        operation = _latest_deletion_operation(session, document.id)
+        if operation is None:
+            raise LifecycleError(
+                "deletion_operation_missing",
+                "The deletion checkpoint has no durable owning operation.",
+                status=500,
+            )
+        return operation
+    if document.state in {
+        DocumentState.DELETING,
+        DocumentState.DELETE_FAILED,
+        DocumentState.REJECTED,
+        DocumentState.CANCELLED,
+        DocumentState.DELETED,
+    }:
         raise LifecycleError(
-            "The reviewed analysis is no longer current; reload and review again.",
-            code="stale-analysis-revision",
+            "deletion_binding_invalid",
+            "The document deletion lifecycle is missing its durable checkpoint.",
+            status=500,
         )
-    if analysis.collection_epoch != collection_epoch(session, document.collection_key):
-        raise LifecycleError(
-            "The collection was rebuilt after this analysis; retry the analysis.",
-            code="stale-collection-epoch",
-        )
-
-    advisory_override = bool(
-        analysis.candidate_count
-        or not analysis.semantic_complete
-        or not analysis.classification_complete
-    )
-    decision = IntakeDecision(
-        document=document,
+    progress = DeletionProgress(
         document_id=document.id,
-        analysis_id=analysis.id,
-        analysis_revision=analysis.revision,
-        action=action,
-        target_document_id=target_document_id,
-        idempotency_key=idempotency_key,
-        advisory_override=advisory_override and action == DecisionAction.KEEP,
-        actor_type=actor_type,
-        actor_id=actor_id,
+        prepared_revision_id=prepared_revision_id,
+        publication_record_id=publication_record_id,
+        terminal_disposition=terminal_disposition,
+        active_qdrant_collection=active_qdrant_collection,
+        screening_qdrant_collection=screening_qdrant_collection,
+        phase=DeletionPhase.DELETE_ACTIVE_POINTS,
     )
-    session.add(decision)
-    session.flush()
-
-    operation: WorkOperation | None = None
-    replacement: ReplacementWorkflow | None = None
-    if action == DecisionAction.KEEP:
-        document.state = DocumentState.INGESTING
-        operation = enqueue_operation(session, document, OperationType.INGEST)
-        event_type = "decision_keep"
-    elif action == DecisionAction.REPLACE:
-        replacement = _begin_replacement(
-            session,
-            new_document=document,
-            analysis=analysis,
-            target_document_id=target_document_id,
-            decision=decision,
-        )
-        document.state = DocumentState.REPLACING
-        operation = enqueue_operation(
-            session, document, OperationType.INGEST, replacement_id=replacement.id
-        )
-        event_type = "decision_replace"
-    else:
-        document.state = DocumentState.CLEANUP_PENDING
-        document.cleanup_target = DocumentState.CANCELLED
-        operation = enqueue_operation(session, document, OperationType.CLEANUP)
-        event_type = "decision_cancel"
-
+    document.deletion_progress = progress
+    session.add(progress)
+    document.state = DocumentState.DELETING
+    document.terminal_disposition = terminal_disposition
+    document.failure_code = None
+    document.failure_message = None
+    document.failure_retryable = False
+    operation = enqueue_operation(
+        session,
+        document=document,
+        operation_type=OperationType.DELETE,
+        priority=priority,
+        prepared_revision_id=prepared_revision_id,
+        idempotency_record_id=idempotency_record_id,
+    )
     audit(
         session,
-        event_type=event_type,
+        event_type="deletion_accepted",
         actor_type=actor_type,
         actor_id=actor_id,
-        document=document,
-        operation=operation,
-        details={
-            "status": document.state.value,
-            "analysis_revision": analysis.revision,
-            "advisory_override": decision.advisory_override,
-            "target_document_id": str(target_document_id) if target_document_id else None,
-            "collection_key": document.collection_key,
-        },
+        document_id=document.id,
+        operation_id=operation.id,
+        details={"terminal_disposition": terminal_disposition.value},
     )
-    session.flush()
-    return DecisionOutcome(
-        decision=decision,
-        document=document,
-        operation=operation,
-        replacement=replacement,
-    )
+    return operation
 
 
 def _begin_replacement(
     session: Session,
     *,
-    new_document: Document,
-    analysis: DocumentAnalysis,
-    target_document_id: uuid.UUID | None,
-    decision: IntakeDecision,
-) -> ReplacementWorkflow:
-    if target_document_id is None:
-        raise LifecycleError(
-            "Replace decisions require a target document.",
-            code="replacement-target-required",
-            status=422,
-        )
-    target = session.get(Document, target_document_id)
-    if target is None:
-        raise LifecycleError(
-            "The replacement target no longer exists.",
-            code="replacement-target-not-found",
-            status=404,
-        )
-    target_issue = replacement_target_issue(
-        session,
-        target,
-        collection_key=new_document.collection_key,
-    )
-    if target_issue == "replacement-cross-collection":
-        raise LifecycleError(
-            "Replacement is same-collection only.",
-            code="replacement-cross-collection",
-            status=422,
-        )
-    if target_issue == "replacement-target-not-ingested":
-        raise LifecycleError(
-            "Only a currently ingested document can be replaced.",
-            code="replacement-target-not-ingested",
-        )
-    if target_issue == "replacement-target-busy":
-        raise LifecycleError(
-            "The replacement target has active work or another replacement in progress.",
-            code="replacement-target-busy",
-        )
-    candidate_ids = {candidate.matched_document_id for candidate in analysis.candidates}
-    if target.id not in candidate_ids:
-        raise LifecycleError(
-            "The replacement target must be one of this analysis's candidates.",
-            code="replacement-target-not-candidate",
-            status=422,
-        )
-    workflow = ReplacementWorkflow(
-        new_document_id=new_document.id,
-        old_document_id=target.id,
-        decision_id=decision.id,
-        state=ReplacementState.PREPARING,
-    )
-    session.add(workflow)
-    session.flush()
-    return workflow
-
-
-def retry_upload(
-    session: Session,
-    *,
-    document: Document,
+    incoming: Document,
+    incoming_revision: PreparedRevision,
+    target: Document,
+    target_revision: PreparedRevision,
+    target_publication: PublicationRecord,
+    screening_qdrant_collection: str,
     actor_type: str,
     actor_id: str,
 ) -> WorkOperation:
-    """Queue the next attempt for failed work or a stale completed analysis."""
+    """Queue one workflow that proves old deletion before publishing the incoming revision."""
 
-    if document.state == DocumentState.REVIEW_REQUIRED:
-        analysis = latest_analysis(session, document.id)
-        current_epoch = collection_epoch(session, document.collection_key)
-        if (
-            analysis is None
-            or analysis.completed_at is None
-            or analysis.collection_epoch == current_epoch
-        ):
-            raise LifecycleError(
-                "This upload has no retryable failed work.",
-                code="operation-not-retryable",
-            )
-        previous = latest_operation(
-            session,
-            document.id,
-            operation_type=OperationType.ANALYZE,
+    if target.deletion_progress is not None:
+        raise LifecycleError(
+            "replacement_target_busy",
+            "The replacement target already has a deletion checkpoint.",
         )
-        operation = enqueue_operation(session, document, OperationType.ANALYZE)
-        document.state = DocumentState.ANALYZING
-        document.last_error = None
-        audit(
+    if target_publication.active_qdrant_collection == screening_qdrant_collection:
+        raise LifecycleError(
+            "collection_configuration_invalid",
+            "Active and screening collection targets must be distinct.",
+            status=500,
+        )
+    _ensure_publication_record(
+        session, document=incoming, revision=incoming_revision
+    )
+    progress = DeletionProgress(
+        document_id=target.id,
+        prepared_revision_id=target_revision.id,
+        publication_record_id=target_publication.id,
+        terminal_disposition=TerminalDisposition.DELETED,
+        active_qdrant_collection=target_publication.active_qdrant_collection,
+        screening_qdrant_collection=screening_qdrant_collection,
+        phase=DeletionPhase.DELETE_ACTIVE_POINTS,
+    )
+    target.deletion_progress = progress
+    target.state = DocumentState.DELETING
+    target.terminal_disposition = TerminalDisposition.DELETED
+    target.failure_code = None
+    target.failure_message = None
+    target.failure_retryable = False
+    target.replaced_by_document_id = incoming.id
+    incoming.state = DocumentState.PUBLISHING
+    incoming.failure_code = None
+    incoming.failure_message = None
+    incoming.failure_retryable = False
+    session.add(progress)
+    operation = enqueue_operation(
+        session,
+        document=incoming,
+        operation_type=OperationType.PUBLISH,
+        priority=OperationPriority.REPLACEMENT,
+        prepared_revision_id=incoming_revision.id,
+        replacement_target_document_id=target.id,
+    )
+    audit(
+        session,
+        event_type="replacement_old_deletion_accepted",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        document_id=target.id,
+        operation_id=operation.id,
+        details={
+            "incoming_document_id": str(incoming.id),
+            "active_qdrant_collection": target_publication.active_qdrant_collection,
+            "screening_qdrant_collection": screening_qdrant_collection,
+        },
+    )
+    return operation
+
+
+def record_decision(
+    session: Session,
+    *,
+    document_id: uuid.UUID,
+    prepared_revision_id: uuid.UUID,
+    action: DecisionAction,
+    target_document_id: uuid.UUID | None,
+    idempotency: IdempotencyRecord,
+    actor_type: str,
+    actor_id: str,
+    screening_qdrant_collection: str,
+) -> MutationOutcome:
+    """Bind a Keep/Replace/Cancel action to the exact inspected manifest."""
+
+    if not isinstance(action, DecisionAction):
+        raise LifecycleError(
+            "decision_action_invalid", "The decision action is not supported.", status=400
+        )
+    if idempotency.actor_id != actor_id or idempotency.completed_at is not None:
+        raise LifecycleError(
+            "idempotency_binding_invalid",
+            "The decision idempotency reservation does not belong to this actor or request.",
+            status=500,
+        )
+    document = get_document_for_update(session, document_id)
+    revision = _require_current_review_revision(session, document, prepared_revision_id)
+    if action == DecisionAction.REPLACE:
+        if target_document_id is None:
+            raise LifecycleError(
+                "replacement_target_required", "Replace requires one target document."
+            )
+        target, target_revision, target_publication = _validate_replacement_target(
+            session, incoming=document, target_id=target_document_id
+        )
+    else:
+        if target_document_id is not None:
+            raise LifecycleError(
+                "unexpected_replacement_target", "Keep and Cancel do not accept a target."
+            )
+        target = None
+        target_revision = None
+        target_publication = None
+
+    decision = Decision(
+        document_id=document.id,
+        prepared_revision_id=revision.id,
+        prepared_manifest_sha256=revision.manifest_sha256 or "",
+        action=action,
+        target_document_id=target.id if target is not None else None,
+        idempotency_record_id=idempotency.id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+    )
+    session.add(decision)
+    session.flush()
+    operation: WorkOperation
+    if action == DecisionAction.CANCEL:
+        operation = begin_deletion(
             session,
-            event_type="operation_retried",
+            document=document,
+            terminal_disposition=TerminalDisposition.CANCELLED,
+            active_qdrant_collection=revision.active_qdrant_collection,
+            screening_qdrant_collection=screening_qdrant_collection,
+            prepared_revision_id=revision.id,
+            publication_record_id=None,
+            priority=OperationPriority.HIGH,
             actor_type=actor_type,
             actor_id=actor_id,
+        )
+    elif action == DecisionAction.REPLACE:
+        if target is None or target_revision is None or target_publication is None:
+            raise LifecycleError(
+                "replacement_binding_invalid",
+                "The replacement target binding was not retained.",
+                status=500,
+            )
+        operation = _begin_replacement(
+            session,
+            incoming=document,
+            incoming_revision=revision,
+            target=target,
+            target_revision=target_revision,
+            target_publication=target_publication,
+            screening_qdrant_collection=screening_qdrant_collection,
+            actor_type=actor_type,
+            actor_id=actor_id,
+        )
+    else:
+        _ensure_publication_record(session, document=document, revision=revision)
+        document.state = DocumentState.PUBLISHING
+        operation = enqueue_operation(
+            session,
             document=document,
-            operation=operation,
+            operation_type=OperationType.PUBLISH,
+            priority=OperationPriority.PUBLISH,
+            prepared_revision_id=revision.id,
+        )
+    audit(
+        session,
+        event_type="review_decision_recorded",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        document_id=document.id,
+        operation_id=operation.id,
+        details={
+            "action": action.value,
+            "prepared_revision_id": str(revision.id),
+            "target_document_id": str(target.id) if target is not None else None,
+        },
+    )
+    return MutationOutcome(document=document, operation=operation, idempotency=idempotency)
+
+
+def request_retry(
+    session: Session,
+    *,
+    document_id: uuid.UUID,
+    idempotency: IdempotencyRecord,
+    actor_type: str,
+    actor_id: str,
+) -> MutationOutcome:
+    """Queue only the failed phase, preserving approval and sealed artifacts."""
+
+    if idempotency.actor_id != actor_id or idempotency.completed_at is not None:
+        raise LifecycleError(
+            "idempotency_binding_invalid",
+            "The retry idempotency reservation does not belong to this actor or request.",
+            status=500,
+        )
+    requested_document = get_document_for_update(session, document_id)
+    if not requested_document.failure_retryable:
+        raise LifecycleError(
+            "retry_not_allowed", "The document does not have a retryable failure."
+        )
+    document = requested_document
+    if (
+        requested_document.state is DocumentState.DELETE_FAILED
+        and requested_document.replaced_by_document_id is not None
+    ):
+        document = get_document_for_update(
+            session, requested_document.replaced_by_document_id
+        )
+        replacement_operation = latest_operation(
+            session, document.id, OperationType.PUBLISH
+        )
+        if (
+            document.state is not DocumentState.PUBLISH_FAILED
+            or not document.failure_retryable
+            or replacement_operation is None
+            or replacement_operation.replacement_target_document_id
+            != requested_document.id
+        ):
+            raise LifecycleError(
+                "replacement_retry_binding_invalid",
+                "The failed replacement does not have one retryable owning publication.",
+                status=500,
+            )
+    if document.state == DocumentState.PREFLIGHT_FAILED:
+        operation_type = OperationType.PREFLIGHT
+        next_state = DocumentState.PREFLIGHTING
+    elif document.state == DocumentState.PUBLISH_FAILED:
+        operation_type = OperationType.PUBLISH
+        next_state = DocumentState.PUBLISHING
+    elif document.state == DocumentState.DELETE_FAILED:
+        operation_type = OperationType.DELETE
+        next_state = DocumentState.DELETING
+    else:
+        raise LifecycleError(
+            "retry_not_allowed", "Retry is only available for an explicit failed state."
+        )
+    failed = latest_operation(session, document.id, operation_type)
+    if (
+        failed is None
+        or failed.state is not OperationState.FAILED
+        or not failed.retryable
+        or failed.phase
+        in {OperationPhase.QUEUED, OperationPhase.COMPLETE, OperationPhase.AWAITING_DECISION}
+    ):
+        raise LifecycleError(
+            "retry_checkpoint_missing",
+            "The document has no retryable failed operation checkpoint.",
+            status=500,
+        )
+    try:
+        priority = OperationPriority(failed.priority)
+    except ValueError as exc:
+        raise LifecycleError(
+            "operation_priority_invalid",
+            "The failed operation has an unknown durable priority.",
+            status=500,
+        ) from exc
+    phase = failed.phase
+    revision_id = failed.prepared_revision_id
+    replacement_target_document_id = failed.replacement_target_document_id
+
+    if (
+        requested_document.id != document.id
+        and replacement_target_document_id != requested_document.id
+    ):
+        raise LifecycleError(
+            "replacement_retry_binding_invalid",
+            "The failed publication no longer owns the requested replacement cleanup.",
+            status=500,
+        )
+
+    if operation_type is OperationType.PREFLIGHT:
+        if replacement_target_document_id is not None:
+            raise LifecycleError(
+                "operation_binding_invalid",
+                "Preflight retry cannot own replacement deletion.",
+                status=500,
+            )
+    elif operation_type is OperationType.PUBLISH:
+        if revision_id is None:
+            raise LifecycleError(
+                "publication_record_missing",
+                "The failed publication has no prepared revision checkpoint.",
+                status=500,
+            )
+        publication = _publication_for_revision(session, revision_id)
+        revision = session.get(PreparedRevision, revision_id)
+        if (
+            publication is None
+            or revision is None
+            or publication.document_id != document.id
+            or revision.document_id != document.id
+            or revision.status is not RevisionStatus.SEALED
+            or publication.status is PublicationStatus.VERIFIED
+            or publication.active_qdrant_collection
+            != revision.active_qdrant_collection
+            or publication.expected_points != revision.expected_point_count
+        ):
+            raise LifecycleError(
+                "publication_record_missing",
+                "The failed publication has no matching durable revision record.",
+                status=500,
+            )
+        publication.status = PublicationStatus.PENDING
+        publication.failure_code = None
+        if replacement_target_document_id is not None:
+            replacement_target = session.get(Document, replacement_target_document_id)
+            if replacement_target is None or replacement_target.deletion_progress is None:
+                raise LifecycleError(
+                    "deletion_checkpoint_missing",
+                    "Replacement retry has no old-document deletion checkpoint.",
+                    status=500,
+                )
+            if replacement_target.state is DocumentState.DELETE_FAILED:
+                replacement_target.state = DocumentState.DELETING
+                replacement_target.failure_code = None
+                replacement_target.failure_message = None
+                replacement_target.failure_retryable = False
+                replacement_target.deletion_progress.failure_code = None
+    else:
+        progress = document.deletion_progress
+        if (
+            progress is None
+            or progress.prepared_revision_id != revision_id
+            or replacement_target_document_id is not None
+        ):
+            raise LifecycleError(
+                "deletion_checkpoint_missing",
+                "The failed deletion has no matching durable checkpoint.",
+                status=500,
+            )
+        phase = OperationPhase(progress.phase.value)
+        progress.failure_code = None
+
+    document.state = next_state
+    document.failure_code = None
+    document.failure_message = None
+    document.failure_retryable = False
+    operation = enqueue_operation(
+        session,
+        document=document,
+        operation_type=operation_type,
+        priority=priority,
+        prepared_revision_id=revision_id,
+        replacement_target_document_id=replacement_target_document_id,
+        idempotency_record_id=idempotency.id,
+        phase=phase,
+    )
+    audit(
+        session,
+        event_type="retry_accepted",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        document_id=document.id,
+        operation_id=operation.id,
+        details={
+            "operation_type": operation_type.value,
+            "failed_operation_id": str(failed.id),
+            "requested_document_id": str(requested_document.id),
+            "resume_phase": phase.value,
+            "attempt": operation.attempt,
+        },
+    )
+    if requested_document.id != document.id:
+        audit(
+            session,
+            event_type="replacement_retry_accepted",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            document_id=requested_document.id,
+            operation_id=operation.id,
             details={
-                "previous_operation_id": str(previous.id) if previous else None,
-                "previous_analysis_id": str(analysis.id),
-                "previous_analysis_revision": analysis.revision,
-                "analysis_collection_epoch": analysis.collection_epoch,
-                "current_collection_epoch": current_epoch,
+                "incoming_document_id": str(document.id),
+                "resume_phase": phase.value,
                 "attempt": operation.attempt,
             },
         )
-        session.flush()
-        return operation
-
-    plan = RETRYABLE_DOCUMENT_STATES.get(document.state)
-    if plan is None:
-        raise LifecycleError(
-            "This upload has no retryable failed work.", code="operation-not-retryable"
-        )
-    operation_type, next_state = plan
-    failed = latest_operation(session, document.id, operation_type=operation_type)
-    if failed is None or failed.state != OperationState.FAILED or not failed.retryable:
-        raise LifecycleError(
-            "Only the current failed operation can be retried.",
-            code="operation-not-retryable",
-        )
-    operation = enqueue_operation(
-        session, document, operation_type, replacement_id=failed.replacement_id
-    )
-    document.state = next_state
-    document.last_error = None
-    audit(
-        session,
-        event_type="operation_retried",
-        actor_type=actor_type,
-        actor_id=actor_id,
-        document=document,
+    return MutationOutcome(
+        document=requested_document,
         operation=operation,
-        details={"previous_operation_id": str(failed.id), "attempt": operation.attempt},
+        idempotency=idempotency,
     )
-    session.flush()
-    return operation
 
 
-def _prepare_replacement_cancellation(
-    session: Session,
-    document: Document,
-    *,
-    cancelled_at: datetime,
-) -> dict[str, Any]:
-    """Terminalize a safely cancellable replacement and describe the boundary."""
-
-    workflow = session.scalar(
-        select(ReplacementWorkflow).where(ReplacementWorkflow.new_document_id == document.id)
-    )
-    if workflow is None:
-        return {}
-    old_document = session.get(Document, workflow.old_document_id)
-    if old_document is None:
-        raise LifecycleError(
-            "The replacement workflow references a missing old document.",
-            code="catalog-inconsistent",
-            status=500,
-        )
-
-    stage = workflow.state
-    old_state = old_document.state
-    if stage == ReplacementState.DELETING_OLD and old_state in {
-        DocumentState.DELETING,
-        DocumentState.DELETE_FAILED,
-    }:
-        raise LifecycleError(
-            "The old document may already be partially removed. Retry the replacement "
-            "until its verified deletion completes before cancelling.",
-            code="replacement-cancellation-unsafe",
-        )
-
-    if stage == ReplacementState.PREPARING:
-        boundary_crossed = False
-        expected_old_states = {DocumentState.INGESTED}
-    elif stage == ReplacementState.DELETING_OLD:
-        boundary_crossed = old_state == DocumentState.DELETED
-        expected_old_states = {DocumentState.INGESTED, DocumentState.DELETED}
-    elif stage == ReplacementState.INGESTING_NEW:
-        boundary_crossed = True
-        expected_old_states = {DocumentState.DELETED}
-    elif stage == ReplacementState.FAILED:
-        boundary_crossed = old_state == DocumentState.DELETED
-        expected_old_states = {DocumentState.INGESTED, DocumentState.DELETED}
-    else:
-        raise LifecycleError(
-            "A completed replacement cannot be cancelled as pending work.",
-            code="upload-not-cancellable",
-        )
-
-    if old_state not in expected_old_states:
-        raise LifecycleError(
-            "The replacement stage and old document state are inconsistent.",
-            code="catalog-inconsistent",
-            status=500,
-        )
-
-    if workflow.state != ReplacementState.FAILED:
-        workflow.state = ReplacementState.FAILED
-        workflow.error = (
-            "Replacement cancelled after verified old-document deletion; incoming cleanup queued."
-            if boundary_crossed
-            else "Replacement cancelled before old-document deletion."
-        )
-        workflow.completed_at = cancelled_at
-
-    return {
-        "replacement_id": str(workflow.id),
-        "replacement_stage": stage.value,
-        "replacement_old_document_id": str(old_document.id),
-        "replacement_old_state": old_state.value,
-        "replacement_destructive_boundary_crossed": boundary_crossed,
-    }
-
-
-def cancel_upload(
+def _deletion_target_for_state(
     session: Session,
     *,
     document: Document,
-    actor_type: str,
-    actor_id: str,
-) -> WorkOperation:
-    """Cancel unpublished work and queue full cleanup of retained content."""
+    configured_active_qdrant_collection: str,
+) -> tuple[str, PreparedRevision | None, PublicationRecord | None]:
+    """Resolve the persisted physical target without re-resolving stable work."""
 
-    if document.state not in CANCELLABLE_STATES:
+    if document.state is DocumentState.READY:
+        revision, publication = _verified_ready_binding(session, document)
+        return publication.active_qdrant_collection, revision, publication
+
+    if document.state is DocumentState.REVIEW_REQUIRED:
+        revision = latest_sealed_revision(session, document.id)
+        if revision is None:
+            raise LifecycleError(
+                "prepared_revision_missing",
+                "The review document has no sealed prepared revision.",
+                status=500,
+            )
+        publication = _publication_for_revision(session, revision.id)
+        if publication is not None and (
+            publication.document_id != document.id
+            or publication.active_qdrant_collection != revision.active_qdrant_collection
+            or publication.expected_points != revision.expected_point_count
+        ):
+            raise LifecycleError(
+                "publication_binding_invalid",
+                "The review publication checkpoint does not match its revision.",
+                status=500,
+            )
+        return revision.active_qdrant_collection, revision, publication
+
+    if document.state is DocumentState.PUBLISH_FAILED:
+        publication = session.scalar(
+            select(PublicationRecord)
+            .where(PublicationRecord.document_id == document.id)
+            .order_by(PublicationRecord.created_at.desc())
+        )
+        revision = (
+            session.get(PreparedRevision, publication.prepared_revision_id)
+            if publication is not None
+            else None
+        )
+        if (
+            publication is None
+            or revision is None
+            or revision.document_id != document.id
+            or revision.status is not RevisionStatus.SEALED
+            or publication.status is PublicationStatus.VERIFIED
+            or publication.active_qdrant_collection
+            != revision.active_qdrant_collection
+            or publication.expected_points != revision.expected_point_count
+        ):
+            raise LifecycleError(
+                "publication_record_missing",
+                "The failed publication has no matching exact-target checkpoint.",
+                status=500,
+            )
+        return publication.active_qdrant_collection, revision, publication
+
+    revision = latest_revision(session, document.id)
+    if revision is not None:
+        return revision.active_qdrant_collection, revision, None
+    if not configured_active_qdrant_collection:
         raise LifecycleError(
-            "Only unpublished uploads can be cancelled.",
-            code="upload-not-cancellable",
+            "collection_configuration_invalid",
+            "The configured active collection target is empty.",
+            status=500,
         )
-    open_operations = session.scalars(
-        select(WorkOperation).where(
-            WorkOperation.document_id == document.id,
-            WorkOperation.state.in_((OperationState.QUEUED, OperationState.RUNNING)),
-        )
-    ).all()
-    if any(item.state == OperationState.RUNNING for item in open_operations):
-        raise LifecycleError(
-            "The upload is being processed right now; retry the cancellation shortly.",
-            code="upload-busy",
-        )
-    now = utc_now()
-    replacement_details = _prepare_replacement_cancellation(
-        session,
-        document,
-        cancelled_at=now,
-    )
-    for item in open_operations:
-        item.state = OperationState.CANCELLED
-        item.completed_at = now
-    document.state = DocumentState.CLEANUP_PENDING
-    document.cleanup_target = DocumentState.CANCELLED
-    operation = enqueue_operation(session, document, OperationType.CLEANUP)
-    audit(
-        session,
-        event_type="upload_cancelled",
-        actor_type=actor_type,
-        actor_id=actor_id,
-        document=document,
-        operation=operation,
-        details={"status": document.state.value, **replacement_details},
-    )
-    session.flush()
-    return operation
+    return configured_active_qdrant_collection, None, None
 
 
 def request_deletion(
     session: Session,
     *,
-    document: Document,
+    document_id: uuid.UUID,
+    idempotency: IdempotencyRecord,
     actor_type: str,
     actor_id: str,
-    reason: str | None = None,
-) -> WorkOperation:
-    """Queue removal of an ingested document from retrieval and storage."""
+    active_qdrant_collection: str,
+    screening_qdrant_collection: str,
+) -> MutationOutcome:
+    """Accept idempotent deletion from READY or stable unpublished states."""
 
-    if document.state == DocumentState.DELETE_FAILED:
-        return retry_upload(session, document=document, actor_type=actor_type, actor_id=actor_id)
-    if document.state != DocumentState.INGESTED:
+    if idempotency.actor_id != actor_id or idempotency.completed_at is not None:
         raise LifecycleError(
-            "Only an ingested document can be queued for deletion.",
-            code="document-not-deletable",
+            "idempotency_binding_invalid",
+            "The deletion idempotency reservation does not belong to this actor or request.",
+            status=500,
         )
-    in_flight = session.scalar(
-        select(ReplacementWorkflow).where(
-            ReplacementWorkflow.old_document_id == document.id,
-            ReplacementWorkflow.state.not_in((ReplacementState.SUCCEEDED, ReplacementState.FAILED)),
-        )
-    )
-    if in_flight is not None:
+    document = get_document_for_update(session, document_id)
+    if document.state in {DocumentState.DELETING, DocumentState.DELETE_FAILED}:
+        if document.terminal_disposition is not TerminalDisposition.DELETED:
+            raise LifecycleError(
+                "deletion_disposition_conflict",
+                "The document is already being purged for a different disposition.",
+            )
+        operation = _latest_deletion_operation(session, document.id)
+        if operation is None:
+            raise LifecycleError(
+                "deletion_operation_missing",
+                "The deleting document has no durable owning operation.",
+                status=500,
+            )
+        return MutationOutcome(document=document, operation=operation, idempotency=idempotency)
+    if document.state == DocumentState.DELETED:
+        operation = _latest_deletion_operation(session, document.id)
+        if operation is None:
+            raise LifecycleError(
+                "deletion_operation_missing",
+                "The deleted document has no retained deletion operation.",
+                status=500,
+            )
+        return MutationOutcome(document=document, operation=operation, idempotency=idempotency)
+    eligible = {
+        DocumentState.READY,
+        DocumentState.PREFLIGHT_FAILED,
+        DocumentState.REVIEW_REQUIRED,
+        DocumentState.PUBLISH_FAILED,
+    }
+    if document.state not in eligible:
         raise LifecycleError(
-            "This document is being replaced; the replacement owns its removal.",
-            code="document-being-replaced",
+            "document_state_conflict",
+            "The document cannot be deleted from its current state.",
         )
-    open_operation = session.scalar(
-        select(WorkOperation.id)
-        .where(
-            WorkOperation.document_id == document.id,
-            WorkOperation.state.in_((OperationState.QUEUED, OperationState.RUNNING)),
-        )
-        .limit(1)
-    )
-    if open_operation is not None:
-        raise LifecycleError(
-            "This document still has active ingestion work; retry deletion after it finishes.",
-            code="document-busy",
-        )
-    document.state = DocumentState.DELETING
-    operation = enqueue_operation(session, document, OperationType.DELETE)
-    audit(
+    target, revision, publication = _deletion_target_for_state(
         session,
-        event_type="deletion_requested",
+        document=document,
+        configured_active_qdrant_collection=active_qdrant_collection,
+    )
+    operation = begin_deletion(
+        session,
+        document=document,
+        terminal_disposition=TerminalDisposition.DELETED,
+        active_qdrant_collection=target,
+        screening_qdrant_collection=screening_qdrant_collection,
+        prepared_revision_id=revision.id if revision is not None else None,
+        publication_record_id=publication.id if publication is not None else None,
+        priority=OperationPriority.HIGH,
         actor_type=actor_type,
         actor_id=actor_id,
-        document=document,
-        operation=operation,
-        details={
-            "status": document.state.value,
-            "detail": reason or "Deletion queued for the internal worker.",
-            "collection_key": document.collection_key,
-        },
+        idempotency_record_id=idempotency.id,
     )
-    session.flush()
+    return MutationOutcome(document=document, operation=operation, idempotency=idempotency)
+
+
+def queue_rejection_cleanup(
+    session: Session,
+    *,
+    document: Document,
+    reason_code: str,
+    active_qdrant_collection: str,
+    screening_qdrant_collection: str,
+    prepared_revision_id: uuid.UUID | None,
+) -> WorkOperation:
+    """Keep REJECTED truthful by purging asynchronously through DELETING first."""
+
+    if not reason_code or len(reason_code) > 100:
+        raise LifecycleError(
+            "rejection_reason_invalid",
+            "Rejection cleanup requires a bounded reason code.",
+            status=500,
+        )
+    if document.state in {DocumentState.DELETING, DocumentState.DELETE_FAILED}:
+        if document.terminal_disposition is not TerminalDisposition.REJECTED:
+            raise LifecycleError(
+                "deletion_disposition_conflict",
+                "The document is already being purged for a different disposition.",
+            )
+        if document.failure_code not in {None, reason_code}:
+            raise LifecycleError(
+                "rejection_reason_conflict",
+                "The rejection cleanup already has a different terminal reason.",
+            )
+    elif document.state not in {
+        DocumentState.PREFLIGHTING,
+        DocumentState.PREFLIGHT_FAILED,
+    }:
+        raise LifecycleError(
+            "document_state_conflict",
+            "Only preflight work can transition to asynchronous rejection cleanup.",
+        )
+    operation = begin_deletion(
+        session,
+        document=document,
+        terminal_disposition=TerminalDisposition.REJECTED,
+        active_qdrant_collection=active_qdrant_collection,
+        screening_qdrant_collection=screening_qdrant_collection,
+        prepared_revision_id=prepared_revision_id,
+        publication_record_id=None,
+        priority=OperationPriority.HIGH,
+        actor_type="system",
+        actor_id="pdf-bridge",
+    )
+    # The cleanup transition clears transient worker failure fields. Restore the
+    # bounded terminal reason so the worker can carry it into the tombstone.
+    document.failure_code = reason_code
     return operation
 
 
-def can_serve_content(document: Document) -> bool:
-    """Return whether a clean retained document may be served to a browser."""
+def commit_tombstone(
+    session: Session,
+    *,
+    document: Document,
+    reason_code: str | None,
+    actor_type: str,
+    actor_id: str,
+) -> Tombstone:
+    """Commit the final content-free state after verified point/storage purge."""
+
+    if reason_code is not None and (not reason_code or len(reason_code) > 100):
+        raise LifecycleError(
+            "tombstone_reason_invalid",
+            "The tombstone reason code is invalid.",
+            status=500,
+        )
+    progress = document.deletion_progress
+    existing = document.tombstone
+    if existing is not None:
+        if (
+            progress is None
+            or existing.disposition is not progress.terminal_disposition
+            or document.state.value != existing.disposition.value
+            or progress.tombstoned_at is None
+        ):
+            raise LifecycleError(
+                "tombstone_binding_invalid",
+                "The retained tombstone does not match the document lifecycle.",
+                status=500,
+            )
+        return existing
+    if document.state not in {DocumentState.DELETING, DocumentState.DELETE_FAILED}:
+        raise LifecycleError(
+            "document_state_conflict",
+            "A tombstone can only finish an active deletion workflow.",
+            status=500,
+        )
+    if progress is None or progress.storage_purged_at is None:
+        raise LifecycleError(
+            "deletion_checkpoint_incomplete",
+            "Storage purge must be verified before a terminal tombstone is committed.",
+            status=500,
+        )
+    if document.terminal_disposition is not progress.terminal_disposition:
+        raise LifecycleError(
+            "deletion_disposition_conflict",
+            "The deletion checkpoint disposition does not match the document.",
+            status=500,
+        )
+    if progress.active_zero_verified_at is None or progress.screening_zero_verified_at is None:
+        raise LifecycleError(
+            "index_cleanup_incomplete",
+            "Both active and screening point counts must be zero before tombstoning.",
+            status=500,
+        )
+    if document.storage_key is not None:
+        raise LifecycleError(
+            "source_not_purged",
+            "The source object still exists in the catalog.",
+            status=500,
+        )
+    revision = (
+        session.get(PreparedRevision, progress.prepared_revision_id)
+        if progress.prepared_revision_id is not None
+        else None
+    )
+    if progress.prepared_revision_id is not None and (
+        revision is None or revision.document_id != document.id
+    ):
+        raise LifecycleError(
+            "deletion_binding_invalid",
+            "The deletion checkpoint revision no longer matches the document.",
+            status=500,
+        )
+    revision_ids = tuple(
+        session.scalars(
+            select(PreparedRevision.id).where(PreparedRevision.document_id == document.id)
+        ).all()
+    )
+    remaining_content = {
+        model.__tablename__: count
+        for model in (
+            RevisionArtifact,
+            ExtractedPage,
+            FormatterBatch,
+            PreparedPage,
+            PreparedChunk,
+            PreparedChunkVector,
+            PreparedCandidate,
+            CandidateEvidence,
+        )
+        if (
+            count := session.scalar(
+                select(func.count())
+                .select_from(model)
+                .where(model.prepared_revision_id.in_(revision_ids))
+            )
+            or 0
+        )
+    }
+    if remaining_content:
+        raise LifecycleError(
+            "content_purge_incomplete",
+            "Revision content remains after the storage purge checkpoint.",
+            status=500,
+            extra={"remaining_content": remaining_content},
+        )
+    tombstone = Tombstone(
+        document_id=document.id,
+        collection_key=document.collection_key,
+        disposition=progress.terminal_disposition,
+        source_sha256=document.sha256,
+        manifest_sha256=revision.manifest_sha256 if revision is not None else None,
+        reason_code=reason_code,
+        actor_type=actor_type,
+        actor_id=actor_id,
+    )
+    document.tombstone = tombstone
+    session.add(tombstone)
+    terminal_state = DocumentState(progress.terminal_disposition.value)
+    document.state = terminal_state
+    document.terminal_disposition = progress.terminal_disposition
+    document.failure_retryable = False
+    document.failure_message = None
+    document.failure_code = (
+        reason_code if terminal_state is DocumentState.REJECTED else None
+    )
+    now = utc_now()
+    if terminal_state == DocumentState.REJECTED:
+        document.rejected_at = now
+    elif terminal_state == DocumentState.CANCELLED:
+        document.cancelled_at = now
+    else:
+        document.deleted_at = now
+    progress.phase = DeletionPhase.COMMIT_TOMBSTONE
+    progress.failure_code = None
+    progress.tombstoned_at = now
+    audit(
+        session,
+        event_type="tombstone_committed",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        document_id=document.id,
+        details={"disposition": progress.terminal_disposition.value},
+    )
+    return tombstone
+
+
+def can_serve_source(document: Document) -> bool:
+    """Fail-closed source gate for clean, retained catalog states."""
 
     return (
-        document.scan_state == ScanState.CLEAN
+        document.scan_state is ScanState.CLEAN
         and document.storage_key is not None
-        and document.state in RETAINED_DOCUMENT_STATES
-        and document.state not in {DocumentState.CLEANUP_PENDING, DocumentState.CLEANUP_FAILED}
+        and document.state
+        in {
+            DocumentState.PREFLIGHTING,
+            DocumentState.PREFLIGHT_FAILED,
+            DocumentState.REVIEW_REQUIRED,
+            DocumentState.PUBLISHING,
+            DocumentState.PUBLISH_FAILED,
+            DocumentState.READY,
+        }
     )
 
 
-def is_open_upload(document: Document) -> bool:
-    """Return whether a document still represents open intake work."""
+def can_serve_prepared_content(document: Document) -> bool:
+    """Gate Markdown/chunks to states that require a sealed revision."""
 
-    return document.state in OPEN_UPLOAD_STATES
+    return can_serve_source(document) and document.state in {
+        DocumentState.REVIEW_REQUIRED,
+        DocumentState.PUBLISHING,
+        DocumentState.PUBLISH_FAILED,
+        DocumentState.READY,
+    }
+
+
+def utc_timestamp(value: datetime | None) -> str | None:
+    """Stable RFC 3339 helper used in idempotent response snapshots."""
+
+    if value is None:
+        return None
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")

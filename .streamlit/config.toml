@@ -1,0 +1,18 @@
+# Streamlit theme aligned with the PDF Bridge deployment brand palette
+# (brand_primary_1/2 and brand_secondary_1/2 in pdf_bridge.core.config).
+
+[theme]
+base = "light"
+primaryColor = "#173f34"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f5"
+textColor = "#1c2321"
+font = "sans serif"
+
+[server]
+# The server-side limit is PDF_BRIDGE_MAX_UPLOAD_BYTES (50 MiB by default);
+# PDF Bridge remains the authority and rejects oversized envelopes with 413.
+maxUploadSize = 100
+
+[browser]
+gatherUsageStats = false

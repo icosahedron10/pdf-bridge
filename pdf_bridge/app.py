@@ -1,4 +1,4 @@
-"""Litestar application assembly."""
+"""Litestar assembly for the API-v2-only intake service."""
 
 from __future__ import annotations
 
@@ -6,64 +6,117 @@ import hashlib
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
-from litestar import Litestar, MediaType, Response, Router
+from litestar import Litestar, Router
 from litestar.datastructures import State
 from litestar.di import Provide
+from litestar.middleware import DefineMiddleware
 from litestar.middleware.session.client_side import CookieBackendConfig
 from litestar.openapi.config import OpenAPIConfig
-from litestar.openapi.plugins import JsonRenderPlugin, SwaggerRenderPlugin
-from litestar.plugins.jinja import JinjaTemplateEngine
-from litestar.static_files import create_static_files_router
-from litestar.template.config import TemplateConfig
+from litestar.openapi.plugins import JsonRenderPlugin
+from litestar.types import ASGIApp, Message, Receive, Scope, Send
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from pdf_bridge import __version__
+from pdf_bridge.contracts.schemas import ErrorResponse
 from pdf_bridge.controllers.api import create_api_routers
-from pdf_bridge.controllers.web import TEMPLATE_ROOT, web_router
 from pdf_bridge.core.config import Settings, get_settings
 from pdf_bridge.core.logging_config import configure_logging
-from pdf_bridge.http.middleware import PortAwareTrustedHostMiddleware, RequestContextMiddleware
-from pdf_bridge.http.problems import exception_handlers
-from pdf_bridge.managers.worker import (
-    AnalysisWorker,
-    WorkerProviders,
-    providers_from_settings,
+from pdf_bridge.http.middleware import (
+    PortAwareTrustedHostMiddleware,
+    RequestContextMiddleware,
+    ensure_request_id,
 )
+from pdf_bridge.http.problems import exception_handlers
+from pdf_bridge.managers.worker import AnalysisWorker, WorkerProviders, providers_from_settings
 from pdf_bridge.persistence.db import build_engine, build_session_factory
-from pdf_bridge.services.intake import validate_collection_references
 from pdf_bridge.services.scanner import Scanner, scanner_from_settings
 
 DBProvider = Callable[[], Iterator[Session]]
 UPLOAD_REQUEST_OVERHEAD_BYTES = 1_048_576
 
 
+class _OpenApiJsonOnlyMiddleware:
+    """Replace OpenAPI-router HTML misses with the strict JSON API error."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        replacement_body: bytes | None = None
+        replacement_sent = False
+
+        async def send_json_only(message: Message) -> None:
+            nonlocal replacement_body, replacement_sent
+            if message["type"] == "http.response.start" and message["status"] in {
+                404,
+                405,
+            }:
+                status = message["status"]
+                request_id = ensure_request_id(scope)
+                error = ErrorResponse.model_validate(
+                    {
+                        "error": {
+                            "code": (
+                                "route_not_found"
+                                if status == 404
+                                else "method_not_allowed"
+                            ),
+                            "message": (
+                                "The requested API route was not found."
+                                if status == 404
+                                else "The requested method is not allowed for this API route."
+                            ),
+                            "request_id": request_id,
+                            "retryable": False,
+                        }
+                    }
+                )
+                replacement_body = error.model_dump_json().encode("utf-8")
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(replacement_body)).encode("ascii")),
+                            (b"cache-control", b"no-store"),
+                            (b"x-request-id", request_id.encode("ascii")),
+                        ],
+                    }
+                )
+                return
+            if message["type"] == "http.response.body" and replacement_body is not None:
+                if not replacement_sent:
+                    replacement_sent = True
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": replacement_body,
+                            "more_body": False,
+                        }
+                    )
+                return
+            await send(message)
+
+        await self.app(scope, receive, send_json_only)
+
+
 def _session_key(settings: Settings) -> bytes:
     secret = settings.session_secret.get_secret_value().encode("utf-8")
-    return hashlib.sha256(b"pdf-bridge/session/v1\0" + secret).digest()
+    return hashlib.sha256(b"pdf-bridge/session/v2\0" + secret).digest()
 
 
 def _db_from_state(state: State) -> Iterator[Session]:
-    """Yield a request session from the lifespan-owned session factory."""
-
     factory: sessionmaker[Session] = state.db_session_factory
     with factory() as session:
         yield session
-
-
-def _normalize_openapi_not_found(response: Response) -> Response:
-    """Keep unknown development schema routes on Litestar's JSON error contract."""
-
-    if response.status_code == 404:
-        return Response(
-            content={"status_code": 404, "detail": "Not Found"},
-            status_code=404,
-            media_type=MediaType.JSON,
-        )
-    return response
 
 
 def _openapi_config(settings: Settings) -> OpenAPIConfig | None:
@@ -71,25 +124,16 @@ def _openapi_config(settings: Settings) -> OpenAPIConfig | None:
         return None
     return OpenAPIConfig(
         title="PDF Bridge API",
-        summary="A transparent upload, analysis, and semantic-intake bridge for PDFs.",
+        summary="Prepared-revision semantic PDF intake and replacement API.",
         version=__version__,
         path="/api",
         openapi_router=Router(
             path="/api",
             route_handlers=[],
-            after_request=_normalize_openapi_not_found,
             include_in_schema=False,
+            middleware=[DefineMiddleware(_OpenApiJsonOnlyMiddleware)],
         ),
-        render_plugins=[
-            SwaggerRenderPlugin(
-                path="/docs",
-                favicon=(
-                    '<link rel="icon" type="image/svg+xml" '
-                    'href="/static/favicon.svg">'
-                ),
-            ),
-            JsonRenderPlugin(path="/openapi.json", media_type=MediaType.JSON),
-        ],
+        render_plugins=[JsonRenderPlugin(path="/openapi.json")],
     )
 
 
@@ -102,32 +146,15 @@ def create_app(
     worker: AnalysisWorker | None = None,
     worker_providers: WorkerProviders | None = None,
 ) -> Litestar:
-    """Assemble and configure the PDF Bridge Litestar application.
-
-    The internal analysis worker is lifespan-owned: it starts with the app,
-    recovers durable leases, and stops before the engine is disposed. Tests
-    may inject a preconstructed worker (or disable it via settings) and drive
-    operations synchronously instead.
-    """
+    """Assemble the sole v2 service surface and its lifespan-owned worker."""
 
     active_settings = settings or get_settings()
-    if active_settings.app_env != "test":
-        if db_provider is not None:
-            raise RuntimeError("custom database providers are supported only in test mode")
-        if worker is not None:
-            raise RuntimeError("custom workers are supported only in test mode")
+    if active_settings.app_env != "test" and (db_provider is not None or worker is not None):
+        raise RuntimeError("custom database and worker injection is supported only in test mode")
     configure_logging()
 
     @asynccontextmanager
     async def lifespan(application: Litestar):
-        """Own the engine, session factory, worker, and HTTP clients.
-
-        Owned resources are built from the settings given to ``create_app`` so
-        the validated database is the served database, and they are always
-        released — including when startup validation fails. Injected resources
-        remain caller-owned and are never closed here.
-        """
-
         engine: Engine | None = None
         owned_search_client: httpx.Client | None = None
         owned_provider_client: httpx.Client | None = None
@@ -137,27 +164,24 @@ def create_app(
             if db_provider is None:
                 engine = build_engine(active_settings.database_url)
                 factory = build_session_factory(engine)
-                with factory() as session:
-                    validate_collection_references(
-                        session,
-                        {collection.key for collection in active_settings.collections},
-                    )
                 application.state.db_session_factory = factory
             if search_http_client is None:
-                owned_search_client = httpx.Client(timeout=active_settings.search_api_timeout)
+                owned_search_client = httpx.Client(
+                    timeout=active_settings.search_api_timeout_seconds
+                )
                 application.state.search_http_client = owned_search_client
 
             if worker is not None:
                 application.state.worker = worker
             elif active_settings.worker_enabled and factory is not None:
-                if worker_providers is None:
-                    if active_settings.embedding_api_url or active_settings.llm_api_url:
-                        owned_provider_client = httpx.Client()
+                providers = worker_providers
+                if providers is None:
+                    owned_provider_client = httpx.Client()
                     providers = providers_from_settings(
-                        active_settings, http_client=owned_provider_client
+                        active_settings,
+                        http_client=owned_provider_client,
                     )
-                else:
-                    providers = worker_providers
+                application.state.worker_providers = providers
                 owned_worker = AnalysisWorker(
                     settings=active_settings,
                     session_factory=factory,
@@ -179,14 +203,14 @@ def create_app(
     state_values: dict[str, object] = {
         "settings": active_settings,
         "scanner": scanner or scanner_from_settings(active_settings),
-        # SQLite remains deliberately single-process. Litestar runs blocking
-        # handlers in worker threads, so transition boundaries still share a lock.
         "transition_lock": threading.RLock(),
     }
     if search_http_client is not None:
         state_values["search_http_client"] = search_http_client
     if worker is not None:
         state_values["worker"] = worker
+    if worker_providers is not None:
+        state_values["worker_providers"] = worker_providers
 
     session_config = CookieBackendConfig(
         secret=_session_key(active_settings),
@@ -197,36 +221,16 @@ def create_app(
         httponly=True,
         samesite="strict",
     )
-
-    static_root = Path(__file__).with_name("static")
-    upload_request_limit = (
-        active_settings.max_upload_bytes + UPLOAD_REQUEST_OVERHEAD_BYTES
-    )
+    upload_request_limit = active_settings.max_upload_bytes + UPLOAD_REQUEST_OVERHEAD_BYTES
     application = Litestar(
-        route_handlers=[
-            *create_api_routers(upload_request_limit),
-            web_router,
-            create_static_files_router(path="/static", directories=[static_root]),
-        ],
-        dependencies={
-            # Litestar manages generator dependency cleanup itself; its
-            # sync_to_thread flag intentionally has no effect on generators.
-            "db": Provide(db_provider or _db_from_state),
-        },
+        route_handlers=create_api_routers(upload_request_limit),
+        dependencies={"db": Provide(db_provider or _db_from_state)},
         exception_handlers=exception_handlers,
         lifespan=[lifespan],
         middleware=[session_config.middleware],
         openapi_config=_openapi_config(active_settings),
         state=State(state_values),
-        template_config=TemplateConfig(
-            directory=TEMPLATE_ROOT,
-            engine=JinjaTemplateEngine,
-        ),
     )
-
-    # Litestar attaches ordinary middleware after route resolution. Wrap the
-    # completed handler so host checks, request IDs, and security headers also
-    # cover framework-generated 404 and 405 responses.
     application.asgi_handler = RequestContextMiddleware(
         PortAwareTrustedHostMiddleware(
             application.asgi_handler,

@@ -6,20 +6,31 @@ if [ -z "${PDF_BRIDGE_STORAGE_ROOT:-}" ]; then
     exit 64
 fi
 
-if [ -z "${PDF_BRIDGE_SESSION_SECRET:-}" ] || [ -z "${PDF_BRIDGE_QDRANT_API_KEY:-}" ]; then
-    echo "PDF_BRIDGE_SESSION_SECRET and PDF_BRIDGE_QDRANT_API_KEY are required" >&2
+if [ -n "${PDF_BRIDGE_QDRANT_ADMIN_API_KEY:-}" ]; then
+    echo "PDF_BRIDGE_QDRANT_ADMIN_API_KEY must never be injected into the Bridge process" >&2
     exit 64
 fi
 
-case "$PDF_BRIDGE_SESSION_SECRET:$PDF_BRIDGE_QDRANT_API_KEY:${PDF_BRIDGE_EMBEDDING_API_TOKEN:-}:${PDF_BRIDGE_LLM_API_TOKEN:-}" in
+if [ -z "${PDF_BRIDGE_SESSION_SECRET:-}" ] || [ -z "${PDF_BRIDGE_QDRANT_API_KEY:-}" ] \
+    || [ -z "${PDF_BRIDGE_FORMATTER_API_TOKEN:-}" ] || [ -z "${PDF_BRIDGE_LLM_API_TOKEN:-}" ]; then
+    echo "session, scoped Qdrant JWT, formatter, and advisory credentials are required" >&2
+    exit 64
+fi
+
+case "$PDF_BRIDGE_SESSION_SECRET:$PDF_BRIDGE_QDRANT_API_KEY:$PDF_BRIDGE_FORMATTER_API_TOKEN:$PDF_BRIDGE_LLM_API_TOKEN" in
     *CHANGE_ME*|development-only-change-me:*)
         echo "replace all placeholder/development secrets before starting PDF Bridge" >&2
         exit 64
         ;;
 esac
 
-if [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_QDRANT_API_KEY" ]; then
-    echo "session and Qdrant administrative secrets must be different" >&2
+if [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_QDRANT_API_KEY" ] \
+    || [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_FORMATTER_API_TOKEN" ] \
+    || [ "$PDF_BRIDGE_SESSION_SECRET" = "$PDF_BRIDGE_LLM_API_TOKEN" ] \
+    || [ "$PDF_BRIDGE_QDRANT_API_KEY" = "$PDF_BRIDGE_FORMATTER_API_TOKEN" ] \
+    || [ "$PDF_BRIDGE_QDRANT_API_KEY" = "$PDF_BRIDGE_LLM_API_TOKEN" ] \
+    || [ "$PDF_BRIDGE_FORMATTER_API_TOKEN" = "$PDF_BRIDGE_LLM_API_TOKEN" ]; then
+    echo "session and provider credentials must all be different" >&2
     exit 64
 fi
 

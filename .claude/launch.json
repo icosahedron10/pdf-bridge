@@ -5,9 +5,24 @@
       "name": "pdf-bridge-demo",
       "runtimeExecutable": "C:\\Users\\madse\\OneDrive\\Documents\\pdf-storage-manager\\.venv\\Scripts\\python.exe",
       "runtimeArgs": [
-        "C:\\Users\\madse\\AppData\\Local\\Temp\\claude\\C--Users-madse-OneDrive-Documents-pdf-storage-manager\\ff865188-d271-4113-b7c8-cf46be4652cc\\scratchpad\\demo_server.py"
+        "C:\\Users\\madse\\AppData\\Local\\Temp\\claude\\C--Users-madse-OneDrive-Documents-pdf-storage-manager\\3595fe48-847e-4e39-93a5-77f67894ef8f\\scratchpad\\bridge_demo_server.py"
       ],
-      "port": 8123
+      "port": 8000
+    },
+    {
+      "name": "streamlit-workspace",
+      "runtimeExecutable": "C:\\Users\\madse\\OneDrive\\Documents\\pdf-storage-manager\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "streamlit_app/app.py",
+        "--server.headless",
+        "true",
+        "--server.port",
+        "8501"
+      ],
+      "port": 8501
     }
   ]
 }

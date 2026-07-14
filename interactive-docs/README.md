@@ -1,25 +1,20 @@
-# PDF Bridge documentation wiki
+# Retired PDF Bridge interactive documentation
 
-Internal role guides and technical reference for the PDF Bridge proof of concept, built with
-vinext and deployed through OpenAI Sites.
+**Status: Retired.** This package now serves only a retirement notice. It is not an authoritative
+source for PDF Bridge behavior or architecture.
 
-The wiki uses separate, linkable routes for the library operator, semantic intake owner, platform
-operator, retrieval service integrator, chatbot integrator, security reviewer, and code maintainer.
-Reference pages cover lifecycle states, the intake API, code architecture, configuration and
-operations, search correlation, and the Playwright/ClamAV review.
+Use the repository-level `README.md` and `docs/` directory for current architecture, interfaces,
+configuration, and operations. Streamlit is the target operator facade.
 
-These guides describe responsibilities, not application RBAC. Browser users currently share one
-capability set. The lifespan-owned worker is internal to the single application process, while
-provider and Qdrant credentials protect service boundaries.
+The vinext package and deployment configuration remain in place so previously published URLs can
+direct readers to the canonical Markdown documentation.
 
-## Local development
+## Local verification
 
 Requires Node.js 22.13 or newer.
 
 ```sh
 npm ci
-npm run dev
+npm run lint
+npm test
 ```
-
-Use `npm run lint` and `npm test` before publishing. The site has no persistence, uploads, or
-application-owned authentication.
