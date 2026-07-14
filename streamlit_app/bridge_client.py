@@ -110,7 +110,7 @@ def _download_filename(response: httpx.Response, fallback: str) -> str:
         from urllib.parse import unquote
 
         return unquote(utf8_match.group(1))
-    quoted_match = re.search(r'filename="([^"\\r\\n]+)"', disposition)
+    quoted_match = re.search(r'filename="([^"\r\n]+)"', disposition)
     return quoted_match.group(1) if quoted_match else fallback
 
 

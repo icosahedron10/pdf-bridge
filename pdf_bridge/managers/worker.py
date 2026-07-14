@@ -20,7 +20,7 @@ import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -543,6 +543,7 @@ class AnalysisWorker:
         self._claim_lock = threading.Lock()
         self._busy_lock = threading.Lock()
         self._busy_documents: set[uuid.UUID] = set()
+        self._claim_times: dict[uuid.UUID, datetime] = {}
         self._threads: list[threading.Thread] = []
 
     # -- process lifecycle -------------------------------------------------
@@ -755,21 +756,48 @@ class AnalysisWorker:
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(timeout=self.settings.worker_heartbeat_seconds):
             try:
-                with self.session_factory.begin() as session:
-                    now = utc_now()
-                    running = session.scalars(
-                        select(WorkOperation).where(
-                            WorkOperation.state == OperationState.RUNNING,
-                            WorkOperation.worker_id == self.worker_id,
-                        )
-                    ).all()
-                    for operation in running:
-                        operation.heartbeat_at = now
-                        operation.lease_expires_at = now + timedelta(
-                            seconds=self.settings.worker_lease_seconds
-                        )
+                self.renew_leases()
             except Exception:
                 logger.exception("worker heartbeat failed")
+
+    def renew_leases(self) -> int:
+        """Extend leases only for claims still inside the operation runtime cap.
+
+        A claim older than ``worker_max_operation_seconds`` stops being renewed so
+        its lease lapses, ``recover_leases`` requeues the operation, and the hung
+        executing thread fails on its next durable step via ``LeaseLostError``.
+        """
+
+        now = utc_now()
+        cutoff = now - timedelta(seconds=self.settings.worker_max_operation_seconds)
+        with self._busy_lock:
+            capped = {
+                operation_id
+                for operation_id, claimed_at in self._claim_times.items()
+                if claimed_at <= cutoff
+            }
+        renewed = 0
+        with self.session_factory.begin() as session:
+            running = session.scalars(
+                select(WorkOperation).where(
+                    WorkOperation.state == OperationState.RUNNING,
+                    WorkOperation.worker_id == self.worker_id,
+                )
+            ).all()
+            for operation in running:
+                if operation.id in capped:
+                    continue
+                operation.heartbeat_at = now
+                operation.lease_expires_at = now + timedelta(
+                    seconds=self.settings.worker_lease_seconds
+                )
+                renewed += 1
+        if capped:
+            logger.warning(
+                "operation exceeded the runtime cap; lease renewal stopped",
+                extra={"operation_ids": sorted(str(item) for item in capped)},
+            )
+        return renewed
 
     def _claim_next(self) -> ClaimedOperation | None:
         with self._claim_lock:
@@ -834,11 +862,13 @@ class AnalysisWorker:
                 if set(claimed.locked_document_ids) & self._busy_documents:
                     raise RuntimeError("document work exclusion changed while claiming")
                 self._busy_documents.update(claimed.locked_document_ids)
+                self._claim_times[claimed.operation_id] = utc_now()
             return claimed
 
     def _release_claim(self, claimed: ClaimedOperation) -> None:
         with self._busy_lock:
             self._busy_documents.difference_update(claimed.locked_document_ids)
+            self._claim_times.pop(claimed.operation_id, None)
 
     # -- operation dispatch and durable helpers ---------------------------
 

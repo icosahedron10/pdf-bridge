@@ -745,9 +745,12 @@ def get_operation_metrics(
 ) -> Response[OperationMetricsResponse]:
     """Return content-free queue depth, age, and durable phase aggregates."""
 
-    result = catalog.operation_metrics(
-        db, definitions=request.app.state.settings.collections
-    )
+    try:
+        result = catalog.operation_metrics(
+            db, definitions=request.app.state.settings.collections
+        )
+    except _TRANSPORT_ERRORS as exc:
+        raise _problem(exc) from exc
     return _authenticated_response(request, result)
 
 

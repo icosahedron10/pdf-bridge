@@ -353,6 +353,7 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = 1.0
     worker_lease_seconds: int = 300
     worker_heartbeat_seconds: int = 30
+    worker_max_operation_seconds: int = 3_600
 
     search_api_url: str | None = None
     search_api_token: SecretStr | None = None
@@ -592,6 +593,8 @@ class Settings(BaseSettings):
             raise ValueError("worker_lease_seconds must be between 10 and 3600")
         if not 1 <= self.worker_heartbeat_seconds < self.worker_lease_seconds:
             raise ValueError("worker_heartbeat_seconds must be shorter than the lease")
+        if self.worker_max_operation_seconds <= self.worker_lease_seconds:
+            raise ValueError("worker_max_operation_seconds must exceed worker_lease_seconds")
 
     def _validate_provider_groups(self) -> None:
         formatter = {

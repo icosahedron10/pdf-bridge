@@ -472,6 +472,64 @@ def test_heartbeat_preserves_phase_start_and_phase_transition_advances_it(
         assert repeated.phase_started_at == new_phase_start
 
 
+def test_lease_renewal_stops_after_the_operation_runtime_cap(
+    settings: Settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    owner = document()
+    now = utc_now().replace(tzinfo=None)
+    operation = WorkOperation(
+        document=owner,
+        operation_type=OperationType.PREFLIGHT,
+        priority=int(OperationPriority.NORMAL),
+        state=OperationState.QUEUED,
+        phase=OperationPhase.QUEUED,
+        phase_started_at=now,
+        attempt=1,
+        created_at=now,
+    )
+    with session_factory.begin() as session:
+        session.add_all([owner, operation])
+
+    worker = AnalysisWorker(
+        settings=settings,
+        session_factory=session_factory,
+        providers=WorkerProviders(),
+        worker_id="runtime-cap-test",
+    )
+    claimed = worker._claim_next()
+    assert claimed is not None
+
+    assert worker.renew_leases() == 1
+    with session_factory() as session:
+        running = session.get(WorkOperation, operation.id)
+        assert running is not None
+        renewed_lease = running.lease_expires_at
+        assert renewed_lease is not None
+
+    worker._claim_times[claimed.operation_id] = utc_now() - timedelta(
+        seconds=settings.worker_max_operation_seconds + 1
+    )
+    assert worker.renew_leases() == 0
+    with session_factory() as session:
+        capped = session.get(WorkOperation, operation.id)
+        assert capped is not None
+        assert capped.lease_expires_at == renewed_lease
+
+    with session_factory.begin() as session:
+        stalled = session.get(WorkOperation, operation.id)
+        assert stalled is not None
+        stalled.lease_expires_at = utc_now() - timedelta(seconds=1)
+    assert worker.recover_leases() == 1
+    with session_factory() as session:
+        requeued = session.get(WorkOperation, operation.id)
+        assert requeued is not None
+        assert requeued.state is OperationState.QUEUED
+        assert requeued.worker_id is None
+
+    worker._release_claim(claimed)
+
+
 def test_preflight_failure_keeps_last_durable_preparation_phase(
     settings: Settings,
     session_factory: sessionmaker[Session],

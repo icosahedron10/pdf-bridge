@@ -263,6 +263,7 @@ read-only JWT for active collections and no access to screening.
 | <code>PDF_BRIDGE_WORKER_POLL_SECONDS</code> | <code>1</code> | Best-effort dispatch interval |
 | <code>PDF_BRIDGE_WORKER_LEASE_SECONDS</code> | <code>300</code> | Durable recovery lease |
 | <code>PDF_BRIDGE_WORKER_HEARTBEAT_SECONDS</code> | <code>30</code> | Must be shorter than the lease |
+| <code>PDF_BRIDGE_WORKER_MAX_OPERATION_SECONDS</code> | <code>3600</code> | Per-claim runtime cap; must exceed the lease. Past the cap the heartbeat stops renewing, so the lease lapses and the operation is requeued |
 
 Run exactly one Uvicorn process and one in-process worker against the SQLite catalog. The worker
 has two operation slots, while local embedding has one serialized lane. The capacity target is a

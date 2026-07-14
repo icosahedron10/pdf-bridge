@@ -280,6 +280,43 @@ def test_source_and_degraded_readiness_preserve_non_json_transport_semantics() -
     assert content_type == "application/pdf"
 
 
+def test_source_download_parses_plain_quoted_ascii_filenames() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v2/documents/doc/source"
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7 source",
+            headers={
+                "Content-Type": "application/pdf",
+                "Content-Disposition": 'inline; filename="quarterly-report.pdf"',
+            },
+            request=request,
+        )
+
+    client = BridgeClient("https://bridge.test", transport=httpx.MockTransport(handler))
+
+    _content, filename, _content_type = client.source("doc")
+    assert filename == "quarterly-report.pdf"
+
+
+def test_source_download_falls_back_to_document_id_without_a_parseable_filename() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7 source",
+            headers={
+                "Content-Type": "application/pdf",
+                "Content-Disposition": "inline",
+            },
+            request=request,
+        )
+
+    client = BridgeClient("https://bridge.test", transport=httpx.MockTransport(handler))
+
+    _content, filename, _content_type = client.source("doc")
+    assert filename == "doc.pdf"
+
+
 def test_expired_csrf_session_refreshes_once_with_the_same_idempotency_key() -> None:
     requests: list[httpx.Request] = []
     bootstrap_count = 0

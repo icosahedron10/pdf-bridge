@@ -325,6 +325,11 @@ The deployment cutover is a reset, not an in-place migration:
 10. reconcile every source checksum, catalog document, object, Qdrant point count, and collection
     view before declaring cutover complete.
 
+A catalog stamped with the retired `0001_semantic_intake` Alembic revision cannot be
+`alembic upgrade`d: that revision was replaced by `0001_target_bridge`, so Alembic will fail with
+an unknown-revision error. Step 6 is therefore mandatory — delete and recreate the old SQLite
+catalog; never upgrade it in place.
+
 There is no Jenkins compatibility mode, synthetic ingested record, alias migration, plain-text
 fallback, or reuse of old incompatible points. Use the exact manifest, resume-state, and rollback
 procedure in [coordinated reingestion](migration/historical-import.md).

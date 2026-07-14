@@ -231,6 +231,11 @@ Browser mutations require an authenticated session, same-origin request, CSRF pr
 idempotency key. The Bridge URL is deployment-owned in Streamlit, is not operator-editable, and
 redirects are refused to limit server-side request forgery and credential forwarding.
 
+The session cookie is marked `Secure` only when `PDF_BRIDGE_APP_ENV=enterprise`. Any deployment
+terminating TLS in front of Bridge must therefore run in the enterprise environment, which also
+forces trusted-header authentication; the non-enterprise cookie is intended only for the isolated
+localhost POC topology.
+
 In trusted-header mode, the approved ingress injects the configured identity header into the
 incoming Streamlit request. Streamlit requires it and forwards its value server-side; the browser
 does not manufacture the header. Bridge accepts it only when Streamlit's direct-peer address is in
