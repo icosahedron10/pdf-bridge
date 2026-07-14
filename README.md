@@ -137,6 +137,18 @@ pytest -q
 Browser tests require Playwright and its Chromium runtime. ClamAV integration tests require a live
 daemon and remain separately marked.
 
+## Streamlit workspace
+
+A Streamlit operator front end covering the full intake lifecycle lives in
+[`streamlit_app/`](streamlit_app/README.md). It is a pure HTTP client of a running PDF Bridge
+service — it holds the same session and CSRF contract as the built-in browser UI and never opens
+the catalog database directly.
+
+```bash
+python -m pip install -e '.[streamlit]'
+streamlit run streamlit_app/app.py
+```
+
 ## Documentation
 
 - [Architecture and lifecycle](docs/architecture.md)

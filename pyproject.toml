@@ -31,6 +31,9 @@ dev = [
   "respx==0.23.1",
   "ruff==0.15.21",
 ]
+streamlit = [
+  "streamlit>=1.46,<2",
+]
 
 [project.scripts]
 pdf-bridge = "pdf_bridge.controllers.admin_cli:app"
@@ -63,3 +66,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+# The Streamlit workspace's flat modules resolve from streamlit_app/ at runtime.
+known-first-party = ["pdf_bridge", "bridge_client", "bridge_ui", "views"]
