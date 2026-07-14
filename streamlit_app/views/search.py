@@ -1,131 +1,132 @@
-"""Search page: operator workspace access to the external retrieval service."""
+"""Optional operator-only proxy to the external active-corpus retrieval service."""
 
 from __future__ import annotations
+
+import html
 
 import streamlit as st
 
 import bridge_ui as ui
-
-_MODE_HELP = {
-    "hybrid": "Fuses keyword and semantic rankings (recommended).",
-    "keyword": "Exact-term BM25 matching.",
-    "semantic": "Dense-vector similarity.",
-}
+from bridge_client import BridgeProblem, BridgeUnreachable
 
 
-def _document_label(client, document_id: str) -> str:
-    """Resolve a hit's filename, caching lookups for the session."""
+def _open_document(document_id: str) -> None:
+    st.query_params["document"] = document_id
+    st.switch_page("views/library.py")
 
-    cache: dict[str, str] = st.session_state.setdefault("search_doc_labels", {})
-    if document_id not in cache:
-        try:
-            detail = client.document(document_id)
-            cache[document_id] = detail.get("original_filename", document_id)
-        except Exception:
-            cache[document_id] = document_id
-    return cache[document_id]
+
+def _run_search(client, **kwargs):
+    try:
+        return client.search(**kwargs)
+    except BridgeProblem as error:
+        if error.status == 503:
+            st.warning("Operator search is not configured or its retrieval service is unavailable.")
+            st.caption(
+                f"`{error.code}`" + (f" · request `{error.request_id}`" if error.request_id else "")
+            )
+            return None
+        ui.render_problem(error)
+    except BridgeUnreachable as error:
+        ui.render_unreachable(error)
+    return None
 
 
 def render() -> None:
-    """Render retrieval search over configured collections."""
-
     ui.apply_chrome(
         "Search",
-        "Query published content through the stable external retrieval contract.",
+        "Run an optional operator diagnostic against one configured active collection.",
     )
     client = ui.get_client()
-
-    collections_payload = ui.guarded(client.collections)
-    if collections_payload is None:
+    collections = ui.guarded(lambda: client.collections(limit=100))
+    if collections is None:
         return
-    options = ui.collection_options(collections_payload)
+    options = ui.collection_options(collections)
     if not options:
-        st.info("No collections are configured.")
+        st.info("No enabled collections are configured.")
         return
 
-    with st.form("search-form"):
-        query = st.text_input("Query", max_chars=1000, placeholder="What are you looking for?")
-        form_columns = st.columns([2, 3])
-        mode = form_columns[0].radio(
-            "Mode",
-            options=("hybrid", "keyword", "semantic"),
-            horizontal=True,
-            help=" ".join(f"**{name}**: {text}" for name, text in _MODE_HELP.items()),
-        )
-        selected_collections = form_columns[1].multiselect(
-            "Collections",
+    with st.form("operator-search"):
+        collection_key = st.selectbox(
+            "Collection",
             options=list(options),
-            default=list(options)[:1],
             format_func=options.get,
-            help="Pick one collection for ranked hits with snippets; several "
-            "collections return match totals only.",
         )
-        submitted = st.form_submit_button("Search", type="primary", icon=":material/search:")
+        query = st.text_input(
+            "Query",
+            max_chars=1000,
+            placeholder="Enter a precise retrieval diagnostic",
+        )
+        mode_column, limit_column = st.columns(2)
+        mode = mode_column.selectbox(
+            "Mode",
+            options=("hybrid", "semantic", "keyword"),
+            format_func=str.title,
+        )
+        limit = limit_column.number_input(
+            "Result limit",
+            min_value=1,
+            max_value=100,
+            value=20,
+        )
+        submitted = st.form_submit_button(
+            "Run operator search",
+            type="primary",
+            icon=":material/search:",
+        )
 
+    st.caption(
+        "Bridge validates every hit against the requested collection and READY state. "
+        "It never exposes the upstream credential."
+    )
     if not submitted:
-        st.caption(
-            "Search covers published (active) content only. Pending uploads stay "
-            "in the private screening index and are never retrievable."
-        )
         return
     if not query.strip():
-        st.warning("Enter a query first.")
-        return
-    if not selected_collections:
-        st.warning("Select at least one collection.")
+        st.warning("Enter a non-blank query.")
         return
 
-    include_hits = len(selected_collections) == 1
-    response = ui.guarded(
-        lambda: client.search(
-            query=query.strip(),
-            mode=mode,
-            collections=selected_collections,
-            include_hits=include_hits,
-            page=1,
-            page_size=20,
-        )
+    payload = _run_search(
+        client,
+        collection_key=collection_key,
+        query=query,
+        mode=mode,
+        limit=int(limit),
     )
-    if response is None:
+    if payload is None:
+        return
+    results = payload.get("results", [])
+    st.subheader(f"Results · {len(results)}")
+    if not results:
+        st.info("No READY document chunks matched this query.")
         return
 
-    groups = response.get("groups", [])
-    if not include_hits:
-        st.markdown("##### Matches per collection")
-        st.dataframe(
-            [
-                {
-                    "Collection": options.get(group["collection_key"], group["collection_key"]),
-                    "Matches": group["total"],
-                }
-                for group in groups
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption("Narrow to a single collection to see ranked hits and snippets.")
-        return
-
-    group = groups[0] if groups else {"total": 0, "hits": []}
-    st.markdown(f"##### {group.get('total', 0)} match(es)")
-    if not group.get("hits"):
-        st.info("No published content matched this query.")
-        return
-    for hit in group["hits"]:
+    for hit in results:
         document_id = str(hit["document_id"])
         with st.container(border=True):
-            columns = st.columns([6, 2, 2])
-            columns[0].markdown(f"**{_document_label(client, document_id)}**")
-            columns[1].metric("Score", f"{hit['score']:.3f}")
-            if columns[2].button("Open document", key=f"hit-{document_id}"):
-                st.query_params.clear()
-                st.query_params["doc"] = document_id
-                st.switch_page("views/library.py")
-            snippet = hit.get("snippet", "")
-            if snippet:
-                st.markdown(
-                    f'<div class="pdfb-excerpt">{snippet}</div>', unsafe_allow_html=True
+            heading, score, action = st.columns([5, 1, 2])
+            heading.markdown(
+                f"**#{hit.get('rank', '?')} · {hit.get('original_filename', 'Unknown')}**"
+            )
+            location = " / ".join(hit.get("heading_path", []))
+            if hit.get("page_start") is not None:
+                location = f"pages {hit['page_start']}–{hit['page_end']}" + (
+                    f" · {location}" if location else ""
                 )
+            heading.caption(location or "Document-level result")
+            score.metric("Score", f"{float(hit.get('score', 0)):.3f}")
+            if action.button(
+                "Inspect document",
+                key=f"search-open::{document_id}::{hit.get('rank')}",
+                use_container_width=True,
+            ):
+                _open_document(document_id)
+            st.markdown(
+                f'<div class="pdfb-excerpt">{html.escape(str(hit.get("excerpt", "")))}</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Document `{document_id}` · revision `{hit.get('prepared_revision_id', '—')}`"
+                + (f" · chunk `{hit['chunk_id']}`" if hit.get("chunk_id") else "")
+            )
 
 
 render()

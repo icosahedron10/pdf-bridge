@@ -1,523 +1,507 @@
-"""Catalog queries and catalog-boundary validation."""
+"""Read-only API-v2 catalog queries and opaque cursor pagination."""
 
 from __future__ import annotations
 
-import math
+import base64
+import binascii
+import json
 import uuid
-from collections.abc import Iterable, Sequence
-from typing import Literal
-from uuid import UUID
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Generic, TypeVar
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, selectinload
 
-from pdf_bridge.contracts.schemas import (
-    AnalysisDetailResponse,
-    ChunkExcerptPublic,
-    CollectionListResponse,
-    CollectionSummary,
-    DocumentDetail,
-    DocumentListResponse,
-    SearchRequest,
-    SearchResponse,
-    UploadListResponse,
-    UploadResource,
-)
 from pdf_bridge.core.config import CollectionDefinition
 from pdf_bridge.persistence.models import (
-    OPEN_UPLOAD_STATES,
-    AnalysisCandidate,
-    AnalysisChunk,
+    TERMINAL_DOCUMENT_STATES,
+    AuditEvent,
+    Decision,
+    DeletionProgress,
     Document,
     DocumentState,
-    IntakeDecision,
     OperationState,
-    ReplacementState,
-    ReplacementWorkflow,
+    PreparedChunk,
+    PreparedRevision,
+    PublicationRecord,
+    TerminalDisposition,
+    Tombstone,
     WorkOperation,
 )
-from pdf_bridge.presentation.api_serializers import (
-    analysis_summary,
-    candidate_public,
-    chunk_excerpt,
-    decision_summary,
-    document_summary,
-    operation_summary,
-    upload_resource,
-)
-from pdf_bridge.services.analysis import candidate_snapshot_analysis_id
-from pdf_bridge.services.errors import ServiceError
+from pdf_bridge.services.document import configured_collection
 from pdf_bridge.services.intake import (
-    latest_analysis,
-    latest_operation,
-    replacement_target_issue,
+    LifecycleError,
+    can_serve_prepared_content,
+    latest_sealed_revision,
 )
 
-LIBRARY_STATES = (
-    DocumentState.INGESTED,
-    DocumentState.DELETING,
-    DocumentState.DELETE_FAILED,
-)
-RETRIEVAL_STATES = (
-    DocumentState.INGESTED,
-    DocumentState.DELETING,
-    DocumentState.DELETE_FAILED,
-)
-MAX_EXCERPTS_PER_SIDE = 6
+T = TypeVar("T")
 
 
-def retrieval_catalog_filters(*, collection_key: str | None = None) -> list:
-    """Build the common retrieval-eligibility SQL predicates."""
-
-    filters = [Document.state.in_(RETRIEVAL_STATES)]
-    if collection_key is not None:
-        filters.append(Document.collection_key == collection_key)
-    return filters
+@dataclass(frozen=True, slots=True)
+class CursorPage(Generic[T]):
+    items: list[T]
+    next_cursor: str | None
 
 
-def configured_collection(
-    definitions: Sequence[CollectionDefinition], collection_key: str
-) -> CollectionDefinition:
-    """Resolve a deployment collection or fail with a stable domain error."""
+@dataclass(frozen=True, slots=True)
+class CollectionRecord:
+    definition: CollectionDefinition
+    counts: dict[str, int]
 
-    collection = next((item for item in definitions if item.key == collection_key), None)
-    if collection is None:
-        raise ServiceError(
-            "Choose one of the collections configured for this PDF Bridge deployment.",
-            status=422,
-            code="collection-not-configured",
-            title="Collection was rejected",
+
+@dataclass(frozen=True, slots=True)
+class DocumentAggregate:
+    document: Document
+    operation: WorkOperation | None
+    revision: PreparedRevision | None
+    decision: Decision | None
+    publication: PublicationRecord | None
+    deletion: DeletionProgress | None
+
+
+@dataclass(frozen=True, slots=True)
+class MarkdownRecord:
+    prepared_revision: PreparedRevision
+    markdown: str
+
+
+def _encode_cursor(timestamp: datetime, identifier: str) -> str:
+    aware = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+    payload = json.dumps(
+        {"v": 1, "t": aware.astimezone(UTC).isoformat(), "id": identifier},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str, *, uuid_identifier: bool) -> tuple[datetime, str]:
+    if not cursor or len(cursor) > 500:
+        raise LifecycleError("invalid_cursor", "The pagination cursor is invalid.", status=400)
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if set(payload) != {"v", "t", "id"} or payload["v"] != 1:
+            raise ValueError
+        timestamp = datetime.fromisoformat(str(payload["t"]).replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            raise ValueError
+        identifier = str(payload["id"])
+        if uuid_identifier:
+            identifier = str(uuid.UUID(identifier))
+        elif not identifier.isdecimal():
+            raise ValueError
+    except (
+        binascii.Error,
+        ValueError,
+        TypeError,
+        KeyError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise LifecycleError(
+            "invalid_cursor", "The pagination cursor is invalid.", status=400
+        ) from exc
+    return timestamp.astimezone(UTC), identifier
+
+
+def _validate_limit(limit: int) -> None:
+    if not 1 <= limit <= 100:
+        raise LifecycleError(
+            "invalid_limit", "Pagination limit must be between 1 and 100.", status=400
         )
-    return collection
 
 
-def collection_list(
-    session: Session, definitions: Sequence[CollectionDefinition]
-) -> CollectionListResponse:
-    """Return configured collections enriched with authoritative catalog counts."""
+def list_collections(
+    session: Session,
+    definitions: tuple[CollectionDefinition, ...] | list[CollectionDefinition],
+) -> list[CollectionRecord]:
+    """Return enabled deployment collections with exact catalog state counts."""
 
-    items: list[CollectionSummary] = []
-    for definition in definitions:
-        available = (
-            session.scalar(
-                select(func.count())
-                .select_from(Document)
-                .where(*retrieval_catalog_filters(collection_key=definition.key))
-            )
-            or 0
+    rows = session.execute(
+        select(Document.collection_key, Document.state, func.count(Document.id)).group_by(
+            Document.collection_key, Document.state
         )
-        processing = (
-            session.scalar(
-                select(func.count())
-                .select_from(Document)
-                .where(
-                    Document.collection_key == definition.key,
-                    Document.state.in_(OPEN_UPLOAD_STATES),
-                )
-            )
-            or 0
+    ).all()
+    counts_by_collection: dict[str, dict[str, int]] = {}
+    for collection_key, state, count in rows:
+        counts_by_collection.setdefault(collection_key, {})[state.value] = int(count)
+    return [
+        CollectionRecord(
+            definition=definition,
+            counts={
+                state.value: counts_by_collection.get(definition.key, {}).get(state.value, 0)
+                for state in DocumentState
+            },
         )
-        items.append(
-            CollectionSummary(
-                key=definition.key,
-                display_name=definition.display_name,
-                description=definition.description,
-                audience=definition.audience,
-                available_documents=available,
-                processing_documents=processing,
-                detail_url=f"/library/{definition.key}",
-            )
-        )
-    return CollectionListResponse(items=items, total=len(items))
+        for definition in definitions
+        if definition.enabled
+    ]
 
 
-def document_list(
+def get_collection(
+    session: Session,
+    definitions: tuple[CollectionDefinition, ...] | list[CollectionDefinition],
+    key: str,
+) -> CollectionRecord:
+    definition = configured_collection(definitions, key)
+    return next(item for item in list_collections(session, [definition]))
+
+
+def list_documents(
     session: Session,
     *,
-    definitions: Sequence[CollectionDefinition],
-    document_scope: Literal["library", "queue", "all"],
-    document_state: DocumentState | None,
-    collection_key: str | None,
-    page: int,
-    page_size: int,
-) -> DocumentListResponse:
-    """Query one page of catalog documents for the public API."""
+    collection_key: str,
+    state: DocumentState | None,
+    cursor: str | None,
+    limit: int,
+) -> CursorPage[Document]:
+    """List nonterminal collection documents newest-first with a stable tie-breaker."""
 
-    filters = []
-    if collection_key is not None:
-        configured_collection(definitions, collection_key)
-        filters.append(Document.collection_key == collection_key)
-    if document_state is not None:
-        filters.append(Document.state == document_state)
-    elif document_scope == "library":
-        filters.append(Document.state.in_(LIBRARY_STATES))
-    elif document_scope == "queue":
-        filters.append(Document.state.in_(OPEN_UPLOAD_STATES))
-
-    total = session.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
-    documents = session.scalars(
-        select(Document)
-        .where(*filters)
-        .order_by(Document.uploaded_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).all()
-    return DocumentListResponse.create(
-        [document_summary(document) for document in documents],
-        total=total,
-        page=page,
-        page_size=page_size,
+    _validate_limit(limit)
+    statement = select(Document).where(
+        Document.collection_key == collection_key,
+        Document.state.not_in(TERMINAL_DOCUMENT_STATES),
     )
+    if state is not None:
+        if state in TERMINAL_DOCUMENT_STATES:
+            return CursorPage(items=[], next_cursor=None)
+        statement = statement.where(Document.state == state)
+    if cursor:
+        timestamp, identifier = _decode_cursor(cursor, uuid_identifier=True)
+        document_id = uuid.UUID(identifier)
+        statement = statement.where(
+            or_(
+                Document.created_at < timestamp,
+                and_(Document.created_at == timestamp, Document.id < document_id),
+            )
+        )
+    items = list(
+        session.scalars(
+            statement.order_by(Document.created_at.desc(), Document.id.desc()).limit(limit + 1)
+        ).all()
+    )
+    has_more = len(items) > limit
+    items = items[:limit]
+    next_cursor = (
+        _encode_cursor(items[-1].created_at, str(items[-1].id)) if has_more and items else None
+    )
+    return CursorPage(items=items, next_cursor=next_cursor)
 
 
-def _upload_resource_for(session: Session, document: Document) -> UploadResource:
-    operation = latest_operation(session, document.id)
-    analysis = latest_analysis(session, document.id)
-    replacement = session.scalar(
-        select(ReplacementWorkflow).where(
-            ReplacementWorkflow.new_document_id == document.id
+def document_aggregate(session: Session, document_id: uuid.UUID) -> DocumentAggregate:
+    document = session.scalar(
+        select(Document)
+        .where(Document.id == document_id)
+        .options(
+            selectinload(Document.operations),
+            selectinload(Document.prepared_revisions).selectinload(
+                PreparedRevision.decision
+            ),
+            selectinload(Document.prepared_revisions).selectinload(
+                PreparedRevision.publication
+            ),
+            selectinload(Document.deletion_progress),
+            selectinload(Document.tombstone),
         )
     )
-    decision = session.scalar(
-        select(IntakeDecision)
-        .where(IntakeDecision.document_id == document.id)
-        .order_by(IntakeDecision.created_at.desc())
+    if document is None:
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    revision = max(
+        (item for item in document.prepared_revisions if item.status.value == "SEALED"),
+        key=lambda item: item.revision_number,
+        default=None,
+    )
+    operations = list(document.operations)
+    replacement_operation = session.scalar(
+        select(WorkOperation)
+        .where(WorkOperation.replacement_target_document_id == document.id)
+        .order_by(WorkOperation.created_at.desc(), WorkOperation.id.desc())
         .limit(1)
     )
-    return upload_resource(
-        document,
-        operation=operation,
-        analysis=analysis,
-        replacement=replacement,
-        decision=decision,
-    )
-
-
-def upload_list(
-    session: Session,
-    *,
-    definitions: Sequence[CollectionDefinition],
-    open_only: bool,
-    collection_key: str | None,
-    page: int,
-    page_size: int,
-) -> UploadListResponse:
-    """Return one page of durable upload workspace rows."""
-
-    filters = []
-    if collection_key is not None:
-        configured_collection(definitions, collection_key)
-        filters.append(Document.collection_key == collection_key)
-    if open_only:
-        open_operation = (
-            select(WorkOperation.id)
-            .where(
-                WorkOperation.document_id == Document.id,
-                WorkOperation.state.in_(
-                    (OperationState.QUEUED, OperationState.RUNNING)
-                ),
-            )
-            .exists()
-        )
-        open_replacement = (
-            select(ReplacementWorkflow.id)
-            .where(
-                ReplacementWorkflow.new_document_id == Document.id,
-                ReplacementWorkflow.state.not_in(
-                    (ReplacementState.SUCCEEDED, ReplacementState.FAILED)
-                ),
-            )
-            .exists()
-        )
-        filters.append(
-            or_(
-                Document.state.in_(OPEN_UPLOAD_STATES),
-                open_operation,
-                open_replacement,
-            )
-        )
-    total = session.scalar(select(func.count()).select_from(Document).where(*filters)) or 0
-    documents = session.scalars(
-        select(Document)
-        .where(*filters)
-        .order_by(Document.uploaded_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).all()
-    return UploadListResponse.create(
-        [_upload_resource_for(session, document) for document in documents],
-        total=total,
-        page=page,
-        page_size=page_size,
-    )
-
-
-def upload_detail(session: Session, upload_id: UUID) -> UploadResource:
-    """Return one durable upload workspace row."""
-
-    document = session.get(Document, upload_id)
-    if document is None:
-        raise ServiceError(
-            "No upload exists for this ID.",
-            status=404,
-            code="upload-not-found",
-            title="Upload not found",
-        )
-    return _upload_resource_for(session, document)
-
-
-def _candidate_excerpt_pairs(
-    session: Session,
-    candidate: AnalysisCandidate,
-) -> tuple[list[ChunkExcerptPublic], list[ChunkExcerptPublic]]:
-    incoming_indexes: list[int] = []
-    matched_ids: list[uuid.UUID] = []
-    for pair in candidate.matched_chunk_pairs:
-        index = int(pair[0])
-        if index not in incoming_indexes:
-            incoming_indexes.append(index)
-        try:
-            chunk_id = uuid.UUID(str(pair[1]))
-        except ValueError:
-            continue
-        if chunk_id not in matched_ids:
-            matched_ids.append(chunk_id)
-
-    incoming_query = (
-        select(AnalysisChunk)
-        .where(AnalysisChunk.analysis_id == candidate.analysis_id)
-        .order_by(AnalysisChunk.chunk_index)
-    )
-    if incoming_indexes:
-        incoming_query = incoming_query.where(
-            AnalysisChunk.chunk_index.in_(incoming_indexes[:MAX_EXCERPTS_PER_SIDE])
-        )
-    incoming_chunks = list(
-        session.scalars(incoming_query.limit(MAX_EXCERPTS_PER_SIDE)).all()
-    )
-
-    candidate_analysis_id = candidate_snapshot_analysis_id(session, candidate)
-    matched_chunks: list[AnalysisChunk] = []
-    if matched_ids:
-        correlated = list(
-            session.scalars(
-                select(AnalysisChunk).where(
-                    AnalysisChunk.id.in_(matched_ids[:MAX_EXCERPTS_PER_SIDE]),
-                    AnalysisChunk.document_id == candidate.matched_document_id,
-                    AnalysisChunk.analysis_id == candidate_analysis_id,
-                )
-            ).all()
-        )
-        by_id = {chunk.id: chunk for chunk in correlated}
-        matched_chunks = [
-            by_id[chunk_id]
-            for chunk_id in matched_ids[:MAX_EXCERPTS_PER_SIDE]
-            if chunk_id in by_id
-        ]
-    if candidate.matched_chunk_pairs and len(matched_chunks) != len(
-        matched_ids[:MAX_EXCERPTS_PER_SIDE]
+    if replacement_operation is not None and all(
+        item.id != replacement_operation.id for item in operations
     ):
-        # Never replace a stale or cross-document Qdrant reference with text
-        # from an unrelated chunk.
-        matched_chunks = []
-    elif not candidate.matched_chunk_pairs and candidate_analysis_id is not None:
-        matched_chunks = list(
-            session.scalars(
-                select(AnalysisChunk)
-                .where(
-                    AnalysisChunk.document_id == candidate.matched_document_id,
-                    AnalysisChunk.analysis_id == candidate_analysis_id,
-                )
-                .order_by(AnalysisChunk.chunk_index)
-                .limit(MAX_EXCERPTS_PER_SIDE)
-            ).all()
-        )
-    return (
-        [
-            chunk_excerpt(chunk, reference=f"incoming:{chunk.chunk_index}")
-            for chunk in incoming_chunks
-        ],
-        [chunk_excerpt(chunk, reference=f"candidate:{chunk.id}") for chunk in matched_chunks],
+        operations.append(replacement_operation)
+    operation = max(
+        operations, key=lambda item: (item.created_at, str(item.id)), default=None
+    )
+    return DocumentAggregate(
+        document=document,
+        operation=operation,
+        revision=revision,
+        decision=revision.decision if revision is not None else None,
+        publication=revision.publication if revision is not None else None,
+        deletion=document.deletion_progress,
     )
 
 
-def analysis_detail(
+def markdown_record(session: Session, document_id: uuid.UUID) -> MarkdownRecord:
+    document = session.get(Document, document_id)
+    if document is None:
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    if not can_serve_prepared_content(document):
+        if document.state in TERMINAL_DOCUMENT_STATES or document.state in {
+            DocumentState.DELETING,
+            DocumentState.DELETE_FAILED,
+        }:
+            raise LifecycleError("content_purged", "Prepared content is unavailable.", status=410)
+        raise LifecycleError(
+            "artifact_not_ready", "Canonical Markdown is not ready.", status=409
+        )
+    revision = latest_sealed_revision(session, document_id)
+    if revision is None or not revision.prepared_pages:
+        raise LifecycleError(
+            "artifact_not_ready", "Canonical Markdown is not ready.", status=409
+        )
+    pages = sorted(revision.prepared_pages, key=lambda item: item.page_number)
+    markdown = "\n\n".join(
+        f"<!-- page:{page.page_number} -->\n\n{page.markdown}" for page in pages
+    )
+    return MarkdownRecord(prepared_revision=revision, markdown=markdown)
+
+
+def list_chunks(
     session: Session,
     *,
-    upload_id: UUID,
-    page: int,
-    page_size: int,
-) -> AnalysisDetailResponse:
-    """Return the current analysis with one page of candidate evidence."""
+    document_id: uuid.UUID,
+    cursor: str | None,
+    limit: int,
+) -> CursorPage[PreparedChunk]:
+    """Return stable chunk-index pages without ever loading vector rows."""
 
-    document = session.get(Document, upload_id)
+    _validate_limit(limit)
+    document = session.get(Document, document_id)
     if document is None:
-        raise ServiceError(
-            "No upload exists for this ID.",
-            status=404,
-            code="upload-not-found",
-            title="Upload not found",
-        )
-    analysis = latest_analysis(session, document.id)
-    if analysis is None:
-        raise ServiceError(
-            "This upload has no analysis yet.",
-            status=404,
-            code="analysis-not-found",
-            title="Analysis not found",
-        )
-    total = (
-        session.scalar(
-            select(func.count())
-            .select_from(AnalysisCandidate)
-            .where(AnalysisCandidate.analysis_id == analysis.id)
-        )
-        or 0
-    )
-    candidates = session.scalars(
-        select(AnalysisCandidate)
-        .where(AnalysisCandidate.analysis_id == analysis.id)
-        .options(joinedload(AnalysisCandidate.findings))
-        .order_by(AnalysisCandidate.rank)
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).unique().all()
-
-    rendered = []
-    for candidate in candidates:
-        live_target = session.get(Document, candidate.matched_document_id)
-        replacement_eligible = (
-            live_target is not None
-            and replacement_target_issue(
-                session,
-                live_target,
-                collection_key=document.collection_key,
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    if not can_serve_prepared_content(document):
+        if document.state in TERMINAL_DOCUMENT_STATES or document.state in {
+            DocumentState.DELETING,
+            DocumentState.DELETE_FAILED,
+        }:
+            raise LifecycleError("content_purged", "Prepared content is unavailable.", status=410)
+        raise LifecycleError("artifact_not_ready", "Chunks are not ready.", status=409)
+    revision = latest_sealed_revision(session, document_id)
+    if revision is None:
+        raise LifecycleError("artifact_not_ready", "Chunks are not ready.", status=409)
+    after_index = -1
+    if cursor:
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+            if set(payload) != {"v", "revision_id", "chunk_index"} or payload["v"] != 1:
+                raise ValueError
+            if uuid.UUID(str(payload["revision_id"])) != revision.id:
+                raise ValueError
+            after_index = int(payload["chunk_index"])
+            if after_index < 0:
+                raise ValueError
+        except (
+            binascii.Error,
+            ValueError,
+            TypeError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise LifecycleError(
+                "invalid_cursor", "The pagination cursor is invalid.", status=400
+            ) from exc
+    items = list(
+        session.scalars(
+            select(PreparedChunk)
+            .where(
+                PreparedChunk.prepared_revision_id == revision.id,
+                PreparedChunk.chunk_index > after_index,
             )
-            is None
-        )
-        incoming_excerpts, candidate_excerpts = _candidate_excerpt_pairs(session, candidate)
-        rendered.append(
-            candidate_public(
-                candidate,
-                replacement_eligible=replacement_eligible,
-                incoming_excerpts=incoming_excerpts,
-                candidate_excerpts=candidate_excerpts,
-            )
-        )
-    return AnalysisDetailResponse(
-        upload_id=document.id,
-        analysis=analysis_summary(analysis),
-        candidates=rendered,
-        total_candidates=total,
-        page=page,
-        page_size=page_size,
-        pages=math.ceil(total / page_size) if total else 0,
+            .order_by(PreparedChunk.chunk_index.asc())
+            .limit(limit + 1)
+        ).all()
     )
-
-
-def document_detail_record(session: Session, document_id: UUID) -> Document:
-    """Load a document with operations and audit events."""
-
-    document = (
-        session.execute(
-            select(Document)
-            .where(Document.id == document_id)
-            .options(
-                joinedload(Document.operations),
-                joinedload(Document.audit_events),
-                joinedload(Document.decisions),
-            )
-        )
-        .unique()
-        .scalar_one_or_none()
-    )
+    has_more = len(items) > limit
+    items = items[:limit]
+    next_cursor = None
+    if has_more and items:
+        payload = json.dumps(
+            {
+                "v": 1,
+                "revision_id": str(revision.id),
+                "chunk_index": items[-1].chunk_index,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        next_cursor = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return CursorPage(items=items, next_cursor=next_cursor)
+def preflight_revision(session: Session, document_id: uuid.UUID) -> PreparedRevision:
+    document = session.get(Document, document_id)
     if document is None:
-        raise ServiceError(
-            "No catalog record exists for this document ID.",
-            status=404,
-            code="document-not-found",
-            title="Document not found",
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    if document.state in TERMINAL_DOCUMENT_STATES or document.state in {
+        DocumentState.DELETING,
+        DocumentState.DELETE_FAILED,
+    }:
+        raise LifecycleError("content_purged", "Preflight evidence was purged.", status=410)
+    revision = latest_sealed_revision(session, document_id)
+    if revision is None:
+        raise LifecycleError(
+            "artifact_not_ready", "Preflight evidence is not ready.", status=409
         )
-    return document
+    return revision
 
 
-def document_detail(session: Session, document_id: UUID) -> DocumentDetail:
-    """Return the public detailed representation of one catalog document."""
-
-    document = document_detail_record(session, document_id)
-    analysis = latest_analysis(session, document.id)
-    detail = DocumentDetail.model_validate(document).model_copy(
-        update={
-            "detail_url": f"/documents/{document.id}",
-            "analysis": analysis_summary(analysis) if analysis else None,
-            "decisions": [decision_summary(item) for item in document.decisions],
-            "operations": [operation_summary(item) for item in document.operations],
-        }
+def list_events(
+    session: Session,
+    *,
+    document_id: uuid.UUID,
+    cursor: str | None,
+    limit: int,
+) -> CursorPage[AuditEvent]:
+    _validate_limit(limit)
+    if session.get(Document, document_id) is None:
+        raise LifecycleError("document_not_found", "The document was not found.", status=404)
+    statement = select(AuditEvent).where(AuditEvent.document_id == document_id)
+    if cursor:
+        timestamp, identifier = _decode_cursor(cursor, uuid_identifier=False)
+        event_id = int(identifier)
+        statement = statement.where(
+            or_(
+                AuditEvent.occurred_at < timestamp,
+                and_(AuditEvent.occurred_at == timestamp, AuditEvent.id < event_id),
+            )
+        )
+    items = list(
+        session.scalars(
+            statement.order_by(AuditEvent.occurred_at.desc(), AuditEvent.id.desc()).limit(
+                limit + 1
+            )
+        ).all()
     )
-    return detail
-
-
-def available_document_count(session: Session, *, collection_key: str) -> int:
-    """Count retrieval-eligible documents in a collection."""
-
-    return (
-        session.scalar(
-            select(func.count())
-            .select_from(Document)
-            .where(*retrieval_catalog_filters(collection_key=collection_key))
-        )
-        or 0
+    has_more = len(items) > limit
+    items = items[:limit]
+    next_cursor = (
+        _encode_cursor(items[-1].occurred_at, str(items[-1].id))
+        if has_more and items
+        else None
     )
+    return CursorPage(items=items, next_cursor=next_cursor)
 
 
-def validate_search_response(
-    session: Session, request: SearchRequest, response: SearchResponse
-) -> None:
-    """Fail closed when retrieval results cross catalog boundaries.
+def get_operation(session: Session, operation_id: uuid.UUID) -> WorkOperation:
+    operation = session.get(WorkOperation, operation_id)
+    if operation is None:
+        raise LifecycleError("operation_not_found", "The operation was not found.", status=404)
+    return operation
 
-    Pending, screening-only, and tombstoned content must never surface:
-    every hit must belong to a retrieval-eligible document in the requested
-    collection.
-    """
 
-    for group in response.groups:
-        ids = [hit.document_id for hit in group.hits]
-        documents = (
-            session.scalars(
-                select(Document).where(
-                    Document.id.in_(ids),
-                    *retrieval_catalog_filters(),
-                )
-            ).all()
-            if ids
-            else []
+def operation_metric_rows(
+    session: Session,
+    *,
+    visible_collection_keys: tuple[str, ...],
+) -> list[tuple[object, ...]]:
+    """Aggregate non-succeeded operations without loading document content."""
+
+    if not visible_collection_keys:
+        return []
+    statement = (
+        select(
+            WorkOperation.operation_type,
+            WorkOperation.state,
+            WorkOperation.phase,
+            func.count(WorkOperation.id),
+            func.min(WorkOperation.created_at),
+            func.min(WorkOperation.phase_started_at),
         )
-        documents_by_id = {document.id: document for document in documents}
-        invalid_hit = len(ids) != len(set(ids)) or any(
-            document_id not in documents_by_id
-            or documents_by_id[document_id].collection_key != group.collection_key
-            for document_id in ids
-        )
-        catalog_total = available_document_count(
-            session,
-            collection_key=group.collection_key,
-        )
-        if invalid_hit or group.total > catalog_total:
-            raise ServiceError(
+        .join(Document, Document.id == WorkOperation.document_id)
+        .where(
+            Document.collection_key.in_(visible_collection_keys),
+            WorkOperation.state.in_(
                 (
-                    "The retrieval response included a document or total outside its requested "
-                    "collection boundary. No partial results were returned."
+                    OperationState.QUEUED,
+                    OperationState.RUNNING,
+                    OperationState.FAILED,
+                )
+            ),
+        )
+        .group_by(
+            WorkOperation.operation_type,
+            WorkOperation.state,
+            WorkOperation.phase,
+        )
+        .order_by(
+            WorkOperation.state,
+            WorkOperation.operation_type,
+            WorkOperation.phase,
+        )
+    )
+    return [tuple(row) for row in session.execute(statement).all()]
+
+
+def queue_position(session: Session, operation: WorkOperation) -> int | None:
+    if operation.state.value != "QUEUED":
+        return None
+    ahead = session.scalar(
+        select(func.count(WorkOperation.id)).where(
+            WorkOperation.state == operation.state,
+            or_(
+                WorkOperation.priority < operation.priority,
+                and_(
+                    WorkOperation.priority == operation.priority,
+                    or_(
+                        WorkOperation.created_at < operation.created_at,
+                        and_(
+                            WorkOperation.created_at == operation.created_at,
+                            WorkOperation.id < operation.id,
+                        ),
+                    ),
                 ),
-                status=502,
-                code="search-catalog-mismatch",
-                title="Search and catalog are out of sync",
+            ),
+        )
+    )
+    return int(ahead or 0) + 1
+
+
+def list_history(
+    session: Session,
+    *,
+    visible_collection_keys: tuple[str, ...],
+    collection_key: str | None,
+    disposition: TerminalDisposition | None,
+    cursor: str | None,
+    limit: int,
+) -> CursorPage[Tombstone]:
+    _validate_limit(limit)
+    if not visible_collection_keys:
+        raise LifecycleError(
+            "collection_not_found", "No configured collection is visible.", status=404
+        )
+    statement = select(Tombstone).where(
+        Tombstone.collection_key.in_(visible_collection_keys)
+    )
+    if collection_key is not None:
+        statement = statement.where(Tombstone.collection_key == collection_key)
+    if disposition is not None:
+        statement = statement.where(Tombstone.disposition == disposition)
+    if cursor:
+        timestamp, identifier = _decode_cursor(cursor, uuid_identifier=True)
+        tombstone_id = uuid.UUID(identifier)
+        statement = statement.where(
+            or_(
+                Tombstone.occurred_at < timestamp,
+                and_(Tombstone.occurred_at == timestamp, Tombstone.id < tombstone_id),
             )
-
-
-def validate_configured_collections(
-    definitions: Sequence[CollectionDefinition], collection_keys: Iterable[str]
-) -> None:
-    """Require every supplied collection key to be configured."""
-
-    for collection_key in collection_keys:
-        configured_collection(definitions, collection_key)
+        )
+    items = list(
+        session.scalars(
+            statement.order_by(Tombstone.occurred_at.desc(), Tombstone.id.desc()).limit(limit + 1)
+        ).all()
+    )
+    has_more = len(items) > limit
+    items = items[:limit]
+    next_cursor = (
+        _encode_cursor(items[-1].occurred_at, str(items[-1].id))
+        if has_more and items
+        else None
+    )
+    return CursorPage(items=items, next_cursor=next_cursor)

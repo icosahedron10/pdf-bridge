@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -14,13 +13,18 @@ from sqlalchemy.orm import Session, sessionmaker
 # pdf_bridge.app intentionally validates required external storage at import time.
 _IMPORT_STORAGE = tempfile.mkdtemp(prefix="pdf-bridge-import-")
 os.environ.setdefault("PDF_BRIDGE_STORAGE_ROOT", _IMPORT_STORAGE)
+os.environ.setdefault("PDF_BRIDGE_APP_ENV", "test")
+os.environ.setdefault("PDF_BRIDGE_WORKER_ENABLED", "false")
 os.environ.setdefault("PDF_BRIDGE_SESSION_SECRET", "test-import-session-secret-32-characters")
+os.environ.setdefault("PDF_BRIDGE_ALLOWED_HOSTS", '["testserver.local","localhost"]')
 os.environ.setdefault(
     "PDF_BRIDGE_COLLECTIONS",
     '[{"key":"customer","display_name":"Customer Product",'
-    '"description":"Approved customer-facing product content.","audience":"customer"},'
+    '"description":"Approved customer-facing product content.","audience":"customer",'
+    '"qdrant_collection_name":"customer-product-pdfs"},'
     '{"key":"internal","display_name":"HR & Internal",'
-    '"description":"Employee-only policies and operations.","audience":"internal"}]',
+    '"description":"Employee-only policies and operations.","audience":"internal",'
+    '"qdrant_collection_name":"internal-pdfs"}]',
 )
 
 from pdf_bridge.app import create_app  # noqa: E402
@@ -45,29 +49,33 @@ def clean_scanner(_path: Path) -> ScanResult:
 def settings(tmp_path: Path) -> Settings:
     storage_root = tmp_path / "bridge-data"
     return Settings(
+        _env_file=None,
         app_env="test",
         auth_mode="anonymous-poc",
         storage_root=storage_root,
         database_url=f"sqlite+pysqlite:///{(storage_root / 'catalog.sqlite3').as_posix()}",
         session_secret=SecretStr("test-session-secret-not-for-production"),
-        search_api_token=SecretStr("test-search-token-not-for-production"),
         allowed_hosts=["testserver.local", "localhost", "127.0.0.1"],
         clamd_host="127.0.0.1",
         clamd_port=3310,
-        clamd_timeout=0.05,
+        clamd_timeout_seconds=0.05,
         search_api_url="https://retrieval.test",
+        search_api_token=SecretStr("test-search-token-not-for-production"),
+        worker_enabled=False,
         collections=[
             {
                 "key": "customer",
                 "display_name": "Customer Product",
                 "description": "Approved customer-facing product content.",
                 "audience": "customer",
+                "qdrant_collection_name": "customer-product-pdfs",
             },
             {
                 "key": "internal",
                 "display_name": "HR & Internal",
                 "description": "Employee-only policies and operations.",
                 "audience": "internal",
+                "qdrant_collection_name": "internal-pdfs",
             },
         ],
     )
@@ -111,11 +119,11 @@ def client(app) -> Iterator[TestClient]:
 
 @pytest.fixture
 def csrf_headers(client: TestClient) -> dict[str, str]:
-    response = client.get("/upload")
+    response = client.get("/api/v2/collections?limit=1")
     assert response.status_code == 200
-    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', response.text)
-    assert match
-    return {"X-CSRF-Token": match.group(1)}
+    token = response.headers.get("X-CSRF-Token")
+    assert token
+    return {"X-CSRF-Token": token}
 
 
 @pytest.fixture
@@ -130,13 +138,9 @@ def upload_pdf(client: TestClient, csrf_headers: dict[str, str]) -> Callable[...
     ):
         headers = {**csrf_headers, "Idempotency-Key": key}
         return client.post(
-            "/api/v1/uploads",
+            f"/api/v2/collections/{collection}/documents",
             headers=headers,
             files={"file": (filename, contents, content_type)},
-            data={
-                "idempotency_key": key,
-                "collection_key": collection,
-            },
         )
 
     return perform

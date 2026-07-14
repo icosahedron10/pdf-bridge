@@ -1,424 +1,380 @@
-"""Review queue: durable upload workspace, evidence review, and decisions."""
+"""Document-centric review queue, preflight evidence, decisions, and retry."""
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 import streamlit as st
 
 import bridge_ui as ui
-from bridge_client import new_idempotency_key
 
-_DECISION_HELP = (
-    "Keep publishes this document alongside existing content. Replace prepares "
-    "the new analysis, deletes the old document, then publishes — a short "
-    "availability gap is accepted so old and new content are never active "
-    "together. Cancel purges the upload's bytes, artifacts, and index points."
-)
-
-
-def _selected_upload_id() -> str | None:
-    return st.query_params.get("upload")
+_QUEUE_STATES = {
+    "REVIEW_REQUIRED": "Needs decision",
+    "PREFLIGHTING": "Preflight running",
+    "PREFLIGHT_FAILED": "Preflight failed",
+    "PUBLISHING": "Publishing",
+    "PUBLISH_FAILED": "Publication failed",
+    "DELETING": "Deleting",
+    "DELETE_FAILED": "Deletion failed",
+}
 
 
-def _select_upload(upload_id: str | None) -> None:
-    if upload_id is None:
-        st.query_params.pop("upload", None)
+def _selected_document_id() -> str | None:
+    value = st.query_params.get("document")
+    return str(value) if value else None
+
+
+def _select_document(document_id: str | None) -> None:
+    if document_id is None:
+        st.query_params.pop("document", None)
     else:
-        st.query_params["upload"] = upload_id
+        st.query_params["document"] = document_id
     st.rerun()
 
 
-def _decision_key(upload_id: str, action: str, revision: int) -> str:
-    """Stable idempotency key per decision so a retried click replays."""
+def _render_queue(client) -> None:
+    collections = ui.guarded(lambda: client.collections(limit=100))
+    if collections is None:
+        return
+    options = ui.collection_options(collections)
+    if not options:
+        st.info("No enabled collections are configured.")
+        return
 
-    keys: dict[str, str] = st.session_state.setdefault("decision_idempotency_keys", {})
-    return keys.setdefault(f"{upload_id}::{action}::{revision}", new_idempotency_key())
-
-
-def _render_queue_list(client) -> None:
-    filter_columns = st.columns([2, 3, 2])
-    open_only = filter_columns[0].toggle("Open work only", value=True)
-    collections_payload = ui.guarded(client.collections) or {"items": []}
-    options = {"": "All collections"} | ui.collection_options(collections_payload)
-    collection_key = filter_columns[1].selectbox(
-        "Collection", options=list(options), format_func=options.get, key="queue_collection"
+    filters = st.columns([3, 3])
+    collection_key = filters[0].selectbox(
+        "Collection",
+        options=list(options),
+        format_func=options.get,
+        key="review-collection",
     )
-    page = filter_columns[2].number_input("Page", min_value=1, value=1, key="queue_page")
-
+    state = filters[1].selectbox(
+        "Work state",
+        options=list(_QUEUE_STATES),
+        format_func=_QUEUE_STATES.get,
+        key="review-state",
+    )
+    scope = (collection_key, state)
+    cursor = ui.cursor_for("review-documents", scope)
     payload = ui.guarded(
-        lambda: client.uploads(
-            open_only=open_only,
-            collection_key=collection_key or None,
-            page=int(page),
-            page_size=25,
+        lambda: client.documents(
+            collection_key,
+            state=state,
+            cursor=cursor,
+            limit=25,
         )
     )
     if payload is None:
         return
     items = payload.get("items", [])
-    st.caption(
-        f"{payload.get('total', 0)} upload{'s' if payload.get('total') != 1 else ''} · "
-        f"page {payload.get('page', 1)} of {max(payload.get('pages', 1), 1)}"
-    )
     if not items:
-        st.info("Nothing here. Open work appears as soon as an upload is accepted.")
+        st.info(f"No documents are currently {_QUEUE_STATES[state].lower()}.")
         return
 
-    selected = _selected_upload_id()
-    for item in items:
-        document = item["document"]
-        upload_id = str(item["upload_id"])
+    selected = _selected_document_id()
+    for document in items:
+        document_id = str(document["id"])
         with st.container(border=True):
-            columns = st.columns([5, 2, 2, 2, 2])
-            columns[0].markdown(f"**{document['original_filename']}**")
-            columns[0].caption(
-                f"{document['collection_key']} · {ui.fmt_bytes(document['size_bytes'])}"
-                f" · {ui.fmt_relative(document['uploaded_at'])}"
+            heading, status, action = st.columns([5, 2, 2])
+            heading.markdown(f"**{document['original_filename']}**")
+            heading.caption(
+                f"{ui.fmt_bytes(document.get('size_bytes'))} · "
+                f"{ui.fmt_relative(document.get('updated_at'))} · `{document_id}`"
             )
-            columns[1].markdown(ui.state_badge(document["state"]), unsafe_allow_html=True)
-            if item.get("review_required"):
-                columns[2].markdown(
-                    ui.badge("Needs decision", "warn"), unsafe_allow_html=True
-                )
-            operation = item.get("operation") or {}
-            phase = operation.get("phase")
-            if phase and phase != "COMPLETE" and item.get("open"):
-                columns[3].caption(phase.replace("_", " ").title())
-            if columns[4].button(
-                "Review" if upload_id != selected else "Selected",
-                key=f"select-{upload_id}",
-                disabled=upload_id == selected,
-            ):
-                _select_upload(upload_id)
-
-
-def _render_findings(findings: list[dict[str, Any]]) -> None:
-    for finding in findings:
-        role = finding.get("role", "model")
-        if not finding.get("valid", False):
-            st.markdown(
-                f"- **{role.title()}** ({finding.get('model_id', '?')}): "
-                + ui.badge("invalid output", "neutral")
-                + f" {finding.get('error') or ''}",
+            status.markdown(
+                ui.state_badge(str(document.get("state", "UNKNOWN"))),
                 unsafe_allow_html=True,
             )
-            continue
-        label = finding.get("label") or "uncertain"
-        tone = ui.FINDING_LABEL_TONES.get(label, "neutral")
-        summary = finding.get("summary") or "No summary."
+            if action.button(
+                "Selected" if selected == document_id else "Inspect",
+                key=f"review-select::{document_id}",
+                disabled=selected == document_id,
+                use_container_width=True,
+            ):
+                _select_document(document_id)
+            failure = document.get("failure")
+            if failure:
+                st.caption(
+                    f"Failure `{failure.get('code', 'unknown')}`"
+                    + (" · retryable" if failure.get("retryable") else "")
+                )
+    ui.render_cursor_controls("review-documents", payload)
+
+
+def _render_completeness(preflight: dict[str, Any]) -> None:
+    completeness = preflight.get("completeness", {})
+    checks = [
+        ("Native text", completeness.get("native_text_eligible")),
+        ("Markdown", completeness.get("formatter_complete")),
+        ("Vectors", completeness.get("vector_complete")),
+        ("Candidates", completeness.get("candidate_discovery_complete")),
+        ("Advisory", completeness.get("advisory_complete")),
+    ]
+    columns = st.columns(len(checks))
+    for column, (label, complete) in zip(columns, checks, strict=True):
+        column.markdown(ui.badge(label, "ok" if complete else "warn"), unsafe_allow_html=True)
+    if completeness.get("clear_for_publication"):
+        st.success("The sealed revision is clear for publication.")
+    reasons = completeness.get("incomplete_reasons", [])
+    if reasons:
+        st.warning("Incomplete evidence: " + "; ".join(str(reason) for reason in reasons))
+
+
+def _render_evidence(evidence: list[dict[str, Any]]) -> None:
+    for finding in evidence:
+        kind = str(finding.get("kind", "EVIDENCE")).replace("_", " ").title()
+        label = str(finding.get("label") or ("Valid" if finding.get("valid") else "Incomplete"))
+        tone = "info" if finding.get("valid") else "warn"
         st.markdown(
-            f"- **{role.title()}** ({finding.get('model_id', '?')}): "
-            + ui.badge(label.replace("_", " "), tone)
-            + f" — {summary}",
+            f"**{kind}** · {ui.badge(label, tone)}",
             unsafe_allow_html=True,
         )
+        if finding.get("summary"):
+            st.write(finding["summary"])
+        if finding.get("failure_code"):
+            st.caption(f"Failure `{finding['failure_code']}`")
+        for citation in finding.get("citations", []):
+            page_label = f"pages {citation.get('page_start')}–{citation.get('page_end')}"
+            st.caption(f"{page_label} · chunk `{citation.get('chunk_id', '—')}`")
+            st.markdown(
+                f'<div class="pdfb-excerpt">{html.escape(str(citation.get("excerpt", "")))}</div>',
+                unsafe_allow_html=True,
+            )
 
 
-def _render_excerpts(candidate: dict[str, Any]) -> None:
-    incoming = candidate.get("incoming_excerpts", [])
-    existing = candidate.get("candidate_excerpts", [])
-    if not incoming and not existing:
-        return
-    left, right = st.columns(2)
-    left.markdown("**Incoming document**")
-    for excerpt in incoming:
-        left.caption(f"Pages {excerpt['page_start']}–{excerpt['page_end']}")
-        left.markdown(
-            f'<div class="pdfb-excerpt">{excerpt["text"]}</div>', unsafe_allow_html=True
-        )
-    right.markdown("**Existing candidate**")
-    for excerpt in existing:
-        right.caption(f"Pages {excerpt['page_start']}–{excerpt['page_end']}")
-        right.markdown(
-            f'<div class="pdfb-excerpt">{excerpt["text"]}</div>', unsafe_allow_html=True
-        )
-
-
-def _render_candidates(client, upload_id: str) -> list[dict[str, Any]]:
-    page_key = f"evidence_page::{upload_id}"
-    page = st.session_state.get(page_key, 1)
-    payload = ui.guarded(
-        lambda: client.upload_analysis(upload_id, page=page, page_size=10)
-    )
-    if payload is None:
+def _render_candidates(client, document_id: str, revision_id: str) -> list[dict[str, Any]]:
+    cursor_key = "review-candidates"
+    cursor = ui.cursor_for(cursor_key, (document_id, revision_id))
+    preflight = ui.guarded(lambda: client.preflight(document_id, cursor=cursor, limit=20))
+    if preflight is None:
         return []
-    candidates = payload.get("candidates", [])
-    total = payload.get("total_candidates", 0)
-    pages = max(payload.get("pages", 1), 1)
-    st.markdown(f"##### Candidate evidence · {total} qualifying candidate(s)")
+
+    _render_completeness(preflight)
+    revision = preflight.get("prepared_revision", {})
+    profile_columns = st.columns(3)
+    profile_columns[0].caption(f"Content profile · `{revision.get('content_profile_id', '—')}`")
+    profile_columns[1].caption(f"Index profile · `{revision.get('index_profile_id', '—')}`")
+    profile_columns[2].caption(f"Policy · `{revision.get('preflight_policy_id', '—')}`")
+
+    candidate_page = preflight.get("candidates", {})
+    candidates = candidate_page.get("items", [])
+    st.markdown(f"#### Candidate evidence · {preflight.get('candidate_count', 0)} total")
     if not candidates:
-        st.caption("No active or pending content resembles this document.")
-        return []
+        st.caption("No retained candidate appears on this page.")
     for candidate in candidates:
         matched = candidate.get("document", {})
-        source = candidate.get("source", "active")
         title = (
-            f"#{candidate['rank']} · {matched.get('filename', 'unknown')} "
-            f"· fused score {candidate.get('fused_score', 0):.3f}"
+            f"#{candidate.get('rank', '?')} · {matched.get('original_filename', 'Unknown')} "
+            f"· fused {float(candidate.get('fused_score', 0)):.3f}"
         )
-        with st.expander(title, expanded=candidate["rank"] == 1):
-            badge_row = " ".join(
-                [
-                    ui.badge(
-                        "active content" if source == "active" else "pending screening",
-                        "info" if source == "active" else "warn",
-                    ),
-                    ui.badge(matched.get("state", "?"),
-                             ui.DOCUMENT_STATE_TONES.get(matched.get("state", ""), "neutral")),
-                ]
-                + ([ui.badge("replacement eligible", "ok")]
-                   if candidate.get("replacement_eligible") else [])
-                + ([ui.badge("not classified (overflow)", "neutral")]
-                   if candidate.get("overflow") else [])
-            )
-            st.markdown(badge_row, unsafe_allow_html=True)
-            metric_columns = st.columns(4)
-            metric_columns[0].metric("Max cosine", f"{candidate.get('max_cosine', 0):.3f}")
-            metric_columns[1].metric("Strong chunks", candidate.get("strong_cosine_chunks", 0))
-            metric_columns[2].metric("Moderate chunks", candidate.get("moderate_cosine_chunks", 0))
-            metric_columns[3].metric("BM25 strong", candidate.get("bm25_strong_placements", 0))
-            reasons = candidate.get("reasons", [])
-            if reasons:
-                st.caption("Qualified because: " + "; ".join(reasons))
-            findings = candidate.get("findings", [])
-            if findings:
-                st.markdown("**Model findings** (advisory, explanation-only)")
-                _render_findings(findings)
-            _render_excerpts(candidate)
-    if pages > 1:
-        new_page = st.number_input(
-            "Evidence page", min_value=1, max_value=pages, value=page, key=f"np-{upload_id}"
-        )
-        if new_page != page:
-            st.session_state[page_key] = int(new_page)
-            st.rerun()
+        with st.expander(title, expanded=candidate.get("rank") == 1):
+            tags = [
+                ui.badge(str(candidate.get("source", "UNKNOWN")).title(), "info"),
+                ui.state_badge(str(matched.get("state", "UNKNOWN"))),
+            ]
+            if candidate.get("replacement_eligible"):
+                tags.append(ui.badge("Replacement eligible", "ok"))
+            st.markdown(" ".join(tags), unsafe_allow_html=True)
+            scores = st.columns(4)
+            scores[0].metric("Cosine", f"{float(candidate.get('max_cosine', 0)):.3f}")
+            scores[1].metric("BM25", f"{float(candidate.get('bm25_score', 0)):.3f}")
+            scores[2].metric("Fused", f"{float(candidate.get('fused_score', 0)):.3f}")
+            scores[3].metric("Chunk pairs", candidate.get("matched_chunk_pair_count", 0))
+            if candidate.get("reasons"):
+                st.caption("Qualified by: " + "; ".join(candidate["reasons"]))
+            _render_evidence(candidate.get("evidence", []))
+    ui.render_cursor_controls(cursor_key, candidate_page)
     return candidates
 
 
-def _render_decision_panel(
-    client, upload: dict[str, Any], candidates: list[dict[str, Any]]
+def _submit_decision(
+    client,
+    *,
+    document_id: str,
+    revision_id: str,
+    action: str,
+    target_document_id: str | None = None,
 ) -> None:
-    analysis = upload.get("analysis") or {}
-    revision = analysis.get("revision", 1)
-    upload_id = str(upload["upload_id"])
-    st.markdown("##### Operator decision")
-    st.caption(_DECISION_HELP)
-    if analysis.get("incomplete_reasons"):
-        st.warning(
-            "Analysis is incomplete — advisory checks could not all run: "
-            + "; ".join(analysis["incomplete_reasons"])
+    result = ui.guarded(
+        lambda: client.decide(
+            document_id,
+            prepared_revision_id=revision_id,
+            action=action,
+            target_document_id=target_document_id,
+            idempotency_key=ui.idempotency_key(
+                "decision", document_id, revision_id, action, target_document_id
+            ),
         )
+    )
+    if result is not None:
+        st.toast(f"{action.title()} accepted", icon=":material/gavel:")
+        st.rerun()
 
-    def _submit(action: str, target: str | None = None) -> None:
-        result = ui.guarded(
-            lambda: client.decide(
-                upload_id,
-                analysis_revision=revision,
-                action=action,
-                target_document_id=target,
-                idempotency_key=_decision_key(upload_id, action, revision),
+
+def _render_decisions(
+    client,
+    document: dict[str, Any],
+    revision_id: str,
+    candidates: list[dict[str, Any]],
+) -> None:
+    actions = set(document.get("allowed_actions", []))
+    if not actions.intersection({"KEEP", "REPLACE", "CANCEL"}):
+        return
+    st.divider()
+    st.subheader("Operator decision")
+    st.caption(
+        "The decision binds to this exact sealed revision. Replace first removes and "
+        "verifies the old active points."
+    )
+    keep, replace, cancel = st.columns(3)
+    document_id = str(document["id"])
+    with keep:
+        if st.button(
+            "Keep and publish",
+            type="primary",
+            disabled="KEEP" not in actions,
+            use_container_width=True,
+        ):
+            _submit_decision(
+                client,
+                document_id=document_id,
+                revision_id=revision_id,
+                action="KEEP",
             )
-        )
-        if result is not None:
-            replay = " (replayed)" if result.get("idempotent_replay") else ""
-            st.toast(f"Decision recorded: {action}{replay}", icon=":material/gavel:")
-            st.rerun()
-
-    keep_column, replace_column, cancel_column = st.columns(3)
-    with keep_column:
-        if st.button("Keep and publish", type="primary", icon=":material/check:"):
-            _submit("keep")
-    with replace_column:
+    with replace:
         eligible = {
-            str(candidate["document"]["document_id"]): (
-                f"#{candidate['rank']} {candidate['document'].get('filename', 'unknown')}"
-            )
+            str(candidate["document"]["id"]): candidate["document"]["original_filename"]
             for candidate in candidates
             if candidate.get("replacement_eligible")
         }
-        with st.popover("Replace existing…", icon=":material/swap_horiz:"):
+        with st.popover(
+            "Replace existing",
+            disabled="REPLACE" not in actions,
+            use_container_width=True,
+        ):
             if not eligible:
-                st.caption(
-                    "No replacement-eligible candidate on this evidence page. "
-                    "Only published documents in the same collection qualify."
-                )
+                st.caption("No replacement-eligible document appears on this candidate page.")
             else:
                 target = st.selectbox(
-                    "Document to replace",
+                    "Ready document",
                     options=list(eligible),
                     format_func=eligible.get,
-                    key=f"replace-target-{upload_id}",
+                    key=f"replace-target::{document_id}",
                 )
                 st.warning(
-                    "The old document is deleted and verified before the new "
-                    "one publishes; a brief availability gap is expected."
+                    "The old document becomes unavailable before the new revision publishes."
                 )
-                if st.button("Confirm replacement", type="primary", key=f"rp-{upload_id}"):
-                    _submit("replace", target)
-    with cancel_column:
-        with st.popover("Cancel intake…", icon=":material/delete_forever:"):
+                if st.button("Confirm replacement", type="primary"):
+                    _submit_decision(
+                        client,
+                        document_id=document_id,
+                        revision_id=revision_id,
+                        action="REPLACE",
+                        target_document_id=target,
+                    )
+    with cancel:
+        with st.popover(
+            "Cancel intake",
+            disabled="CANCEL" not in actions,
+            use_container_width=True,
+        ):
             st.warning(
-                "Cancelling purges the uploaded bytes, analysis artifacts, and "
-                "screening index points. Only a content-free audit hash remains."
+                "Cancel purges unpublished content and retains only a content-free tombstone."
             )
-            if st.button("Confirm cancellation", key=f"cx-{upload_id}"):
-                _submit("cancel")
+            if st.button("Confirm cancellation", key=f"cancel::{document_id}"):
+                _submit_decision(
+                    client,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    action="CANCEL",
+                )
 
 
-def _render_detail(client, upload_id: str) -> None:
-    upload = ui.guarded(lambda: client.upload_status(upload_id))
-    if upload is None:
-        return
-    document = upload["document"]
-    st.markdown(f"### {document['original_filename']}")
-    st.markdown(
-        ui.state_badge(document["state"])
-        + " "
-        + ui.badge(document["collection_key"], "info")
-        + " "
-        + ui.badge(
-            f"scan {document['scan_state']}",
-            ui.SCAN_STATE_TONES.get(document["scan_state"], "neutral"),
-        ),
-        unsafe_allow_html=True,
+def _retry(client, document: dict[str, Any]) -> None:
+    document_id = str(document["id"])
+    current = document.get("current_operation") or {}
+    result = ui.guarded(
+        lambda: client.retry(
+            document_id,
+            idempotency_key=ui.idempotency_key(
+                "retry", document_id, current.get("id"), current.get("attempt")
+            ),
+        )
     )
-    info_columns = st.columns(4)
-    info_columns[0].metric("Size", ui.fmt_bytes(document["size_bytes"]))
-    info_columns[1].metric("Uploaded", ui.fmt_relative(document["uploaded_at"]))
-    analysis = upload.get("analysis")
-    info_columns[2].metric("Pages", (analysis or {}).get("page_count") or "—")
-    info_columns[3].metric("Chunks", (analysis or {}).get("chunk_count") or "—")
-    st.markdown(
-        f'<div class="pdfb-kv">SHA-256</div>'
-        f'<div class="pdfb-mono">{document["sha256"]}</div>',
-        unsafe_allow_html=True,
-    )
+    if result is not None:
+        st.toast("Retry accepted", icon=":material/replay:")
+        st.rerun()
 
-    operation = upload.get("operation") or {}
+
+def _render_detail(client, document_id: str) -> dict[str, Any] | None:
+    document = ui.guarded(lambda: client.document(document_id))
+    if document is None:
+        return None
+    heading, status = st.columns([5, 2])
+    heading.markdown(f"### {document['original_filename']}")
+    heading.caption(f"{document['collection_key']} · `{document_id}`")
+    status.markdown(ui.state_badge(document["state"]), unsafe_allow_html=True)
+
+    facts = st.columns(4)
+    facts[0].metric("Size", ui.fmt_bytes(document.get("size_bytes")))
+    facts[1].metric("Updated", ui.fmt_relative(document.get("updated_at")))
+    revision = document.get("prepared_revision") or {}
+    facts[2].metric("Pages", revision.get("page_count") if revision else "—")
+    facts[3].metric("Chunks", revision.get("chunk_count") if revision else "—")
+
+    operation = document.get("current_operation")
     if operation:
-        st.markdown("##### Current operation")
-        state = operation.get("state", "?")
-        phase = operation.get("phase", "QUEUED")
-        op_columns = st.columns([2, 5])
-        op_columns[0].markdown(
-            ui.badge(
-                f"{operation.get('operation_type', '?')} · {state}",
-                ui.OPERATION_STATE_TONES.get(state, "neutral"),
-            )
-            + " "
-            + ui.badge(f"attempt {operation.get('attempt', 1)}", "neutral"),
-            unsafe_allow_html=True,
-        )
-        if state == "RUNNING" or (state == "QUEUED" and upload.get("open")):
-            op_columns[1].progress(
-                ui.phase_progress(phase), text=phase.replace("_", " ").title()
-            )
-        if operation.get("error"):
-            st.error(f"Last attempt failed: {operation['error']}")
-            if operation.get("retryable") and st.button(
-                "Retry without a new decision", icon=":material/replay:"
-            ):
-                if ui.guarded(lambda: client.retry_upload(upload_id)) is not None:
-                    st.toast("Retry queued", icon=":material/replay:")
-                    st.rerun()
+        operation_id = str(operation["id"])
+        detail = ui.guarded(lambda: client.operation(operation_id))
+        st.markdown("#### Durable operation")
+        ui.render_operation(detail or operation, show_timing=detail is not None)
 
-    replacement = upload.get("replacement")
-    if replacement:
-        st.markdown("##### Replacement progress")
-        tone = {"SUCCEEDED": "ok", "FAILED": "danger"}.get(replacement["state"], "info")
-        st.markdown(ui.badge(replacement["state"], tone), unsafe_allow_html=True)
-        if replacement.get("error"):
-            st.error(replacement["error"])
-
-    decision = upload.get("decision")
-    if decision:
-        st.markdown("##### Decision")
-        st.markdown(
-            ui.badge(decision["action"], "info")
-            + f" by `{decision['actor_id']}` at {ui.fmt_dt(decision['created_at'])}"
-            + (" against revision " + str(decision["analysis_revision"])),
-            unsafe_allow_html=True,
-        )
-
-    if analysis:
-        st.markdown("##### Analysis")
-        summary_bits = [
-            ui.badge(
-                f"revision {analysis['revision']} · {analysis['status']}",
-                "ok" if analysis["status"] == "COMPLETE" else "info",
-            ),
-            ui.badge(
-                "semantic complete" if analysis["semantic_complete"] else "semantic incomplete",
-                "ok" if analysis["semantic_complete"] else "warn",
-            ),
-            ui.badge(
-                "classification complete"
-                if analysis["classification_complete"]
-                else "classification incomplete",
-                "ok" if analysis["classification_complete"] else "warn",
-            ),
-        ]
-        if analysis.get("auto_ingest_eligible"):
-            summary_bits.append(ui.badge("auto-ingest eligible", "ok"))
-        st.markdown(" ".join(summary_bits), unsafe_allow_html=True)
-        ui.render_filename_warnings(analysis.get("filename_warnings", []))
+    failure = document.get("failure")
+    if failure:
+        st.error(str(failure.get("message", "The document workflow failed.")))
+    if "RETRY" in document.get("allowed_actions", []):
+        if st.button("Retry eligible phase", icon=":material/replay:"):
+            _retry(client, document)
 
     candidates: list[dict[str, Any]] = []
-    if upload.get("analysis_url") and analysis:
-        candidates = _render_candidates(client, upload_id)
-
-    if upload.get("review_required") and document["state"] == "REVIEW_REQUIRED" and analysis:
+    revision_id = str(revision.get("id", ""))
+    if revision_id:
         st.divider()
-        _render_decision_panel(client, upload, candidates)
-    elif upload.get("open") and document["state"] not in ("INGESTED",):
-        with st.popover("Cancel this intake…", icon=":material/delete_forever:"):
-            st.warning(
-                "Cancelling unpublished work purges its bytes, artifacts, and "
-                "index points after recording a content-free manifest hash."
-            )
-            if st.button("Confirm cancellation", key=f"cancel-open-{upload_id}"):
-                if ui.guarded(lambda: client.cancel_upload(upload_id)) is not None:
-                    st.toast("Cancellation queued", icon=":material/delete_forever:")
-                    _select_upload(None)
+        st.subheader("Preflight inspection")
+        candidates = _render_candidates(client, document_id, revision_id)
+        _render_decisions(client, document, revision_id, candidates)
+    return document
 
 
 def render() -> None:
-    """Render the durable review queue and the selected upload's detail."""
-
     ui.apply_chrome(
-        "Review queue",
-        "Durable intake work: restore after refresh, inspect evidence, decide.",
+        "Review",
+        "Inspect revision-bound preflight evidence, decide explicitly, and retry "
+        "exact failed phases.",
     )
     client = ui.get_client()
-    selected = _selected_upload_id()
-
-    st.subheader("Queue")
-    _render_queue_list(client)
-
-    if not selected:
-        st.info("Select an upload to inspect its evidence and record a decision.")
+    _render_queue(client)
+    selected = _selected_document_id()
+    if selected is None:
+        st.info("Select a document to inspect its current operation and preflight evidence.")
         return
 
     st.divider()
-    upload = ui.guarded(lambda: client.upload_status(selected))
-    if upload is None:
+    initial = ui.guarded(lambda: client.document(selected))
+    if initial is None:
         return
-    # Auto-refresh only while the worker is busy; a static page while a human
-    # reads evidence keeps popovers and scroll position stable.
-    worker_busy_states = {"ANALYZING", "INGESTING", "REPLACING", "DELETING", "CLEANUP_PENDING"}
-    refresh = "4s" if upload["document"]["state"] in worker_busy_states else None
-    if refresh is None:
-        if st.button("Refresh", icon=":material/refresh:"):
-            st.rerun()
-    else:
-        st.caption("Refreshing automatically while the worker is busy…")
+    refresh = "2s" if initial.get("state") in ui.WORKING_DOCUMENT_STATES else None
+    if refresh:
+        st.caption("Polling every two seconds while durable work is open.")
+    elif st.button("Refresh document", icon=":material/refresh:"):
+        st.rerun()
 
     @st.fragment(run_every=refresh)
-    def detail_section() -> None:
+    def detail_fragment() -> None:
         _render_detail(client, selected)
 
-    detail_section()
+    detail_fragment()
 
 
 render()

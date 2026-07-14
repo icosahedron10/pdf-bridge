@@ -1,45 +1,68 @@
 # PDF Bridge Streamlit workspace
 
-A professional Streamlit front end covering the full PDF Bridge intake
-lifecycle for the POC. It is a **pure HTTP client** of a running PDF Bridge
-service: it bootstraps the same anonymous cookie session and CSRF token the
-built-in browser UI uses, sends `Idempotency-Key` headers on every mutation,
-and never opens the SQLite catalog directly (the supported topology is exactly
-one application process).
+Status: Current
 
-## Pages
+This is the production-canonical operator experience for PDF Bridge API v2. It is a pure HTTP
+client: Streamlit never opens the catalog database, reads managed storage paths, loads models, or
+connects to Qdrant directly.
 
-| Page | Coverage |
+## Operator workflow
+
+| Page | Workflow |
 |---|---|
-| Overview | Dependency health, collection counts, recent intake |
-| Upload | Preflight filename advisories, scanned multipart upload, live tracking |
-| Review queue | Durable open work, operation phases, candidate evidence with LLM findings and excerpt comparison, Keep / Replace / Cancel decisions, retry, cancel |
-| Library | Catalog filters (scope, state, collection), document detail with audit ledger, operations, decisions, PDF download/preview, verified deletion |
-| Search | Keyword / semantic / hybrid retrieval; ranked hits with snippets for one collection, totals across several |
+| Operations | Process and dependency readiness, collection lifecycle counts, and fixed physical-target status |
+| Intake | Collection selection, filename-only advisory, bounded upload, and two-second document/operation polling |
+| Review | Revision-bound semantic preflight, candidate evidence, Keep/Replace/Cancel, and exact-phase retry |
+| Library | Cursor-paged current documents; source preview/download; Markdown, chunk, lifecycle, operation, and event inspection; high-priority delete; terminal history |
+| Search | Optional operator-only proxy to the configured external active-corpus retrieval service, with an explicit unavailable state |
 
-## Running
+Uploads, decisions, retries, and deletes use stable `Idempotency-Key` values. A delete immediately
+blocks content access and queues `HIGH`-priority verified point and storage removal. Deleted,
+cancelled, and rejected documents leave content-free tombstones in History.
 
-1. Start PDF Bridge itself (`docker compose up --build`, or `uvicorn
-   pdf_bridge.app:app` with a configured environment).
-2. Install the UI dependency group and launch from the repository root so the
-   bundled theme in `.streamlit/config.toml` applies:
+The client retains the server-owned authentication cookie for one Streamlit session. Before its
+first protected request, it performs an authenticated `GET /api/v2/collections` and reads the CSRF
+token from the `X-CSRF-Token` response header. It refreshes that session once after an explicit CSRF
+failure. The browser never manufactures an identity header or receives an upstream search secret.
 
-   ```bash
-   python -m pip install -e '.[streamlit]'
-   streamlit run streamlit_app/app.py
-   ```
+## API v2 coverage
 
-3. The app targets `http://127.0.0.1:8000` by default. Override with the
-   `PDF_BRIDGE_URL` environment variable or the sidebar setting.
+The workspace consumes only `/api/v2` and covers:
 
-## Authentication notes
+- liveness and readiness;
+- collection list/detail, filename advisory, document list, and upload;
+- document detail, source PDF, canonical Markdown, public chunks, and semantic preflight;
+- decisions, retry, high-priority delete, audit events, and operation polling;
+- terminal history and optional operator search.
 
-The client supports the `anonymous-poc` mode. Each Streamlit browser session
-holds its own bridge session, so audit events record distinct anonymous actor
-identifiers. Behind a trusted-header deployment the app would need to run
-behind the same identity-injecting proxy as the service; that is outside the
-POC scope.
+Lists use the API's opaque `cursor` and bounded `limit`; no view derives offsets or parses cursor
+contents. Protected paths, raw vectors, prompts, model output, credentials, and provider failures
+are not rendered.
 
-Uploads are limited server-side by `PDF_BRIDGE_MAX_UPLOAD_BYTES` (50 MiB by
-default); the Streamlit uploader allows up to 100 MB and relies on the service
-to reject oversized envelopes with a typed 413 problem.
+## Launch
+
+Start the configured Litestar service first. Then, from the repository root:
+
+```bash
+python -m pip install -e '.[streamlit]'
+streamlit run streamlit_app/app.py
+```
+
+For the reference container topology, configure `.env` and run `docker compose up --build` from
+the repository root. Compose publishes this workspace on `http://127.0.0.1:8501`, waits for Bridge
+readiness, and gives the Streamlit container only the dedicated internal operator network. It
+receives no Bridge storage, model cache, ClamAV/Qdrant networks, or provider credentials.
+
+`PDF_BRIDGE_URL` selects the fixed Litestar service root and defaults to
+`http://127.0.0.1:8000`. It is deployment-owned, cannot be changed in the workspace, and redirects
+from Bridge are refused.
+
+`PDF_BRIDGE_STREAMLIT_MAX_UPLOAD_FILES` caps one Intake selection, defaults to `5`, and accepts
+values from 1 through 20. The UI rejects a larger selection before filename advisories or uploads;
+the API continues to accept exactly one PDF per request.
+
+For trusted-header authentication, set `PDF_BRIDGE_STREAMLIT_IDENTITY_HEADER` to the header name
+injected by the approved Streamlit ingress. Streamlit requires that header on the current request
+and forwards its value to Bridge; no form or browser script can supply an alternate identity. Block
+direct access to both services and configure Bridge's trusted proxy CIDRs to include Streamlit's
+direct peer.

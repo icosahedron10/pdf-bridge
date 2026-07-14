@@ -1,166 +1,346 @@
 # Security model and enterprise gates
 
-PDF intake crosses file-upload, malware, parser, model, vector-database, and retrieval trust
-boundaries. These controls make the POC fail closed for known unsafe states; they do not make
-arbitrary PDFs or model output trustworthy.
+**Status: Current**
 
-## Implemented controls
+This document describes the implemented application security boundaries, required deployment
+controls, and residual risk. `Status: Current` does not attest that an environment has completed the
+external controls or the mandatory enterprise gate at the end of this document.
 
-- Display names must end in `.pdf`; separators, control characters, empty files, oversized bodies,
-  and invalid leading signatures are rejected.
-- Uploads stream to generated temporary names with byte limits and server-calculated SHA-256.
-- ClamAV `INSTREAM` runs synchronously. Scanner error, protocol failure, or unclean verdict prevents
-  canonical promotion.
-- Exact bytes are blocked only within the selected configured collection. User filenames never
-  influence canonical paths or collection assignment.
-- Pinned pypdf runs in a child process with wall-clock, Linux CPU/address-space, page, character,
-  and chunk limits. Encryption, malformed input, image-only/insufficient text, and over-budget
-  content reject without override and are purged.
-- Browser mutations require an authenticated/encrypted session, same-origin request, and CSRF token.
-  Trusted-header mode accepts identity only from configured direct-peer proxy CIDRs. CORS is absent.
-- Durable decisions name an exact analysis revision. Keep/Replace/Cancel records are immutable;
-  replacement targets must be current, same-collection, ingested candidates.
-- PDF text is sent to models as untrusted quoted data. Tools are disabled, output uses a strict
-  schema at temperature zero, malformed output is retried once, and every cited reference and quote
-  is checked against retained source.
-- Model findings are explanation-only. They cannot suppress deterministic candidates, publish,
-  delete, or select a replacement.
-- Pending points use a separate screening collection. Active point payloads require publication and
-  schema markers, and Bridge validates external retrieval UUIDs against eligible catalog state.
-- Qdrant requires an API key and enables JWT RBAC. Bridge has the administrative key; retrieval gets
-  collection-scoped read JWTs for active aliases only and no screening permission.
-- Qdrant mutations are durable in a SQL outbox, idempotent by deterministic point ID, applied with
-  wait and strong ordering, and verified by exact count.
-- Full analysis content is compressed in private storage and is purged on cancellation/deletion.
-  Audit records keep a canonical manifest hash and metadata, not excerpts, vectors, prompts, raw
-  model output, or credentials.
-- The reference app container runs as non-root, drops capabilities, disallows privilege escalation,
-  uses a read-only root filesystem, and mounts only explicit data/tmp paths writable. Qdrant is not
-  published to the host and sits on an internal-only network.
+PDF Bridge crosses browser, file-upload, malware scanner, PDF parser, local-model, remote-model,
+filesystem, SQLite, and vector-database trust boundaries. The source PDF, extracted text,
+LLM-produced Markdown, classifier output, Qdrant payloads, and filenames are all untrusted data.
 
-## Residual risks
+## Security invariants
 
-### Parser containment is not a sandbox
+- Only configured logical collection keys are accepted. User input never supplies a filesystem
+  path or physical Qdrant name.
+- Clean upload bytes are stored under generated opaque UUID paths only after bounded streaming,
+  server-side SHA-256, PDF-shape checks, and a successful ClamAV verdict.
+- OCR is disabled. Only English native-text PDFs are supported. Encrypted, malformed, image-only,
+  empty, text-insufficient, and over-budget inputs fail closed.
+- pypdf layout extraction, the vLLM formatter, strict Markdown validation, chunking, local dense and
+  sparse embedding, screening, duplicate checks, classifier, and verifier all run before
+  ingestion. Formatting and deterministic screening must complete successfully; incomplete
+  classifier/verifier evidence is explicit and requires operator review.
+- Invalid or unavailable Markdown formatting has no plain-text fallback and cannot produce active
+  Qdrant points.
+- Published points use only the logical collection's fixed pre-provisioned Qdrant collection.
+  Pending points use only the separately pre-provisioned private screening collection.
+- PDF Bridge never creates, drops, renames, aliases, or changes the schema of a Qdrant collection.
+- A deletion request blocks access immediately. Active and screening Qdrant points reach verified
+  zero counts before the operation advances durably to <code>PURGE_STORAGE</code>; source and derived
+  storage are purged afterward.
+- Terminal deleted/cancelled/rejected records contain no PDF text, Markdown, vectors, prompts, or
+  raw model output.
 
-A clean malware result is not a safety proof, and pypdf may contain exploitable defects. Linux
-resource limits constrain CPU and address space but do not provide a complete syscall, filesystem,
-or kernel boundary. Production use requires a least-privilege disposable parser sandbox with no
-network, minimal readable files, a patched image, and owned vulnerability response.
+## Upload and object storage
 
-### Prompt injection classification is out of scope
+The upload handler must:
 
-The prompt marks PDF text untrusted and validates citations, but the system does not classify prompt
-injection. A document may still influence explanatory labels or summaries. Deterministic candidate
-retention and human decisions are the mutation boundary; do not reuse model prose as executable
-instructions.
+- reject path separators, control characters, invalid PDF signatures, empty content, oversized
+  bodies, and incomplete streams;
+- calculate hashes and byte counts server-side while streaming to a generated temporary object;
+- fail closed on scanner timeout, protocol error, or non-clean verdict;
+- promote with an atomic operation into the configured storage root;
+- compare resolved paths against the storage root before every open, move, or purge;
+- reject exact-byte duplicates within the selected logical collection while allowing an
+  intentional copy in a different collection;
+- never log bytes, extracted content, Markdown, full paths, or malware samples.
 
-### Anonymous POC access is not human authentication
+The storage root must be access-controlled and encrypted according to the document classification.
+The service account receives only the filesystem permissions required for its object and temporary
+directories. Streamlit, Qdrant, vLLM, and retrieval services receive no direct filesystem access.
+The reference container topology also isolates Streamlit on a dedicated internal operator network;
+it does not join the separate ClamAV or Qdrant networks and receives no provider credentials.
 
-`anonymous-poc` creates auditable sessions but does not prove identity. Anyone who can reach the app
-has the trusted-operator capability set, including Keep, Replace, Cancel, and delete. Network-isolate
-the POC or deploy trusted-header SSO before handling sensitive collections.
+## Parser boundary
 
-### Collection labels are not end-user authorization
+pypdf is pinned and runs in a child process with hard parent wall-clock and child CPU,
+address-space, page, and character limits. The child receives one staged PDF and returns bounded
+page-scoped layout text. It receives no Qdrant, vLLM, session, scanner, or database credentials and
+should have no network access. PyMuPDF is not an approved dependency because its licensing is
+incompatible with this service.
 
-`customer` and `internal` audience labels help operators place content. PDF Bridge does not decide
-which chatbot user may query a collection. The external application must derive allowed collections
-from authenticated server-side policy and intersect them with every request.
+### A parser subprocess is not a sandbox
 
-### Administrative Qdrant key is high impact
+ClamAV is not proof that a file is safe, and operating-system resource limits do not isolate
+syscalls, kernel bugs, shared mounts, or every parser vulnerability. A production deployment
+requires a disposable least-privilege parser boundary with:
 
-The Bridge key can read and mutate active and screening collections and manage aliases. Disclosure
-exposes pending documents and can corrupt retrieval. Store it in a secret manager, restrict network
-access, monitor rejected authentication, and rotate it through an approved procedure. Changing the
-admin key invalidates JWTs signed by the previous key.
+- a minimal patched image and non-root identity;
+- no outbound network and no ambient credentials;
+- read access only to the staged input and write access only to bounded temporary output;
+- syscall, process, filesystem, CPU, memory, and wall-time restrictions;
+- vulnerability monitoring and a tested malicious-PDF response procedure.
 
-A global Qdrant read-only key is not sufficient isolation because it can read screening. Retrieval
-must use granular JWT claims scoped to required active collections. Test denial of collection-list
-and screening queries after every token or topology change.
+Unexpected parser crashes, limit kills, or output-shape violations are security-relevant events.
+Do not retry them without bounds or move parsing into the credential-bearing application process.
 
-### Private-network HTTP still needs a threat decision
+## Markdown formatter and prompt injection
 
-Reference Compose keeps Qdrant on an internal-only single-host network and does not expose its port.
-API keys still cross that network without Qdrant-native TLS. Use TLS or an authenticated private
-ingress whenever traffic crosses hosts, untrusted namespaces, or a network where packet capture is
-credible. Provider and retrieval endpoints should use organization-managed TLS.
+pypdf layout text is untrusted even though it is native text. A PDF can contain instructions aimed
+at the formatter, classifier, verifier, operator, or a later retrieval model. The formatter must
+treat each delimited page as data and has one narrow authority: represent that content as
+Markdown, including structurally faithful tables.
 
-### SQLite and one process
+Required formatter controls:
 
-The supported topology is one SQLite writer and one Uvicorn process. It is not highly available,
-does not provide per-service database tenancy, and places catalog plus source/analysis data in one
-recovery domain. A second process defeats in-process locks; horizontal scaling requires a redesigned
-distributed coordination model.
+- use the exact configured vLLM URL, token, formatter model ID, pinned prompt, and temperature-zero
+  chat-completions request;
+- provide no tools, filesystem, network, retrieval, or lifecycle capabilities to the model;
+- enforce hard page, input-token, output-token, timeout, and attempt budgets;
+- split an oversized page into deterministic ordered non-overlapping slices rather than truncate
+  or reject it solely for exceeding one request budget;
+- require a strict page/slice-scoped JSON response rather than accepting free-form Markdown;
+- require every input page and slice exactly once, in order, with no unknown identifier;
+- validate bounded expansion, normalized source coverage, preserved anchors/numbers, table shape,
+  and a deterministic hash of the accepted page/slice map;
+- reject raw HTML, executable links, remote-image references, and unsafe Markdown constructs before
+  the content can be displayed;
+- retain size-bounded raw provider exchanges only as mode-`0600`, UUID-addressed protected revision
+  artifacts; never write them to logs or public resources, and purge them with document content.
 
-### Sensitive metadata remains
+Schema and fidelity checks reduce risk but cannot prove that an LLM preserved every semantic
+relationship. A valid-looking formatter response may still omit, rearrange, or invent content.
+The service therefore fails the document after its one bounded retry whenever validation is
+inconclusive. It does not substitute pypdf text, partially accept pages, repair model output by
+hand, or silently drop tables.
 
-Filenames, actors, UUIDs, collection keys, hashes, bounded errors, search queries, and returned
-snippets may be confidential even when PDF content is excluded from logs. Apply classification,
-retention, backup, deletion, and access controls to metadata as well as source bytes.
+Canonical Markdown remains untrusted after acceptance. Streamlit must render a safe Markdown
+subset with raw HTML disabled and must not automatically fetch external links or images. Markdown
+is never interpreted as an instruction, prompt template, configuration value, storage path,
+collection name, or executable content.
 
-### Outage override is deliberate
+The formatter vLLM boundary receives complete extracted document content. Use a dedicated approved
+endpoint and credential with organization-managed TLS, authentication, data-use and retention
+guarantees, and content-free request logging. It must not fall back to the advisory endpoint.
+Provider administrators and model-serving infrastructure are inside the document-data trust
+boundary.
 
-Embedding, LLM, or Qdrant outages are advisory for the semantic decision, but publication still
-requires complete dense and BM25 points. Keep can override analysis incompleteness; it cannot bypass
-durable indexing. Monitor extended retained pending content and avoid treating an outage as an empty
-candidate result.
+## Classifier and verifier boundary
 
-## Mandatory enterprise gate
+Duplicate screening and LLM classification are preflight checks, not ingestion. Classifier and
+skeptical-verifier calls use separate configured model IDs, strict structured output, hard token
+and time limits, temperature zero, no tools, and source-backed chunk references.
 
-Do not call the deployment enterprise-ready until responsible owners approve and verify:
+Classifier and verifier calls use a separately configured advisory endpoint and credential. Bridge
+must not send formatter requests to that endpoint or use an advisory model as a formatting
+fallback. Separate credentials allow the formatter's full-document access and the advisory
+boundary's narrower evidence access to be audited and revoked independently.
 
-- [ ] Organization-managed TLS, reverse-proxy behavior, allowed hosts, and trusted direct-peer CIDRs.
-- [ ] Enterprise SSO with `PDF_BRIDGE_AUTH_MODE=trusted-header`; direct app access blocked.
-- [ ] Authorization for upload/review/delete if all authenticated operators should not be peers.
-- [ ] Server-side chatbot policy that derives and enforces allowed collections.
-- [ ] Qdrant TLS/private ingress, administrative-key custody, JWT expiry/rotation, active-only scopes,
-      screening denial, audit logging, and network egress restrictions.
-- [ ] Separate secret-manager entries, owners, rotation, and revocation for session, Qdrant,
-      embedding, LLM, and retrieval credentials.
-- [ ] Disposable parser sandbox, no parser network, least privilege, patch SLA, and malicious-PDF
-      testing. A resource-limited subprocess alone does not satisfy this item.
-- [ ] ClamAV signature freshness and the organization's malware/CDR/encrypted-document policy.
-- [ ] Provider data-use, retention, residency, TLS, authentication, logging, and model-change policy.
-- [ ] Prompt-injection and data-exfiltration threat review for quoted PDF text and LLM output.
-- [ ] Approved encrypted storage, backup, legal-hold, restore, retention, and verified deletion.
-- [ ] A database/coordination redesign before multiple replicas or high availability.
-- [ ] Active/screening reconciliation, alias/epoch checks, outbox crash tests, and alerts on unknown
-      IDs or publication/schema violations.
-- [ ] External retrieval conformance for BM25, dense, hybrid RRF, filters, payloads, and screening
-      denial.
-- [ ] Rate limits, proxy body limits, capacity monitoring, SAST, dependency/container scanning,
-      DAST, and focused penetration testing.
-- [ ] A labeled same-collection evaluation corpus with candidate recall at least `0.98`, plus a
-      recorded dataset hash and parser/model/threshold fingerprints.
+The advisory boundary receives only the bounded candidate/chunk evidence allowed by the preflight
+policy, not an automatic copy of the complete source or formatter request.
 
-Application enterprise-mode validation is only a backstop; it does not complete this checklist.
+Deterministic candidates cannot be suppressed by model output. Classifier/verifier text may explain
+evidence but cannot:
 
-## ClamAV operations
+- mark a document ready;
+- select or delete a replacement;
+- move a document between collections;
+- modify canonical Markdown or vectors;
+- bypass incomplete provider or Qdrant checks.
 
-Compose builds the exact `clamav/clamav:1.5.3` patch and persists signatures. The daemon stream limit
-is 64 MiB, above the default 50 MiB upload cap, and its port is not published.
+Every referenced document, chunk, page, and quote must resolve to the immutable preflight bundle.
+Malformed, stale, unsupported, unavailable, or unverifiable advisory output is recorded as
+incomplete and forces `REVIEW_REQUIRED`; it is never treated as “no duplicate.” Failure to build a
+trustworthy deterministic candidate set is `PREFLIGHT_FAILED` and must be retried.
 
-- Monitor FreshClam logs, signature timestamps, update failures, and daemon readiness.
-- Keep ClamAV storage separate from canonical PDFs; the app streams bytes to the daemon.
-- Treat scanner errors as a security outage, never as permission to skip scanning.
-- Review the official image and vulnerability data before changing the pin.
+## Local embedding and model supply chain
+
+<code>sentence-transformers/all-mpnet-base-v2</code> executes inside PDF Bridge and therefore
+expands the application process's code, memory, and supply-chain boundary. The approved model
+commit, tokenizer, Sentence Transformers, PyTorch/runtime, FastEmbed, and
+<code>Qdrant/bm25</code> artifacts must be pinned and reviewed together.
+
+Production controls must:
+
+- prefetch approved artifacts through a controlled build/release process;
+- resolve the dense commit only from the Sentence Transformers cache and place the sparse assets at
+  `fastembed/{manifest_sha256}/` with an exact file-hash manifest and required non-empty
+  `english.txt` asset;
+- record upstream revision, file hashes, license, provenance, and vulnerability/SBOM results;
+- mount the verified cache read-only and start with local-files-only behavior;
+- disable remote model code and refuse floating revisions, symlinks outside the cache, hash drift,
+  or startup downloads;
+- verify the loaded dense model produces finite normalized 768-dimensional vectors;
+- verify FastEmbed uses distinct document/query encodings and the Qdrant BM25 IDF modifier;
+- treat cache replacement as a reviewed deployment and index-profile change.
+
+Local inference creates denial-of-service risk through CPU, memory, thread, and model-load
+pressure. Enforce the PDF/chunk/token limits, one embedding lane, bounded batch size, two worker
+slots, operation leases, and queue/host-resource alerts. Do not increase concurrency merely to
+drain a hostile or unexpectedly large queue. A process-level model crash may affect API
+availability; horizontal replicas are not a supported mitigation while SQLite and process-local
+coordination remain.
+
+## Qdrant isolation and least privilege
+
+The platform team owns collection creation and schema. Every active physical collection and the
+private screening collection are fixed names in trusted configuration. Startup and readiness
+validate named <code>dense</code> vectors (768 dimensions, Cosine), named <code>bm25</code> sparse
+vectors with IDF, required payload indexes, and compatible point schema. Drift fails readiness;
+Bridge must not repair it.
+
+Qdrant alone receives the independently generated HS256 admin/signing key. Bridge receives only a
+pre-generated granular JWT whose `access` claim contains exactly one `rw` rule for every enabled
+active physical collection and the screening collection, plus a required future `exp`; it has no
+global `r` or `m` grant. Bridge validates that untrusted structure and exact claim set at startup
+without receiving the signing key. Qdrant verifies the signature during readiness collection
+probes, so a structurally valid forgery still fails closed.
+
+That scoped token permits collection-description, filtered alias-metadata-read, search/read,
+upsert, count, and delete-point operations only for configured active and screening collections.
+Alias metadata is required so readiness can reject alias participation. It must not permit:
+
+- create, delete, or reconfigure collections;
+- create, delete, or move aliases;
+- access unrelated collections;
+- change server configuration or issue snapshots.
+
+Retrieval receives a separate read-only credential for active collections and no screening access.
+Streamlit receives no Qdrant credential and reaches document/index state only through Bridge.
+Network policy should admit Qdrant traffic only from Bridge and approved retrieval components.
+Require TLS or an authenticated private ingress whenever traffic crosses a host or trust zone.
+
+Qdrant payload text is a copy of document content and receives the same classification as the PDF.
+Payload filters for document ID, logical collection, publication state, and index schema are
+mandatory. A hit for pending, unknown, or cross-collection content—or any hit after a deletion has
+advanced to `PURGE_STORAGE`—is an integrity incident, not a reason to loosen validation. A hit during
+the acknowledged-delete interval before verified zero is the documented residual window and must
+never be mistaken for completed deletion.
+
+Self-hosted Qdrant must have authentication and JWT RBAC enabled; anonymous describe, list, query,
+upsert, and delete attempts must fail. The admin signing key must be absent from the Bridge process,
+logs, and support bundles. Run the opt-in live RBAC gate documented in the runbook after every
+credential, collection mapping, or platform change; it proves the Bridge token can describe an
+enabled collection but cannot see/write an unrelated collection or create one. Separately prove the
+retrieval key cannot list/query screening.
+
+## Authentication and canonical Streamlit UI
+
+Streamlit is the canonical operator experience but not a trusted lifecycle authority. It uses only
+authenticated Bridge APIs and never reads SQLite, object storage, or Qdrant directly.
+
+The optional Streamlit Search page also calls only Bridge. Bridge forwards a bounded request to the
+separately owned retrieval service with a Bridge-held credential, validates returned document IDs
+and collection membership against the catalog, and fails closed on unknown, non-`READY`, or
+cross-collection hits. It never exposes the upstream token, queries screening as a fallback, or
+turns the operator proxy into an end-user authorization boundary.
+
+Browser mutations require an authenticated session, same-origin request, CSRF protection, and
+idempotency key. The Bridge URL is deployment-owned in Streamlit, is not operator-editable, and
+redirects are refused to limit server-side request forgery and credential forwarding.
+
+In trusted-header mode, the approved ingress injects the configured identity header into the
+incoming Streamlit request. Streamlit requires it and forwards its value server-side; the browser
+does not manufacture the header. Bridge accepts it only when Streamlit's direct-peer address is in
+the configured trusted proxy CIDRs. Direct access to either app must be blocked. CORS is disabled
+unless a reviewed deployment requirement defines exact origins and credentials behavior.
+
+The isolated POC may use anonymous sessions for attribution, but anonymous mode does not prove
+human identity. Anyone who can reach it can upload, review, replace, cancel, download, or delete.
+Use trusted-header SSO and explicit authorization before handling sensitive collections or before
+operators should have different privileges.
+
+Logical collection labels are not end-user retrieval authorization. Any downstream retrieval
+application must derive allowed physical/logical collections from authenticated server-side policy
+and intersect that policy with every query.
+
+## Deletion, tombstones, and privacy
+
+On a durable deletion request, Bridge immediately removes the document from its active views and
+blocks all Bridge content reads. It then deletes and verifies all applicable active and screening
+points before persisting <code>PURGE_STORAGE</code> as the next phase. Only Qdrant zero ends the short
+interval in which a separate retrieval client could still observe old active points. Only afterward
+may Bridge purge the PDF, raw extraction, Markdown, chunks, vectors, prompts, raw model output, and
+other protected artifacts.
+
+If Qdrant deletion fails, source content remains for an idempotent retry. If storage purge fails at
+or after <code>PURGE_STORAGE</code>, points remain absent, access remains blocked, and retries perform
+only storage/content-row cleanup. Unexpected paths, permission failures, or residual artifacts fail
+hard. No cleanup exception may be swallowed.
+
+The terminal tombstone retains only the minimum content-free audit fields: document UUID, logical
+collection, lifecycle timestamps, actor/change identity, operation IDs, content/manifest hashes,
+and bounded reason/status codes. Even these fields can be personal or confidential metadata.
+Apply retention, access, and legal-hold policy to tombstones and audit records.
+
+Deletion from live storage does not automatically remove content from immutable logs, filesystem
+snapshots, Qdrant snapshots, model-provider logs, or backups. Those systems require documented
+retention and expiry. A restore must reconcile newer tombstones before exposing restored content;
+never resurrect a deleted PDF merely because it exists in an older backup.
 
 ## Logging and incident evidence
 
-Permitted structured fields include request ID, route/status, bounded actor identity, document,
-analysis, operation, replacement and outbox IDs, event type, duration, provider category, and
-content-free hashes. Exclude PDF text/bytes, snippets, vectors, prompts, raw model output, session or
-CSRF data, bearer/API keys, JWTs, and full local paths.
+Allowed structured fields include bounded actor identity, request/document/operation/preflight/
+replacement IDs, logical collection key, phase, attempt, checkpoint, duration, model ID/revision,
+profile hash, Qdrant collection identifier, point count, and content-free error category.
 
-On suspected malware escape, parser compromise, model/provider compromise, screening disclosure,
-Qdrant credential leak, cross-collection result, or replacement overlap:
+Exclude PDF bytes/text, canonical Markdown, snippets, search queries, prompts, raw model output,
+vectors, session or CSRF data, API keys, bearer tokens, JWTs, full object paths, and user-supplied
+error text. Hashes are identifiers and may still be sensitive.
 
-1. contain uploads, worker, provider, and retrieval access without deleting evidence;
-2. preserve protected logs, audit rows, IDs, timestamps, fingerprints, and hashes;
-3. revoke/rotate affected credentials and regenerate Qdrant JWTs when needed;
-4. quarantine inconsistent index content and validate the authoritative SQL collection mapping;
-5. rebuild from externally preserved verified sources;
-6. run positive/negative retrieval, replacement-ordering, purge, and access-denial tests before
-   reopening traffic.
+For malware escape, parser compromise, prompt injection with unsafe output, model/cache
+compromise, vLLM disclosure, screening exposure, cross-collection results, replacement overlap,
+deletion resurrection, credential disclosure, or unexplained catalog/index drift:
 
-Do not manually edit append-only audit/decision records or force lifecycle state. Use supported
-operations or a reviewed repair migration that preserves original evidence.
+1. contain uploads, worker dispatch, Streamlit mutations, vLLM, and retrieval without destroying
+   evidence;
+2. preserve protected content-free IDs, checkpoints, timestamps, fingerprints, hashes, and logs;
+3. revoke affected credentials and have the platform owner quarantine inconsistent points;
+4. verify the model cache and serving revisions against approved hashes;
+5. rebuild from externally preserved verified PDFs when content or index integrity is uncertain;
+6. rerun readiness, access-denial, reconciliation, replacement, and deletion-interruption tests
+   before reopening service.
+
+Do not manually rewrite lifecycle, decision, checkpoint, or audit rows.
+
+## Residual risks
+
+- ClamAV and PDF-shape validation cannot prove a PDF is harmless.
+- A resource-limited parser subprocess is not a complete malicious-document sandbox.
+- Structured output and deterministic fidelity checks cannot prove that LLM Markdown is fully
+  faithful or immune to prompt injection.
+- Local model execution increases application memory, dependency, and denial-of-service exposure.
+- A compromised vLLM endpoint can observe source content and forge plausible structured responses.
+- External retrieval can observe a document between delete acknowledgment and verified Qdrant zero;
+  priority reduces this interval but does not make deletion synchronous.
+- SQLite plus one process is not highly available and cannot safely scale horizontally.
+- Filenames, UUIDs, hashes, collection membership, actors, search queries, and tombstones can
+  disclose sensitive metadata.
+- Qdrant and backup copies extend the time and systems over which deletion must be reconciled.
+
+## Mandatory enterprise gate
+
+Do not describe the deployment as enterprise-ready until owners verify:
+
+- [ ] Enterprise SSO, direct-app blocking, trusted proxy CIDRs, allowed hosts, CSRF, session
+      rotation, and role/collection authorization.
+- [ ] Organization-managed TLS and network policy for Streamlit, Bridge, ClamAV, vLLM, Qdrant, and
+      retrieval.
+- [ ] Approved storage encryption, backup, restore, retention, legal hold, tombstone, and verified
+      deletion procedures.
+- [ ] A disposable no-network parser sandbox and malicious-PDF test program; a child process alone
+      does not satisfy this item.
+- [ ] ClamAV signature freshness, outage handling, and the organization's malware/CDR policy.
+- [ ] vLLM data use, model provenance, authentication, retention, residency, logging, capacity,
+      patching, and incident response.
+- [ ] Formatter prompt-injection review, strict schema/fidelity corpus tests, safe Markdown
+      rendering, and proof that every invalid path has no plain-text fallback.
+- [ ] Read-only verified local model cache, exact revision/hash enforcement, remote-code disabled,
+      SBOM/license review, dependency/container scanning, and host resource limits.
+- [ ] Qdrant fixed-name/schema ownership, least-privilege Bridge credential, active-only retrieval
+      credential, screening denial, TLS/private ingress, audit, snapshot, and drift response.
+- [ ] Operator search proxy authentication, strict response correlation, upstream credential
+      isolation, disabled-state behavior, and proof that it grants no end-user retrieval authority.
+- [ ] Crash tests before and after the transition to <code>PURGE_STORAGE</code>, plus verified
+      filesystem, SQLite, active-index, screening-index, snapshot, and backup deletion
+      reconciliation.
+- [ ] A database and distributed-coordination redesign before multiple processes, replicas, or high
+      availability.
+- [ ] Rate limits, proxy body limits, queue/capacity alerts, SAST, DAST, penetration testing, and
+      incident exercises.
+- [ ] A labeled same-collection evaluation corpus covering prose and tables, with recorded
+      content/index/policy profile hashes and approved retrieval/preflight quality thresholds.
+
+Application enterprise-mode validation is a startup guard, not completion of this checklist.

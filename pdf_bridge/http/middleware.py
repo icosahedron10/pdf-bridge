@@ -7,14 +7,12 @@ import json
 import re
 from collections.abc import Sequence
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from litestar.datastructures import Headers, MutableScopeHeaders
 from litestar.types import ASGIApp, Message, Receive, Scope, Send
 
-REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
 DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-DOCS_UI_PATHS = {"/api", "/api/", "/api/docs", "/api/oauth2-redirect.html"}
 
 
 def ensure_request_id(scope: Scope) -> str:
@@ -22,11 +20,18 @@ def ensure_request_id(scope: Scope) -> str:
 
     state = scope.setdefault("state", {})
     current = state.get("request_id")
-    if isinstance(current, str) and REQUEST_ID_PATTERN.fullmatch(current):
-        return current
+    if isinstance(current, str):
+        try:
+            if current == str(UUID(current)):
+                return current
+        except ValueError:
+            pass
 
     candidate = Headers.from_scope(scope).get("x-request-id", "")
-    request_id = candidate if REQUEST_ID_PATTERN.fullmatch(candidate) else str(uuid4())
+    try:
+        request_id = candidate if candidate == str(UUID(candidate)) else str(uuid4())
+    except ValueError:
+        request_id = str(uuid4())
     state["request_id"] = request_id
     return request_id
 
@@ -60,20 +65,11 @@ class RequestContextMiddleware:
                 if not scope.get("path", "").startswith("/static/"):
                     response_headers.setdefault("Cache-Control", "no-store")
                 if "content-security-policy" not in response_headers:
-                    if scope.get("path") in DOCS_UI_PATHS:
-                        response_headers["Content-Security-Policy"] = (
-                            "default-src 'none'; base-uri 'none'; object-src 'none'; "
-                            "frame-ancestors 'self'; form-action 'self'; connect-src 'self'; "
-                            "script-src 'unsafe-inline' https://cdn.jsdelivr.net; "
-                            "style-src 'unsafe-inline' https://cdn.jsdelivr.net; "
-                            "img-src 'self' data: https://cdn.jsdelivr.net"
-                        )
-                    else:
-                        response_headers["Content-Security-Policy"] = (
-                            "default-src 'self'; base-uri 'none'; object-src 'none'; "
-                            "frame-ancestors 'self'; form-action 'self'; script-src 'self'; "
-                            "style-src 'self'; img-src 'self' data:; connect-src 'self'"
-                        )
+                    response_headers["Content-Security-Policy"] = (
+                        "default-src 'self'; base-uri 'none'; object-src 'none'; "
+                        "frame-ancestors 'self'; form-action 'self'; script-src 'self'; "
+                        "style-src 'self'; img-src 'self' data:; connect-src 'self'"
+                    )
             await send(message)
 
         await self.app(scope, receive, send_with_headers)
@@ -159,9 +155,17 @@ class PortAwareTrustedHostMiddleware:
             hostname.endswith(f".{suffix}") for suffix in self.wildcard_suffixes
         )
 
-    async def _reject(self, send: Send) -> None:
+    async def _reject(self, scope: Scope, send: Send) -> None:
+        request_id = ensure_request_id(scope)
         body = json.dumps(
-            {"status_code": 400, "detail": "Invalid host header"},
+            {
+                "error": {
+                    "code": "invalid_host_header",
+                    "message": "The request Host header is not allowed.",
+                    "request_id": request_id,
+                    "retryable": False,
+                }
+            },
             separators=(",", ":"),
         ).encode("utf-8")
         await send(
@@ -185,6 +189,6 @@ class PortAwareTrustedHostMiddleware:
         host_values = headers.getall("host", [])
         hostname = _hostname_from_header(host_values[0]) if len(host_values) == 1 else None
         if hostname is None or not self._is_allowed(hostname):
-            await self._reject(send)
+            await self._reject(scope, send)
             return
         await self.app(scope, receive, send)

@@ -1,18 +1,8 @@
-"""Subprocess entry point that extracts PDF text under resource limits.
-
-This module runs as ``python -m pdf_bridge.services.extraction_child`` in a
-dedicated child process. It imports only the standard library and pypdf so a
-hostile document can, at worst, exhaust the limits placed on this process.
-
-CPU and address-space limits use ``resource`` and therefore apply on Linux
-deployments only; page, character, and wall-clock limits are enforced
-everywhere. A resource-limited subprocess is containment, not a sandbox.
-"""
+"""Credential-free subprocess for pypdf layout extraction."""
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import sys
 
@@ -20,49 +10,44 @@ import sys
 def _apply_resource_limits(cpu_seconds: int, memory_bytes: int) -> None:
     try:
         import resource
-    except ImportError:  # Windows development hosts; production is Linux.
+    except ImportError:  # Windows development; production is Linux.
         return
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
     resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
 
 
-def _fail(reason: str, detail: str) -> None:
-    json.dump({"ok": False, "reason": reason, "detail": detail[:2000]}, sys.stdout)
-    sys.stdout.flush()
-    sys.exit(0)
-
-
 def extract(path: str, *, max_pages: int, max_characters: int) -> dict[str, object]:
-    """Extract page-mapped text, failing closed on any parser surprise."""
+    """Extract every page in layout mode without truncation or fallback."""
 
     from pypdf import PdfReader
     from pypdf.errors import FileNotDecryptedError, PdfReadError, WrongPasswordError
 
     try:
         with open(path, "rb") as handle:
-            data = handle.read()
-        reader = PdfReader(io.BytesIO(data))
-        if reader.is_encrypted:
-            return {"ok": False, "reason": "encrypted", "detail": "the PDF is encrypted"}
-        page_count = len(reader.pages)
-        if page_count > max_pages:
-            return {
-                "ok": False,
-                "reason": "page-budget",
-                "detail": f"the PDF has {page_count} pages; the limit is {max_pages}",
-            }
-        pages: list[dict[str, object]] = []
-        total_characters = 0
-        for number, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            total_characters += len(text)
-            if total_characters > max_characters:
+            reader = PdfReader(handle)
+            if reader.is_encrypted:
+                return {"ok": False, "reason": "encrypted", "detail": "the PDF is encrypted"}
+            page_count = len(reader.pages)
+            if page_count == 0:
+                return {"ok": False, "reason": "empty", "detail": "the PDF has no pages"}
+            if page_count > max_pages:
                 return {
                     "ok": False,
-                    "reason": "character-budget",
-                    "detail": (f"extracted text exceeds the {max_characters}-character limit"),
+                    "reason": "page-budget",
+                    "detail": f"the PDF has {page_count} pages; the limit is {max_pages}",
                 }
-            pages.append({"number": number, "text": text})
+            pages: list[dict[str, object]] = []
+            total = 0
+            for page_number, page in enumerate(reader.pages, start=1):
+                text = page.extract_text(extraction_mode="layout") or ""
+                total += len(text)
+                if total > max_characters:
+                    return {
+                        "ok": False,
+                        "reason": "character-budget",
+                        "detail": f"extracted text exceeds {max_characters} characters",
+                    }
+                pages.append({"page_number": page_number, "layout_text": text})
         return {"ok": True, "page_count": page_count, "pages": pages}
     except (WrongPasswordError, FileNotDecryptedError):
         return {"ok": False, "reason": "encrypted", "detail": "the PDF requires a password"}
@@ -79,7 +64,7 @@ def extract(path: str, *, max_pages: int, max_characters: int) -> dict[str, obje
         return {
             "ok": False,
             "reason": "malformed",
-            "detail": f"{type(exc).__name__}: {exc}"[:2000],
+            "detail": f"{type(exc).__name__}: {exc}"[:500],
         }
 
 
@@ -91,7 +76,6 @@ def main() -> None:
     parser.add_argument("--cpu-seconds", type=int, required=True)
     parser.add_argument("--memory-bytes", type=int, required=True)
     arguments = parser.parse_args()
-
     _apply_resource_limits(arguments.cpu_seconds, arguments.memory_bytes)
     try:
         result = extract(
@@ -100,9 +84,12 @@ def main() -> None:
             max_characters=arguments.max_characters,
         )
     except MemoryError:
-        _fail("malformed", "the parser exceeded its memory limit")
-        return
-    json.dump(result, sys.stdout)
+        result = {
+            "ok": False,
+            "reason": "malformed",
+            "detail": "the parser exceeded its memory limit",
+        }
+    json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.flush()
 
 

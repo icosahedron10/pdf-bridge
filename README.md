@@ -1,163 +1,125 @@
 # PDF Bridge
 
-PDF Bridge is a single-process Litestar service for safe, reviewable PDF intake into a
-collection-partitioned retrieval system. It owns the durable upload, analysis, decision, indexing,
-replacement, deletion, and cleanup lifecycle. There is no Jenkins handoff or batch consumer.
+Status: Current
 
-An upload is synchronously streamed, hashed, structurally checked, and scanned by ClamAV. Clean
-bytes are promoted to canonical storage and returned as `202 Accepted`; a lifespan-owned worker
-then extracts text, compares the document with active and pending content in the selected
-collection, and either publishes it or asks an operator to choose Keep, Replace, or Cancel.
+PDF Bridge is a collection-based PDF storage facade with service-owned, real-time indexing. It
+stores source PDFs under opaque UUIDs, exposes their immutable metadata and generated content to
+operators, and publishes approved chunks directly to configured Qdrant collections. Jenkins and
+the former ingestion pipeline are not part of the runtime.
 
-## Safety invariants
+The API-v2-only service, current persistence model, priority worker, fixed-collection Qdrant
+integration, and Streamlit workspace are implemented in this repository. That code-completion
+status does not assert that any deployed environment has completed the coordinated reset,
+source-PDF reingestion, retrieval validation, or enterprise gates. Follow the
+[reingestion procedure](docs/migration/historical-import.md) for an operational cutover.
 
-- Exact SHA-256 duplicates are rejected only inside the selected collection. The same bytes may
-  legitimately exist in another collection.
-- Filename, normalized-text, dense, BM25, LLM, contradiction, and provider-outage findings are
-  advisory. A clear, complete analysis publishes automatically; any candidate or incomplete check
-  enters `REVIEW_REQUIRED`.
-- Encrypted, malformed, image-only, empty, text-insufficient, or over-budget PDFs are rejected
-  without an override. OCR is not included.
-- Pending chunks live only in the private screening index. Retrieval may query active aliases only.
-- Replacement prepares the new analysis first, then deletes and verifies the old active points and
-  artifacts, then publishes the new points. A temporary availability gap is accepted; old and new
-  content must never be simultaneously active.
-- Full analysis artifacts remain private for the document lifetime. Cancellation and deletion purge
-  source bytes, analysis artifacts, and index points after recording a content-free manifest hash.
+## Product contract
 
-## Runtime shape
+- Deployment configuration defines the logical PDF collections and maps each one to a fixed,
+  pre-provisioned Qdrant collection. Operators cannot create, rename, move, or delete collections.
+- The filesystem remains the existing opaque UUID-sharded object store. Collection membership is
+  catalog metadata, never a user-controlled filesystem path.
+- Uploads are accepted asynchronously and begin preflight immediately on a best-effort basis. The
+  expected peak is approximately five queued documents; this is not a batch system.
+- After the bounded upload/malware admission gate, preflight performs native-text extraction,
+  Markdown formatting, chunking, dense and sparse embedding, semantic screening, duplicate review,
+  and LLM classification. These checks occur before ingestion.
+- A clear preflight publishes automatically. Advisory findings enter `REVIEW_REQUIRED` for an
+  explicit Keep, Replace, or Cancel decision.
+- Ingestion is the direct publication of the exact immutable preflight artifacts to Qdrant. A
+  document is `READY` only after its expected points are visible and verified.
+- Deletion is immediate asynchronous work with priority over uploads: remove and verify Qdrant
+  points first, then purge the PDF and private artifacts, then retain a content-free tombstone.
+- Streamlit is the sole canonical operator interface. It provides collection and document browsing,
+  upload/review/delete actions, read-only inspection of metadata, Markdown, and chunks, and an
+  optional operator-only proxy to the separately owned retrieval service.
+
+## Processing flow
 
 ```mermaid
-graph LR
-    O["Operator browser"] --> B["PDF Bridge API"]
-    B --> S["SQLite and canonical / analysis storage"]
-    B --> C["ClamAV"]
-    B --> W["Two-slot internal worker"]
-    W --> P["Resource-limited pypdf subprocess"]
-    W --> M["Private embedding and LLM endpoints"]
-    W --> Q["Qdrant active aliases and private screening"]
-    R["External retrieval service"] --> Q
-    B --> R
+flowchart LR
+    U["Streamlit operator UI"] --> A["Litestar API v2"]
+    A --> S["UUID object storage and catalog"]
+    A --> W["Immediate asynchronous worker"]
+    W --> P["pypdf layout extraction"]
+    P --> L["vLLM Markdown formatter"]
+    L --> C["Structure-aware chunks"]
+    C --> E["Local MPNet and FastEmbed BM25"]
+    E --> F["Duplicate and LLM preflight"]
+    F -->|"clear or Keep"| Q["Fixed Qdrant collection"]
+    F -->|"review"| U
 ```
 
-The supported topology is SQLite plus exactly one Uvicorn application process. The worker uses two
-threads and process-local collection locks; multiple app processes or replicas are unsupported.
+Only English, native-text PDFs are supported. OCR and image-only documents are out of scope.
+`pypdf` extracts layout-oriented text; a configured vLLM OpenAI-compatible chat-completions
+endpoint converts bounded page groups or page slices into strict page-scoped Markdown JSON. Invalid
+or incomplete formatting fails preflight—raw text is never silently substituted.
 
-## Local container deployment
+Dense vectors are generated inside PDF Bridge with
+`sentence-transformers/all-mpnet-base-v2` (768 dimensions, cosine distance). One serialized
+embedding lane protects process memory. Sparse vectors use FastEmbed `Qdrant/bm25`; document and
+query encodings are deliberately distinct.
 
-1. Copy `.env.example` to `.env` and replace every `CHANGE_ME` value.
-2. Configure private OpenAI-compatible embedding and LLM endpoints, including exact model IDs and
-   embedding dimension.
-3. Start the pinned stack:
+## Runtime boundary
 
-   ```bash
-   docker compose up --build
-   ```
+PDF Bridge owns source storage, catalog state, generated artifacts, preflight, operator decisions,
+Qdrant point writes, replacement, deletion, retry, and audit tombstones. The platform team owns
+provisioning and lifecycle of fixed Qdrant collections. An external end-user retrieval service may
+read published points, but its API, ranking, authorization, and user experience are outside this
+repository. PDF Bridge may proxy that service for operator diagnostics; the proxy does not make
+PDF Bridge the end-user retrieval product.
 
-4. Open `http://127.0.0.1:8000` unless the bind address or port was changed.
+The v2 API is the only runtime API. `/api/v1` and the integrated Jinja operator UI are absent; there
+is no compatibility adapter or dual-write period. Non-enterprise deployments expose the OpenAPI
+JSON document at `/api/openapi.json`; enterprise mode disables it.
 
-Compose runs Qdrant `1.18.1` on an internal-only network with API-key authentication and JWT RBAC.
-PDF Bridge holds the administrative key because it creates collections, manages aliases, and writes
-both active and screening indexes. External retrieval must receive a separate collection-scoped
-read-only JWT that omits `pdf-bridge-screening-v1`; never give it the administrative key.
+## Run and verify
 
-The application container runs one Uvicorn worker as a non-root user with a read-only root
-filesystem. Startup applies the empty-reset Alembic migration before serving traffic.
+Python 3.12 is required. Copy `.env.example` to `.env`, replace every placeholder independently,
+point storage at an absolute non-synchronized directory outside the source tree, pre-seed the
+pinned model cache, and have the platform owner provision every configured active Qdrant collection
+plus the private screening collection with the required schema. Follow the
+[Qdrant credential procedure](docs/configuration.md#qdrant) to keep its admin signing key out of
+Bridge and issue the exact expiring collection-scoped JWT before startup.
 
-## Intake API
-
-The browser and JSON API share `/api/v1`:
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /uploads/preflight` | Return collection-scoped filename warnings |
-| `POST /uploads` | Stream, scan, promote, and queue analysis; returns `202` |
-| `GET /uploads?open=true` | Restore durable open work after refresh or restart |
-| `GET /uploads/{id}` | Poll document, operation, phase, and analysis state |
-| `GET /uploads/{id}/analysis` | Page through deterministic and LLM evidence |
-| `POST /uploads/{id}/decision` | Submit Keep, Replace, or Cancel with an idempotency key |
-| `POST /uploads/{id}/retry` | Retry retained failed work without a second semantic decision |
-| `DELETE /uploads/{id}` | Cancel eligible unpublished work and queue cleanup |
-| `GET /documents/{id}` | Read document detail and its audit ledger |
-| `POST /documents/{id}/deletion` | Queue verified deletion of active content |
-| `POST /search` | Proxy the stable external retrieval contract |
-
-Upload and decision mutations require `Idempotency-Key`. Decision bodies contain only
-`analysis_revision`, `action`, and, for Replace, `target_document_id`; there is no rationale field.
-
-## Analysis and indexing
-
-- `pypdf==6.14.2` runs in a child process with wall-clock, Linux CPU/address-space, page,
-  normalized-character, and chunk limits. A limited subprocess reduces blast radius but is not a
-  complete parser sandbox.
-- `rapidfuzz==3.14.5` provides deterministic Unicode-aware filename-family warnings.
-- Paragraph/sentence-aware chunks target 400 lexical tokens with 60-token overlap and a
-  3,500-character hard cap. Defaults reject more than 2,000 pages, five million normalized
-  characters, or 10,000 chunks rather than truncating.
-- Dense vectors come from a configured private OpenAI-compatible endpoint. Sparse `content_bm25`
-  and dense `content_dense` vectors are stored together under deterministic UUIDv5 point IDs.
-- Candidate discovery searches active and screening indexes, applies deterministic thresholds, and
-  fuses rankings with reciprocal rank fusion. Two independent temperature-zero structured-output
-  calls add explanation-only evidence for the top 12 candidates.
-- Every point carries schema, document, analysis, chunk, collection, page, text-hash, bounded-text,
-  publication, and screening metadata. Active collections are physical epoch versions exposed by
-  stable collection-key aliases; screening is private.
-
-## Historical import
-
-`pdf-bridge import-manifest` accepts only manifest version 3. It validates and scans each source PDF
-and creates ordinary `ANALYZE` operations; it never synthesizes already-ingested rows.
-
-```bash
-pdf-bridge import-manifest historical-v3.json \
-  --source-root /approved/source-pdfs \
-  --dry-run \
-  --actor-id change-1234
-
-pdf-bridge import-manifest historical-v3.json \
-  --source-root /approved/source-pdfs \
-  --apply \
-  --actor-id change-1234
-```
-
-See [historical import](docs/importing.md) for the strict manifest and recovery procedure.
-
-## Development
-
-Python 3.12 is required.
-
-```bash
+```powershell
 python -m venv .venv
-. .venv/bin/activate
-python -m pip install -e '.[dev]'
-ruff check .
-pytest -q
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev,streamlit]"
+alembic upgrade head
+uvicorn pdf_bridge.app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Browser tests require Playwright and its Chromium runtime. ClamAV integration tests require a live
-daemon and remain separately marked.
+Run Streamlit in a second shell:
 
-## Streamlit workspace
-
-A Streamlit operator front end covering the full intake lifecycle lives in
-[`streamlit_app/`](streamlit_app/README.md). It is a pure HTTP client of a running PDF Bridge
-service — it holds the same session and CSRF contract as the built-in browser UI and never opens
-the catalog database directly.
-
-```bash
-python -m pip install -e '.[streamlit]'
+```powershell
 streamlit run streamlit_app/app.py
 ```
 
-## Documentation
+The API readiness endpoint is `GET /api/v2/health/ready`; Streamlit defaults to
+`http://127.0.0.1:8000`. `docker compose up --build` starts the reference one-Bridge-process
+topology and publishes Streamlit at `http://127.0.0.1:8501`. The isolated Streamlit container talks
+only to API v2 and receives no storage, model-cache, or Qdrant access. Compose deliberately does not
+create Qdrant collections or payload indexes; an empty Qdrant instance remains not ready until its
+platform-owned fixed collections are provisioned.
 
-- [Architecture and lifecycle](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Operations and cutover runbook](docs/runbook.md)
-- [Security model](docs/security.md)
-- [Historical import](docs/importing.md)
-- [Open-source review](docs/oss-review.md)
+```powershell
+python -m ruff check .
+python -m pytest -q
+```
 
-This remains a coordinated proof-of-concept reset. Before production use, complete the security,
-availability, evaluation-corpus, backup, retention, retrieval-authorization, and parser-isolation
-gates in the linked documents.
+## Documentation map
+
+- [Service contract](docs/service-contract.md) — authoritative behavior and lifecycle vocabulary
+- [Architecture](docs/architecture.md) — components, persistence, work scheduling, and failures
+- [API v2 contract](docs/contracts/intake-api.md) — current operator/service interface
+- [Markdown, chunk, and Qdrant contract](docs/contracts/chunks-qdrant.md)
+- [Historical refactor gap](docs/refactor-gap.md) and [implemented refactor plan](docs/refactor-plan.md)
+- [Jenkins retirement](docs/migration/jenkins-retirement.md) and
+  [coordinated reingestion](docs/migration/historical-import.md)
+- [Configuration](docs/configuration.md), [operations](docs/runbook.md), and
+  [security](docs/security.md)
+
+Current documentation replaces prior contracts. Superseded behavior is available only through Git
+history; there is no maintained legacy-documentation archive. The [security model](docs/security.md)
+separately records controls that deployment owners must verify before production or enterprise use.

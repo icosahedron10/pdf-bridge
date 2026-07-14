@@ -1,4 +1,4 @@
-"""Upload page: preflight advisories, scanned intake, and live tracking."""
+"""Collection-scoped intake with filename advisory and live operation polling."""
 
 from __future__ import annotations
 
@@ -7,193 +7,197 @@ from typing import Any
 import streamlit as st
 
 import bridge_ui as ui
-from bridge_client import BridgeProblem, BridgeUnreachable, new_idempotency_key
 
 
-def _file_key(collection_key: str, name: str, size: int) -> str:
-    return f"{collection_key}::{name}::{size}"
+def _file_identity(collection_key: str, file: Any) -> str:
+    file_identity = getattr(file, "file_id", None) or f"{file.name}:{file.size}"
+    return f"{collection_key}:{file_identity}"
 
 
-def _preflight_cached(client, *, collection_key: str, name: str, size: int) -> dict[str, Any]:
-    """Run preflight once per selected file and remember the outcome."""
-
-    cache: dict[str, Any] = st.session_state.setdefault("preflight_cache", {})
-    key = _file_key(collection_key, name, size)
+def _name_advisory(client, collection_key: str, filename: str) -> dict[str, Any] | None:
+    cache: dict[str, dict[str, Any]] = st.session_state.setdefault("name_advisories", {})
+    key = f"{collection_key}:{filename}"
     if key not in cache:
-        try:
-            cache[key] = client.preflight(
-                filename=name, size_bytes=size, collection_key=collection_key
-            )
-        except (BridgeProblem, BridgeUnreachable) as error:
-            cache[key] = {"error": error}
+        result = ui.guarded(lambda: client.name_check(collection_key, filename=filename))
+        if result is None:
+            return None
+        cache[key] = result
     return cache[key]
 
 
-def _stable_idempotency_key(file_key: str) -> str:
-    """Reuse one idempotency key per selected file so retries replay safely."""
+def _track(result: dict[str, Any]) -> None:
+    document = result.get("document", {})
+    operation = result.get("operation", {})
+    document_id = str(document.get("id", ""))
+    if not document_id:
+        raise RuntimeError("upload response omitted document.id")
+    tracked: list[dict[str, str]] = st.session_state.setdefault("tracked_documents", [])
+    tracked[:] = [item for item in tracked if item.get("document_id") != document_id]
+    tracked.insert(
+        0,
+        {
+            "document_id": document_id,
+            "operation_id": str(operation.get("id", "")),
+        },
+    )
+    del tracked[12:]
 
-    keys: dict[str, str] = st.session_state.setdefault("upload_idempotency_keys", {})
-    return keys.setdefault(file_key, new_idempotency_key())
 
-
-def _upload_one(client, file, collection_key: str) -> None:
-    file_key = _file_key(collection_key, file.name, file.size)
-    idempotency_key = _stable_idempotency_key(file_key)
-    try:
-        accepted = client.upload(
+def _upload_one(client, collection_key: str, file: Any) -> bool:
+    identity = _file_identity(collection_key, file)
+    result = ui.guarded(
+        lambda: client.upload(
+            collection_key,
             filename=file.name,
-            content=file.getvalue(),
-            collection_key=collection_key,
-            idempotency_key=idempotency_key,
+            content=file,
+            idempotency_key=ui.idempotency_key("upload", identity),
         )
-    except BridgeProblem as error:
-        st.session_state.setdefault("upload_failures", {})[file_key] = error
-        return
-    except BridgeUnreachable as error:
-        st.session_state.setdefault("upload_failures", {})[file_key] = error
-        return
-    st.session_state.setdefault("upload_failures", {}).pop(file_key, None)
-    st.session_state["upload_idempotency_keys"].pop(file_key, None)
-    upload = accepted.get("upload", {})
-    tracked: list[str] = st.session_state.setdefault("tracked_uploads", [])
-    upload_id = str(upload.get("upload_id", ""))
-    if upload_id and upload_id not in tracked:
-        tracked.insert(0, upload_id)
-    replayed = " (idempotent replay)" if accepted.get("idempotent_replay") else ""
-    st.toast(f"Accepted {file.name}{replayed}", icon=":material/check_circle:")
+    )
+    if result is None:
+        return False
+    _track(result)
+    replay = " · idempotent replay" if result.get("idempotent_replay") else ""
+    st.toast(f"Accepted {file.name}{replay}", icon=":material/task_alt:")
+    return True
 
 
-def _render_intake_form(client) -> None:
-    collections_payload = ui.guarded(client.collections)
-    if collections_payload is None:
+def _render_intake(client) -> None:
+    collections = ui.guarded(lambda: client.collections(limit=100))
+    if collections is None:
         return
-    options = ui.collection_options(collections_payload)
+    options = ui.collection_options(collections)
     if not options:
-        st.info("No collections are configured; uploads need a target collection.")
+        st.warning("No enabled collection can accept documents.")
         return
 
     collection_key = st.selectbox(
-        "Target collection",
+        "Destination collection",
         options=list(options),
         format_func=options.get,
-        help="Duplicates are blocked only inside the selected collection.",
+        help="The logical collection is immutable after admission.",
     )
     files = st.file_uploader(
-        "PDF files",
+        "PDF documents",
         type=["pdf"],
         accept_multiple_files=True,
-        help="Each file is streamed, hashed, structurally checked, and "
-        "scanned by ClamAV before analysis is queued.",
+        help=(
+            "Each file is bounded, validated, scanned, and durably admitted before "
+            "preflight begins."
+        ),
     )
     if not files:
-        st.caption(
-            "Encrypted, malformed, image-only, empty, or over-budget PDFs are "
-            "rejected during analysis; OCR is not included."
+        st.info("Choose one or more PDFs to run the filename-only advisory before intake.")
+        return
+    selection_limit = ui.max_upload_files()
+    if len(files) > selection_limit:
+        st.error(
+            f"Select at most {selection_limit} PDFs at once. This workspace is sized for "
+            "a small durable queue."
         )
         return
 
-    st.markdown("##### Preflight review")
-    failures: dict[str, Any] = st.session_state.get("upload_failures", {})
+    st.markdown("#### Filename advisory")
     for file in files:
-        file_key = _file_key(collection_key, file.name, file.size)
         with st.container(border=True):
-            header, size_column = st.columns([5, 1])
-            header.markdown(f"**{file.name}**")
-            size_column.caption(ui.fmt_bytes(file.size))
-            preflight = _preflight_cached(
-                client, collection_key=collection_key, name=file.name, size=file.size
-            )
-            error = preflight.get("error")
-            if isinstance(error, BridgeProblem):
-                ui.render_problem(error)
-                continue
-            if isinstance(error, BridgeUnreachable):
-                ui.render_unreachable(error)
-                continue
-            normalized = preflight.get("normalized_filename", file.name)
-            if normalized != file.name:
-                st.caption(f"Stored as `{normalized}`")
-            ui.render_filename_warnings(preflight.get("warnings", []))
-            failure = failures.get(file_key)
-            if isinstance(failure, BridgeProblem):
-                ui.render_problem(failure)
-            elif isinstance(failure, BridgeUnreachable):
-                ui.render_unreachable(failure)
+            left, right = st.columns([5, 2])
+            left.markdown(f"**{file.name}**")
+            right.caption(ui.fmt_bytes(file.size))
+            advisory = _name_advisory(client, collection_key, file.name)
+            if advisory is not None:
+                ui.render_name_matches(advisory.get("matches", []))
 
+    st.caption(
+        "This advisory reads filenames only. Semantic preflight starts after durable "
+        "upload and cannot be skipped."
+    )
     if st.button(
-        f"Upload {len(files)} file{'s' if len(files) != 1 else ''}",
+        f"Upload {len(files)} document{'s' if len(files) != 1 else ''}",
         type="primary",
         icon=":material/upload_file:",
     ):
-        progress = st.progress(0.0, text="Uploading…")
+        progress = st.progress(0.0, text="Submitting documents…")
+        succeeded = 0
         for index, file in enumerate(files):
-            progress.progress(
-                index / len(files), text=f"Scanning and storing {file.name}…"
-            )
-            _upload_one(client, file, collection_key)
-        progress.progress(1.0, text="Done")
-        st.rerun()
+            progress.progress(index / len(files), text=f"Accepting {file.name}…")
+            file.seek(0)
+            succeeded += int(_upload_one(client, collection_key, file))
+        progress.progress(1.0, text=f"Accepted {succeeded} of {len(files)}")
+        if succeeded:
+            st.rerun()
 
 
-def _render_tracking(client) -> None:
-    tracked: list[str] = st.session_state.get("tracked_uploads", [])
+def _open_document(document_id: str, *, review: bool) -> None:
+    st.query_params["document"] = document_id
+    st.switch_page("views/workspace.py" if review else "views/library.py")
+
+
+def _render_tracking(client) -> bool:
+    tracked: list[dict[str, str]] = st.session_state.get("tracked_documents", [])
     if not tracked:
-        return
+        return False
+
     st.divider()
-    st.subheader("This session's uploads")
-    any_open = False
-    statuses: list[dict[str, Any]] = []
-    for upload_id in tracked[:10]:
-        status = ui.guarded(lambda upload_id=upload_id: client.upload_status(upload_id))
-        if status is None:
+    st.subheader("Recent intake")
+    any_running = False
+    retained: list[dict[str, str]] = []
+    for item in tracked:
+        document_id = item["document_id"]
+        document = ui.guarded(lambda document_id=document_id: client.document(document_id))
+        if document is None:
+            retained.append(item)
             continue
-        statuses.append(status)
-        if status.get("open"):
-            any_open = True
+        retained.append(item)
+        operation = document.get("current_operation") or {}
+        operation_id = str(operation.get("id") or item.get("operation_id") or "")
+        if operation_id and operation.get("state") in {"QUEUED", "RUNNING"}:
+            detailed = ui.guarded(lambda operation_id=operation_id: client.operation(operation_id))
+            if detailed is not None:
+                operation = detailed
+        any_running = any_running or document.get("state") in ui.WORKING_DOCUMENT_STATES
 
-    for status in statuses:
-        document = status["document"]
-        operation = status.get("operation") or {}
-        columns = st.columns([4, 2, 2, 3])
-        columns[0].markdown(f"**{document['original_filename']}**")
-        columns[1].markdown(ui.state_badge(document["state"]), unsafe_allow_html=True)
-        columns[2].caption(document["collection_key"])
-        phase = operation.get("phase")
-        if status.get("open") and phase not in (None, "COMPLETE"):
-            columns[3].progress(
-                ui.phase_progress(phase), text=phase.replace("_", " ").title()
+        with st.container(border=True):
+            heading, state_column, action = st.columns([5, 2, 2])
+            heading.markdown(f"**{document.get('original_filename', document_id)}**")
+            heading.caption(
+                f"{document.get('collection_key', '—')} · "
+                f"{ui.fmt_bytes(document.get('size_bytes'))} · "
+                f"{ui.fmt_relative(document.get('created_at'))}"
             )
-        else:
-            columns[3].caption(ui.fmt_relative(document["uploaded_at"]))
-
-    action_columns = st.columns([2, 2, 5])
-    if action_columns[0].button("Open review queue", icon=":material/fact_check:"):
-        st.switch_page("views/workspace.py")
-    if action_columns[1].button("Clear list", icon=":material/backspace:"):
-        st.session_state["tracked_uploads"] = []
+            state_column.markdown(
+                ui.state_badge(str(document.get("state", "UNKNOWN"))),
+                unsafe_allow_html=True,
+            )
+            needs_review = document.get("state") == "REVIEW_REQUIRED"
+            if action.button(
+                "Review" if needs_review else "Inspect",
+                key=f"track-open::{document_id}",
+                use_container_width=True,
+            ):
+                _open_document(document_id, review=needs_review)
+            if operation:
+                ui.render_operation(operation)
+    st.session_state["tracked_documents"] = retained
+    if st.button("Clear recent intake", icon=":material/backspace:"):
+        st.session_state["tracked_documents"] = []
         st.rerun()
-    if any_open:
-        st.caption("Refreshing automatically while work is in progress…")
+    return any_running
 
 
 def render() -> None:
-    """Render the upload intake page."""
-
     ui.apply_chrome(
-        "Upload",
-        "Stream PDFs through malware scanning into durable, reviewable analysis.",
+        "Intake",
+        "Admit scanned PDFs, then follow durable preflight and publication work by document.",
     )
     client = ui.get_client()
-    _render_intake_form(client)
+    _render_intake(client)
 
-    any_open = bool(st.session_state.get("tracked_uploads"))
-    refresh = "3s" if any_open else None
+    @st.fragment(run_every="2s")
+    def tracking_fragment() -> None:
+        running = _render_tracking(client)
+        if running:
+            st.caption("Polling every two seconds while durable work is open.")
 
-    @st.fragment(run_every=refresh)
-    def tracking_section() -> None:
-        _render_tracking(client)
-
-    tracking_section()
+    tracking_fragment()
 
 
 render()

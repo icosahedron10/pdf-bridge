@@ -120,7 +120,7 @@ def scanner_from_settings(settings: Settings) -> Scanner:
         clamd_scan_path,
         host=settings.clamd_host,
         port=settings.clamd_port,
-        timeout=settings.clamd_timeout,
+        timeout=settings.clamd_timeout_seconds,
     )
 
 

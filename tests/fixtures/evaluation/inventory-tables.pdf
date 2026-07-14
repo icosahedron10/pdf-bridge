@@ -1,0 +1,131 @@
+%PDF-1.3
+%“Œ‹ž ReportLab Generated PDF document http://www.reportlab.com
+1 0 obj
+<<
+/F1 2 0 R /F2 3 0 R /F3 4 0 R /F4 5 0 R
+>>
+endobj
+2 0 obj
+<<
+/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
+>>
+endobj
+3 0 obj
+<<
+/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
+>>
+endobj
+4 0 obj
+<<
+/BaseFont /Courier-Bold /Encoding /WinAnsiEncoding /Name /F3 /Subtype /Type1 /Type /Font
+>>
+endobj
+5 0 obj
+<<
+/BaseFont /Courier /Encoding /WinAnsiEncoding /Name /F4 /Subtype /Type1 /Type /Font
+>>
+endobj
+6 0 obj
+<<
+/Contents 11 0 R /MediaBox [ 0 0 792 612 ] /Parent 10 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>> /Rotate 0 /Trans <<
+
+>> 
+  /Type /Page
+>>
+endobj
+7 0 obj
+<<
+/Contents 12 0 R /MediaBox [ 0 0 792 612 ] /Parent 10 0 R /Resources <<
+/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
+>> /Rotate 0 /Trans <<
+
+>> 
+  /Type /Page
+>>
+endobj
+8 0 obj
+<<
+/PageMode /UseNone /Pages 10 0 R /Type /Catalog
+>>
+endobj
+9 0 obj
+<<
+/Author (PDF Bridge contributors) /CreationDate (D:20000101000000+00'00') /Creator (PDF Bridge deterministic corpus builder \(ReportLab 4.4.3\)) /Keywords () /ModDate (D:20000101000000+00'00') /Producer (ReportLab PDF Library - www.reportlab.com) 
+  /Subject (Original offline acceptance fixture; CC0-1.0) /Title (Inventory Tables) /Trapped /False
+>>
+endobj
+10 0 obj
+<<
+/Count 2 /Kids [ 6 0 R 7 0 R ] /Type /Pages
+>>
+endobj
+11 0 obj
+<<
+/Length 818
+>>
+stream
+1 0 0 1 0 0 cm  BT /F1 12 Tf 14.4 TL ET
+BT /F2 18 Tf 21.6 TL ET
+BT 1 0 0 1 42 564 Tm (Regional Inventory Table) Tj T* ET
+BT /F3 10 Tf 12 TL ET
+BT 1 0 0 1 42 522 Tm (Region      Item             SKU       Owner        Window       Status) Tj T* ET
+BT /F4 10 Tf 12 TL ET
+BT 1 0 0 1 42 500 Tm (North       Field Kit        FK-101    Rowan       08:00-10:00  Ready) Tj T* ET
+BT 1 0 0 1 42 478 Tm (South       Safety Manual    SM-204    Morgan      10:00-12:00  Review) Tj T* ET
+BT 1 0 0 1 42 456 Tm (East        Sensor Pack      SP-310    Taylor      12:00-14:00  Ready) Tj T* ET
+BT 1 0 0 1 42 434 Tm (West        Cable Bundle     CB-415    Jordan      14:00-16:00  Hold) Tj T* ET
+BT /F1 10 Tf 12 TL ET
+BT 1 0 0 1 42 402 Tm (Each row is authoritative; the repeated header preserves table meaning across pages.) Tj T* ET
+ 
+endstream
+endobj
+12 0 obj
+<<
+/Length 832
+>>
+stream
+1 0 0 1 0 0 cm  BT /F1 12 Tf 14.4 TL ET
+BT /F2 18 Tf 21.6 TL ET
+BT 1 0 0 1 42 564 Tm (Regional Inventory Table \(continued\)) Tj T* ET
+BT /F3 10 Tf 12 TL ET
+BT 1 0 0 1 42 522 Tm (Region      Item             SKU       Owner        Window       Status) Tj T* ET
+BT /F4 10 Tf 12 TL ET
+BT 1 0 0 1 42 500 Tm (Central     Valve Set        VS-520    Casey       08:30-09:30  Ready) Tj T* ET
+BT 1 0 0 1 42 478 Tm (Coastal     Pump Guide       PG-625    Avery       09:30-11:30  Review) Tj T* ET
+BT 1 0 0 1 42 456 Tm (Mountain    Filter Case      FC-730    Quinn       11:30-13:30  Ready) Tj T* ET
+BT 1 0 0 1 42 434 Tm (Prairie     Meter Card       MC-845    Riley       13:30-15:30  Hold) Tj T* ET
+BT /F1 10 Tf 12 TL ET
+BT 1 0 0 1 42 402 Tm (Each row is authoritative; the repeated header preserves table meaning across pages.) Tj T* ET
+ 
+endstream
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000073 00000 n 
+0000000134 00000 n 
+0000000241 00000 n 
+0000000353 00000 n 
+0000000463 00000 n 
+0000000568 00000 n 
+0000000763 00000 n 
+0000000958 00000 n 
+0000001027 00000 n 
+0000001396 00000 n 
+0000001462 00000 n 
+0000002331 00000 n 
+trailer
+<<
+/ID 
+[<a9e5346685d9c59701a3043f4c13448e><a9e5346685d9c59701a3043f4c13448e>]
+% ReportLab generated PDF document -- digest (http://www.reportlab.com)
+
+/Info 9 0 R
+/Root 8 0 R
+/Size 13
+>>
+startxref
+3214
+%%EOF

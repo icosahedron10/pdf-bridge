@@ -17,4 +17,3 @@ runtime-data
 *.sqlite*
 tests
 docs
-Jenkinsfile.example
