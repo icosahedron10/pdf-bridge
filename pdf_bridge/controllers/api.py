@@ -830,7 +830,7 @@ def operator_search(
         raise _problem(exc) from exc
 
 
-_API_ROUTE_HANDLERS = (
+_NON_UPLOAD_API_ROUTE_HANDLERS = (
     live,
     ready,
     list_collections,
@@ -863,7 +863,7 @@ def create_api_routers(upload_request_max_body_size: int) -> list[Router]:
     return [
         Router(
             path="/api/v2",
-            route_handlers=[*_API_ROUTE_HANDLERS, upload_handler],
+            route_handlers=[*_NON_UPLOAD_API_ROUTE_HANDLERS, upload_handler],
             tags=["PDF Bridge API v2"],
         )
     ]

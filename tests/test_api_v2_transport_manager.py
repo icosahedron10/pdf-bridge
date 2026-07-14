@@ -203,6 +203,21 @@ def transport_client(
         yield client
 
 
+def test_upload_route_is_registered_once_with_configured_body_limit() -> None:
+    upload_limit = 2 * 1_024 * 1_024
+    router = api.create_api_routers(upload_limit)[0]
+    upload_handlers = [
+        handler
+        for route in router.routes
+        if route.path == "/api/v2/collections/{key:str}/documents"
+        for handler in route.route_handlers
+        if "POST" in handler.http_methods
+    ]
+
+    assert len(upload_handlers) == 1
+    assert upload_handlers[0].request_max_body_size == upload_limit
+
+
 def test_authenticated_gets_initialize_and_reuse_cookie_csrf_session(
     transport_client: TestClient,
 ) -> None:
